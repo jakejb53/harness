@@ -99,7 +99,25 @@ While the model is working, you can keep typing your next message. It sends once
 
 **Situational awareness.** Each turn starts with the app calling `FYI()` and then `help()` in the REPL on the model's behalf. `FYI()` prints the current date, the prompt-token count of the latest reply (once there is one), and the model; `help()` lists the output limit and library functions. The calls and their output are shown and saved like any other, and the model can call either itself at any time. Before adding them, the app removes every earlier call made only of `FYI()`/`help()` from the conversation and its session file, so only the current turn's copies are in context.
 
-**Approval exemptions.** All synthetic tool calls, including `FYI()` and `help()` and any added in the future, never require approval, whether the app generates them or the model calls them explicitly. This applies at every permission level. Unrelated code bundled with them, including code evaluated in arguments, follows normal permissions and approval rules.
+**Approval exemptions.** Except for the file-injection mechanism below, all synthetic tool calls, present and future, including `FYI()` and `help()`, never require approval, whether the app generates them or the model calls them explicitly. This applies at every permission level. Unrelated code bundled with them, including code evaluated in arguments, follows normal permissions and approval rules. File injection authorizes only the app's attachment read; model-generated reads keep normal permissions.
+
+### File injection
+
+Put `@` in column one on its own attachment line, followed by the literal path:
+
+```text
+@src/app.rs
+@docs/design notes.md
+Review these files.
+```
+
+Everything after `@` is the path, including spaces; there is no trimming, quoting, glob, variable, or `~` expansion. Relative paths start at the launch directory; absolute paths and files outside the repository are allowed. A leading space makes the line ordinary text.
+
+The app reads each UTF-8 regular file in full, independently of REPL permissions and `output_limit`, and adds a synthetic `REPL` call with Python file-reading code and its result before requesting the model. Neither the model nor Monty executes that call. Empty files produce empty results. The original message, including attachment lines, remains in history. Every occurrence adds a separate instance; later turns and resumed sessions retain it without refreshing or replacing its contents.
+
+All files must load before the draft clears or history changes. Missing, unreadable, nonregular, or non-UTF-8 files block submission and preserve both. Loading holds draft editing; Esc cancels and preserves the draft.
+
+A bordered overlay in the transcript's upper right lists each instance, including duplicate filenames. Its size is capped at half the transcript width and height; long paths shorten and the mouse wheel over the box scrolls the list. It does not change transcript wrapping or input width and is hidden when empty. Between turns, click an instance's `-` to highlight it and confirm its full path with `y`; `n` or Esc cancels. Removal deletes only that instance's synthetic call, result, and tracking entry from the saved conversation. It leaves the disk file, original user message, and later references intact.
 
 ### Approval descriptions
 
@@ -211,7 +229,7 @@ Only what's sent and shown changes: the session file keeps replies as the endpoi
 
 ## Conversation files
 
-Session files hold the conversation exactly as it is sent to the model, including tool calls and their results. The system message isn't saved; each request uses this invocation's `--system-prompt` override or the prompt loaded from `config.toml`, including for resumed conversations:
+Session files hold conversation messages, including tool calls and results, plus file-injection tracking. Requests use only the messages, with the optional tool-reasoning conversion. The system message isn't saved; each request uses this invocation's `--system-prompt` override or the prompt loaded from `config.toml`, including for resumed conversations:
 
 ```json
 { "messages": [
@@ -219,7 +237,9 @@ Session files hold the conversation exactly as it is sent to the model, includin
   { "role": "assistant", "content": "", "reasoning": "...", "tool_calls": [ ... ] },
   { "role": "tool", "tool_call_id": "...", "content": "..." },
   { "role": "assistant", "content": "...", "reasoning": "..." }
-] }
+], "injections": [{ "call_id": "...", "path": "src/app.rs" }] }
 ```
 
-Replies keep every field the endpoint sent, such as reasoning under whatever name it uses (`reasoning`, `reasoning_content`, `reasoning_details`, …), and send them back unchanged. A reply you stop partway through is kept as far as it got. Tool results include their errors; display-only notices and failure-count notes are not saved in the conversation.
+`injections` links each displayed file instance to its tool call; it is never sent to the endpoint. File contents live only in the matching tool result. Older sessions without this field load with an empty list.
+
+Replies keep every field the endpoint sent, such as reasoning under whatever name it uses (`reasoning`, `reasoning_content`, `reasoning_details`, …); outgoing reasoning changes only when tool reasoning is enabled. A reply you stop partway through is kept as far as it got. Tool results include their errors; display-only notices and failure-count notes are not saved in the conversation.

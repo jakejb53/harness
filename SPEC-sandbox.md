@@ -34,18 +34,20 @@ Optional `[approval_description]`: required `enabled` boolean; when true, requir
 - Limits: `max_suspensions = usize::MAX`; `max_memory` from `[repl] max_memory_mb`; no time limits (Esc stops). Hitting the memory limit discards the worker and ends the call with `[REPL memory limit of <N> MiB exceeded. The REPL was restarted: every variable, import, and function defined earlier in this turn is gone; library functions are reloaded.]`.
 - The repo (working directory) is mounted read-write at its real absolute path, which is also the sandbox working directory. The directory handle is opened once and reused across feeds and turns. `os.getenv`/`os.environ` see an empty environment.
 - Result: `print` output in order, then the repr of a trailing expression if not `None`, then a traceback if the code raised; `(no output)` if empty; truncated at `output_limit` as before.
-- The approval exemption contract in `SPEC.md` is preserved: all synthetic tool calls, present and future, including `FYI()` and `help()`, never require approval at any permission level, whether app-generated or explicitly called by the model. Unrelated code bundled with them, including code evaluated in arguments, remains subject to normal permission and approval rules.
+- Except for file injection below, all synthetic tool calls, present and future, including `FYI()` and `help()`, never require approval at any permission level, whether app-generated or explicitly called by the model. Unrelated code bundled with them, including code evaluated in arguments, remains subject to normal permission and approval rules. App-generated file injections follow the separate user-authorized read contract below.
 - `reasoning()` is not synthetic and remains separately approval-exempt at every permission level. Exact `reasoning(<string literal>)` calls are answered `(no output)` without running; unrelated code cannot inherit the exemption.
 
 ## Permissions
 
-Every file operation reaches the app as an OS call and is checked before it is serviced:
+Every REPL file operation reaches the app as an OS call and is checked before it is serviced:
 
 - Inside the repo: `none` denies all; `read-only` denies writes; `read-write` allows all.
 - Filesystem operations are serviced exclusively by the repository mount. Outside access is denied at every level, with no outside-path approvals or host filesystem handlers.
 - Unmodified Monty enforces containment against traversal and symlink escapes. Absolute paths and `..` components are not rejected solely for their spelling when the mount contains the operation. Monty rejects absolute symlink targets even inside the repo; filesystem predicates can return `False` for rejected paths. `Path.resolve()` uses Monty's lexical normalization, not host symlink resolution.
 - A change of level applies from the next operation, including mid-call.
 - App denials raise `PermissionError` at the call, e.g. `write /repo/x: denied: the permission level is read-only`, `read /etc/hosts: denied: the path is outside the repository`, `run 'git': denied: 'git' is on the command deny list`.
+
+User file injection (`@path`, specified in `SPEC.md`) is an app-side read outside Monty, authorized independently of these permissions, including `none` and paths outside the repository. The app records Python file-reading code as a synthetic `REPL` call with the complete UTF-8 file as its result, including empty contents, without execution or `output_limit` truncation. This exception belongs to that user-selected instance; identical code requested by the model retains normal REPL permissions and limits. Attachment failures or cancellation preserve the draft and history. Injection instances persist across turns and resume until individually removed with confirmation; `FYI()`/`help()` cleanup does not remove them.
 
 ## Commands
 

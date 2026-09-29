@@ -1,8 +1,9 @@
-//! Session file: `{ "messages": [...] }`, where `messages` is exactly the array sent
-//! to the endpoint after the configured system message, which is never saved.
+//! Session messages are the durable conversation, before request-time tool reasoning.
+//! Injection metadata is local to the session file and never sent to the endpoint.
 //! Messages are appended, except that resume inserts results for
 //! unanswered tool calls, and each turn removes earlier `FYI()`/`help()`-only calls
-//! (`remove_calls`). Partial replies are kept as-is, except that a tool call still
+//! (`remove_calls`). Users can explicitly remove individual file injections.
+//! Partial replies are kept as-is, except that a tool call still
 //! streaming when the reply ended is dropped. Assistant messages keep every field
 //! the endpoint streamed, including ones the app doesn't know.
 
@@ -143,17 +144,28 @@ pub struct FunctionCall {
 #[derive(Deserialize)]
 struct SessionFile {
     messages: Vec<Message>,
+    #[serde(default)]
+    injections: Vec<Injection>,
 }
 
 /// Serialization twin of `SessionFile` that borrows the messages.
 #[derive(Serialize)]
 struct SessionFileRef<'a> {
     messages: &'a [Message],
+    injections: &'a [Injection],
+}
+
+/// One user-authorized injection instance; contents live only in its tool result.
+#[derive(Deserialize, Serialize)]
+pub struct Injection {
+    pub call_id: String,
+    pub path: String,
 }
 
 pub struct Session {
     pub path: PathBuf,
     pub messages: Vec<Message>,
+    pub injections: Vec<Injection>,
 }
 
 /// Session file name for `name`. Names must stay inside the sessions directory and
@@ -203,6 +215,7 @@ impl Session {
         Session {
             path: harness_dir.join(SESSIONS_DIR).join(format!("{name}.json")),
             messages: Vec::new(),
+            injections: Vec::new(),
         }
     }
 
@@ -218,7 +231,9 @@ impl Session {
         let mut session = Session {
             path,
             messages: file.messages,
+            injections: file.injections,
         };
+        session.validate_injections()?;
         let repaired = session.answer_unanswered_calls();
         if repaired > 0 {
             session.save()?;
@@ -258,9 +273,110 @@ impl Session {
         added
     }
 
+    /// Append a model/tool message and immediately persist the conversation.
     pub fn push(&mut self, message: Message) -> anyhow::Result<()> {
         self.messages.push(message);
         self.save()
+    }
+
+    /// Save user text and completed injections together; a failed save keeps the draft retryable.
+    pub fn submit(
+        &mut self,
+        text: String,
+        prepared: Vec<crate::injection::PreparedInjection>,
+    ) -> anyhow::Result<()> {
+        let message_count = self.messages.len();
+        let injection_count = self.injections.len();
+        self.messages.push(Message::user(text));
+        for injection in prepared {
+            let id = injection.call.id.clone();
+            self.messages.push(Message {
+                role: Role::Assistant,
+                tool_calls: Some(vec![injection.call]),
+                ..Default::default()
+            });
+            // User attachments preserve even empty contents and bypass the REPL output cap.
+            self.messages
+                .push(Message::tool(id.clone(), injection.content));
+            self.injections.push(Injection {
+                call_id: id,
+                path: injection.path,
+            });
+        }
+        if let Err(error) = self.save() {
+            self.messages.truncate(message_count);
+            self.injections.truncate(injection_count);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Remove exactly one tracked pair, restoring memory if persistence fails.
+    pub fn remove_injection(&mut self, id: &str) -> anyhow::Result<Vec<usize>> {
+        let tracked = self
+            .injections
+            .iter()
+            .position(|entry| entry.call_id == id)
+            .with_context(|| format!("file injection {id:?} is not tracked"))?;
+        let index = self.injection_index(id)?;
+        let messages: Vec<_> = self.messages.drain(index..index + 2).collect();
+        let injection = self.injections.remove(tracked);
+        if let Err(error) = self.save() {
+            self.messages.splice(index..index, messages);
+            self.injections.insert(tracked, injection);
+            return Err(error);
+        }
+        Ok(vec![index, index + 1])
+    }
+
+    /// Metadata must identify a complete, exclusive call/result pair, never unrelated messages.
+    fn injection_index(&self, id: &str) -> anyhow::Result<usize> {
+        let calls: Vec<_> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| {
+                message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| calls.iter().any(|call| call.id == id))
+            })
+            .collect();
+        let valid = calls.first().filter(|(_, message)| {
+            message.role == Role::Assistant
+                && message.content.is_empty()
+                && message.extra.is_empty()
+                && message
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| calls.len() == 1 && calls[0].function.name == "REPL")
+        });
+        if calls.len() != 1 || valid.is_none() {
+            bail!("invalid file injection {id:?}: expected one dedicated REPL call");
+        }
+        let index = calls[0].0;
+        let results: Vec<_> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.tool_call_id.as_deref() == Some(id))
+            .collect();
+        if results.len() != 1 || results[0].0 != index + 1 || results[0].1.role != Role::Tool {
+            bail!("invalid file injection {id:?}: expected its result immediately after the call");
+        }
+        Ok(index)
+    }
+
+    /// Reject inconsistent tracking on resume rather than displaying an unremovable entry.
+    fn validate_injections(&self) -> anyhow::Result<()> {
+        let mut ids = HashSet::new();
+        for injection in &self.injections {
+            if !ids.insert(&injection.call_id) {
+                bail!("duplicate file injection id {:?}", injection.call_id);
+            }
+            self.injection_index(&injection.call_id)?;
+        }
+        Ok(())
     }
 
     /// `/rename`: rename the session file, or before the first save, the file it will
@@ -282,7 +398,7 @@ impl Session {
         Ok(())
     }
 
-    /// Remove every tool call matching `matches`, with its tool result, and save if
+    /// Remove untracked tool calls matching `matches`, with results, and save if
     /// anything changed. An assistant message left empty (`Message::is_empty`) is
     /// removed too; one that still has content or another field stays without the
     /// call. Returns the pre-removal indices of the removed messages, ascending.
@@ -297,7 +413,9 @@ impl Session {
                 continue;
             };
             calls.retain(|call| {
-                let remove = matches(call);
+                // Only explicit instance removal may delete a user attachment.
+                let remove =
+                    !self.injections.iter().any(|entry| entry.call_id == call.id) && matches(call);
                 if remove {
                     removed_ids.insert(call.id.clone());
                 }
@@ -342,6 +460,7 @@ impl Session {
         }
         let json = serde_json::to_string_pretty(&SessionFileRef {
             messages: &self.messages,
+            injections: &self.injections,
         })?;
         let tmp = self.path.with_extension("json.tmp");
         let mut file =
@@ -351,5 +470,268 @@ impl Session {
             .with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, &self.path)
             .with_context(|| format!("renaming {} to {}", tmp.display(), self.path.display()))
+    }
+}
+
+#[cfg(test)]
+mod injection_tests {
+    use super::*;
+    use crate::injection::PreparedInjection;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        /// Isolate persisted sessions under a unique scratch directory.
+        fn new() -> Self {
+            static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "harness-session-injection-{}-{}-{}",
+                std::process::id(),
+                chrono::Local::now().timestamp_nanos_opt().unwrap(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+
+        /// Use a fixed session name within this fixture for resume assertions.
+        fn session(&self) -> Session {
+            let mut session = Session::new(&self.0);
+            session.path = self.0.join("sessions/test.json");
+            session
+        }
+
+        /// Exercise public resume rather than deserializing test state directly.
+        fn resume(&self) -> anyhow::Result<(Session, usize)> {
+            Session::resume(&self.0, "test")
+        }
+    }
+
+    impl Drop for Fixture {
+        /// Delete only scratch state owned by this test.
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Construct an already prepared attachment without accessing its source file.
+    fn prepared(id: &str, content: &str) -> PreparedInjection {
+        PreparedInjection {
+            call: ToolCall {
+                id: id.into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "REPL".into(),
+                    arguments: json!({"code": "print('attachment')"}).to_string(),
+                    extra: Map::new(),
+                },
+                extra: Map::new(),
+            },
+            content: content.into(),
+            path: "source-does-not-exist.txt".into(),
+        }
+    }
+
+    /// Compare the complete persisted contract, including tracking order.
+    fn state(session: &Session) -> Value {
+        json!({"messages": session.messages, "injections": session.injections})
+    }
+
+    /// Empty and large repeated instances survive resume without rereading sources.
+    #[test]
+    fn full_and_empty_instances_persist_without_request_metadata() {
+        let fixture = Fixture::new();
+        let mut session = fixture.session();
+        let large = "full contents\r\n".repeat(20_000);
+        session
+            .submit(
+                "@source-does-not-exist.txt".into(),
+                vec![
+                    prepared("injection-full", &large),
+                    prepared("injection-empty", ""),
+                ],
+            )
+            .unwrap();
+        assert_eq!(session.messages.len(), 5);
+        assert_eq!(session.messages[2].content, large);
+        assert_eq!(session.messages[4].content, "");
+        assert_eq!(session.injections.len(), 2);
+        assert_eq!(session.injections[0].path, session.injections[1].path);
+        let saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(&session.path).unwrap()).unwrap();
+        assert_eq!(saved, state(&session));
+        let (resumed, repaired) = fixture.resume().unwrap();
+        assert_eq!(repaired, 0);
+        assert_eq!(state(&resumed), saved);
+        for enabled in [false, true] {
+            let sent = crate::tool_reasoning::request_messages(&resumed.messages, enabled);
+            assert_eq!(json!(sent), saved["messages"]);
+            assert!(
+                sent.iter()
+                    .all(|message| message.get("injections").is_none())
+            );
+        }
+    }
+
+    /// Sessions written before tracking existed remain valid and untracked.
+    #[test]
+    fn legacy_session_without_injection_field_resumes() {
+        let fixture = Fixture::new();
+        let mut session = fixture.session();
+        session.submit("legacy text".into(), vec![]).unwrap();
+        std::fs::write(
+            &session.path,
+            json!({"messages": session.messages}).to_string(),
+        )
+        .unwrap();
+        let (resumed, repaired) = fixture.resume().unwrap();
+        assert_eq!(repaired, 0);
+        assert!(resumed.injections.is_empty());
+        assert_eq!(resumed.messages[0].content, "legacy text");
+    }
+
+    /// Automatic cleanup cannot remove tracked pairs, even with a broad matcher.
+    #[test]
+    fn cleanup_preserves_attachments_and_removes_fyi() {
+        let fixture = Fixture::new();
+        let mut session = fixture.session();
+        session
+            .submit("@file".into(), vec![prepared("injection-kept", "file")])
+            .unwrap();
+        let mut call = prepared("fyi-test", "").call;
+        call.function.arguments = json!({"code": "FYI()"}).to_string();
+        session
+            .push(Message {
+                role: Role::Assistant,
+                tool_calls: Some(vec![call]),
+                ..Default::default()
+            })
+            .unwrap();
+        session
+            .push(Message::tool("fyi-test".into(), "environment".into()))
+            .unwrap();
+        assert_eq!(session.remove_calls(|_| true).unwrap(), [3, 4]);
+        assert_eq!(session.messages.len(), 3);
+        assert_eq!(session.messages[2].content, "file");
+        assert_eq!(session.injections[0].call_id, "injection-kept");
+        assert_eq!(state(&fixture.resume().unwrap().0), state(&session));
+    }
+
+    /// Repeated filenames stay independent and removal leaves discussion intact.
+    #[test]
+    fn removes_only_selected_middle_instance() {
+        let fixture = Fixture::new();
+        let mut session = fixture.session();
+        session
+            .submit(
+                "@file\n@file\n@file".into(),
+                vec![
+                    prepared("injection-first", "one"),
+                    prepared("injection-middle", "two"),
+                    prepared("injection-last", "three"),
+                ],
+            )
+            .unwrap();
+        session
+            .push(Message {
+                role: Role::Assistant,
+                content: "I discussed two".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        session
+            .push(Message::user("Later discussion".into()))
+            .unwrap();
+        assert_eq!(
+            session.remove_injection("injection-middle").unwrap(),
+            [3, 4]
+        );
+        assert_eq!(
+            session
+                .injections
+                .iter()
+                .map(|entry| entry.call_id.as_str())
+                .collect::<Vec<_>>(),
+            ["injection-first", "injection-last"]
+        );
+        assert_eq!(session.messages[0].content, "@file\n@file\n@file");
+        assert_eq!(session.messages[2].content, "one");
+        assert_eq!(session.messages[4].content, "three");
+        assert_eq!(session.messages[5].content, "I discussed two");
+        assert_eq!(session.messages[6].content, "Later discussion");
+        let unchanged = state(&session);
+        assert!(session.remove_injection("injection-middle").is_err());
+        assert_eq!(state(&session), unchanged);
+        assert_eq!(state(&fixture.resume().unwrap().0), unchanged);
+    }
+
+    /// A failed save rolls back both messages and metadata for either mutation.
+    #[test]
+    fn failed_submit_and_remove_restore_memory() {
+        let fixture = Fixture::new();
+        let mut session = fixture.session();
+        session
+            .submit(
+                "@file".into(),
+                vec![prepared("injection-existing", "original")],
+            )
+            .unwrap();
+        let before = state(&session);
+        let saved_path = session.path.clone();
+        let blocked = fixture.0.join("not-a-directory");
+        std::fs::write(&blocked, "block parent creation").unwrap();
+        session.path = blocked.join("session.json");
+        assert!(
+            session
+                .submit("new draft".into(), vec![prepared("injection-new", "new")])
+                .is_err()
+        );
+        assert_eq!(state(&session), before);
+        assert!(session.remove_injection("injection-existing").is_err());
+        assert_eq!(state(&session), before);
+        let saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(saved_path).unwrap()).unwrap();
+        assert_eq!(saved, before);
+    }
+
+    /// Corrupt tracking must fail resume rather than target unrelated messages.
+    #[test]
+    fn rejects_inconsistent_metadata_on_resume() {
+        let fixture = Fixture::new();
+        let mut session = fixture.session();
+        session
+            .submit("@file".into(), vec![prepared("injection-test", "contents")])
+            .unwrap();
+        let original = state(&session);
+        for defect in 0..7 {
+            let mut invalid = original.clone();
+            match defect {
+                0 => invalid["injections"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(original["injections"][0].clone()),
+                1 => invalid["injections"][0]["call_id"] = json!("missing"),
+                2 => {
+                    invalid["messages"].as_array_mut().unwrap().pop();
+                }
+                3 => invalid["messages"][1]["content"] = json!("unrelated assistant content"),
+                4 => invalid["messages"][1]["tool_calls"][0]["function"]["name"] = json!("other"),
+                5 => invalid["messages"][2]["role"] = json!("user"),
+                6 => {
+                    invalid["messages"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(original["messages"][2].clone());
+                }
+                _ => unreachable!(),
+            }
+            std::fs::write(&session.path, invalid.to_string()).unwrap();
+            assert!(
+                fixture.resume().is_err(),
+                "accepted invalid metadata case {defect}"
+            );
+        }
     }
 }

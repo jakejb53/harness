@@ -10,10 +10,17 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use anyhow::Context;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui_textarea::TextArea;
@@ -27,12 +34,13 @@ use crate::client::{self, StreamEvent};
 use crate::commands::{self, Action, Completion};
 use crate::config::{self, Settings, Theme};
 use crate::failures::FailureLog;
+use crate::injection::{self, PreparedInjection};
 use crate::input::{self, InputAction};
 use crate::repl::{Repl, ReplEvent, Runtime};
 use crate::session::{FunctionCall, Message, NOT_RUN, Role, Session, ToolCall, reasoning_text};
 use crate::tool_reasoning;
 use crate::transcript::{Block, Key, View};
-use crate::tui::Tui;
+use crate::tui::{InjectionOverlay, Tui};
 
 const STOPPED: &str = "[stopped by user]";
 
@@ -61,6 +69,11 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
         signaled: false,
         completion: 0,
         completion_dismissed: None,
+        repo: std::env::current_dir().context("finding launch directory")?,
+        loading: None,
+        removing: None,
+        injection_scroll: 0,
+        overlay_gesture: false,
     };
     let result = app.run(&mut tui).await;
     app.runtime.close().await;
@@ -101,6 +114,44 @@ struct App {
     /// Input text for which Esc closed the completion list; it stays closed until
     /// the input changes.
     completion_dismissed: Option<String>,
+    /// User paths resolve from launch, independently of the sandbox's working directory.
+    repo: PathBuf,
+    /// No session changes occur until every explicit attachment has loaded successfully.
+    loading: Option<PendingInjection>,
+    /// Stable call id, not filename or row index, identifies the instance being confirmed.
+    removing: Option<String>,
+    injection_scroll: usize,
+    /// A gesture touching the overlay must not select or copy the transcript underneath it.
+    overlay_gesture: bool,
+}
+
+/// Owns one pre-submission read; dropping it makes late results ineligible for submission.
+struct PendingInjection {
+    text: String,
+    task: JoinHandle<anyhow::Result<Vec<PreparedInjection>>>,
+    canceled: Arc<AtomicBool>,
+}
+
+impl PendingInjection {
+    /// Keep potentially large file reads off the event loop without granting model access.
+    fn start(text: String, paths: Vec<String>, root: PathBuf) -> Self {
+        let canceled = Arc::new(AtomicBool::new(false));
+        let signal = canceled.clone();
+        let task = tokio::task::spawn_blocking(move || injection::load(paths, root, signal));
+        Self {
+            text,
+            task,
+            canceled,
+        }
+    }
+}
+
+impl Drop for PendingInjection {
+    /// Blocking reads cooperate between chunks; cancellation never commits a late result.
+    fn drop(&mut self) {
+        self.canceled.store(true, Ordering::Relaxed);
+        self.task.abort();
+    }
 }
 
 struct Turn {
@@ -217,6 +268,7 @@ enum Step {
     Signal,
     Input(Option<io::Result<Event>>),
     Turn(TurnEvent),
+    Injected(anyhow::Result<Vec<PreparedInjection>>),
 }
 
 enum TurnEvent {
@@ -250,7 +302,7 @@ impl App {
         let mut interrupt = signal(SignalKind::interrupt())?;
 
         loop {
-            let footer = self.footer();
+            let footer = self.footer(tui.width()?);
             let blocks = build_blocks(
                 self.settings.chat_prompt.as_deref(),
                 &self.session.messages,
@@ -265,7 +317,13 @@ impl App {
                 &self.textarea,
                 &footer,
                 &self.settings.theme,
+                InjectionOverlay {
+                    entries: &self.session.injections,
+                    scroll: self.injection_scroll,
+                    selected: self.removing.as_deref(),
+                },
             )?;
+            self.injection_scroll = self.injection_scroll.min(tui.injection_max_scroll());
             // Biased toward input so keys (Esc above all) are handled before more
             // output from a fast stream.
             let step = tokio::select! {
@@ -275,8 +333,10 @@ impl App {
                 _ = interrupt.recv() => Step::Signal,
                 event = input.recv() => Step::Input(event),
                 event = next_turn_event(&mut self.turn) => Step::Turn(event),
+                result = next_injection(&mut self.loading) => Step::Injected(result),
             };
             match step {
+                Step::Injected(result) => self.finish_injection(result)?,
                 Step::Signal => {
                     self.signaled = true;
                     return Ok(());
@@ -644,6 +704,9 @@ impl App {
     /// complete call gets a `[not run]` result so the session stays valid, shown under
     /// its call. `error` (a stream error) is shown as a note.
     fn stop_turn(&mut self, error: Option<String>) -> anyhow::Result<()> {
+        // Pre-submission cancellation preserves the draft and has no session effects.
+        self.loading = None;
+        self.removing = None;
         let Some(mut turn) = self.turn.take() else {
             return Ok(());
         };
@@ -703,6 +766,11 @@ impl App {
 
     /// Route terminal events, restricting input while a host operation awaits approval.
     fn on_input(&mut self, tui: &mut Tui, event: Event) -> anyhow::Result<Flow> {
+        if let Event::Mouse(mouse) = &event
+            && self.injection_mouse(tui, *mouse)
+        {
+            return Ok(Flow::Continue);
+        }
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 self.notice = None;
@@ -715,6 +783,21 @@ impl App {
                 };
                 if let Some(direction) = page {
                     self.view.page(direction);
+                    return Ok(Flow::Continue);
+                }
+                // Submission and removal are modal: neither can edit or send the held draft.
+                if self.loading.is_some() {
+                    if key.code == KeyCode::Esc {
+                        self.stop_turn(None)?;
+                    }
+                    return Ok(Flow::Continue);
+                }
+                if self.removing.is_some() {
+                    match key.code {
+                        KeyCode::Char('y') => self.confirm_removal(),
+                        KeyCode::Char('n') | KeyCode::Esc => self.removing = None,
+                        _ => {}
+                    }
                     return Ok(Flow::Continue);
                 }
                 // While a call awaits approval, only y/n, Esc, and Shift+Tab act.
@@ -794,7 +877,11 @@ impl App {
                 }
                 _ => {}
             },
-            Event::Paste(text) if self.pending_prompt().is_none() => {
+            Event::Paste(text)
+                if self.pending_prompt().is_none()
+                    && self.loading.is_none()
+                    && self.removing.is_none() =>
+            {
                 input::paste(&mut self.textarea, &text);
                 self.input_changed();
             }
@@ -802,6 +889,73 @@ impl App {
             _ => {}
         }
         Ok(Flow::Continue)
+    }
+
+    /// Consume overlay gestures before transcript selection, even when a drag leaves the box.
+    fn injection_mouse(&mut self, tui: &Tui, mouse: MouseEvent) -> bool {
+        let over = tui.over_injections(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if over => {
+                if self.removing.is_none() {
+                    self.injection_scroll = if mouse.kind == MouseEventKind::ScrollUp {
+                        self.injection_scroll.saturating_sub(1)
+                    } else {
+                        self.injection_scroll
+                            .saturating_add(1)
+                            .min(tui.injection_max_scroll())
+                    };
+                }
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.overlay_gesture = over;
+                if over {
+                    self.view.clear_selection();
+                    if self.removing.is_none()
+                        && self.loading.is_none()
+                        && let Some(id) = tui.injection_at(mouse.column, mouse.row)
+                    {
+                        if self.turn.is_some() {
+                            self.notice =
+                                Some("files can be removed between turns (esc to stop)".into());
+                        } else {
+                            self.removing = Some(id.to_owned());
+                        }
+                    }
+                }
+                over
+            }
+            MouseEventKind::Drag(MouseButton::Left) if over || self.overlay_gesture => {
+                self.overlay_gesture = true;
+                self.view.clear_selection();
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) if over || self.overlay_gesture => {
+                self.overlay_gesture = false;
+                self.view.clear_selection();
+                true
+            }
+            _ => over,
+        }
+    }
+
+    /// Only an idle-turn keyboard confirmation can remove the selected saved instance.
+    fn confirm_removal(&mut self) {
+        let Some(id) = self.removing.take() else {
+            return;
+        };
+        if self.turn.is_some() || self.loading.is_some() {
+            return;
+        }
+        match self.session.remove_injection(&id) {
+            Ok(removed) => {
+                self.messages_removed(&removed);
+                self.notes
+                    .retain(|note| !matches!(&note.anchor, Anchor::Call(call) if call == &id));
+                self.view.clear_selection();
+            }
+            Err(error) => self.notice = Some(format!("couldn't remove file: {error:#}")),
+        }
     }
 
     /// Expose the single pending prompt to key routing, completion, and status rendering.
@@ -880,7 +1034,24 @@ impl App {
 
     /// Rows below the input: the completion list while it shows, otherwise the
     /// status line.
-    fn footer(&self) -> Vec<Line<'static>> {
+    fn footer(&self, width: u16) -> Vec<Line<'static>> {
+        if let Some(id) = &self.removing
+            && let Some(entry) = self
+                .session
+                .injections
+                .iter()
+                .find(|entry| &entry.call_id == id)
+        {
+            // Escape control characters and wrap the full path, not the overlay's shortened label.
+            let prompt = format!("Remove {:?} from context? (y/n, esc to cancel)", entry.path);
+            return confirmation_lines(&prompt, width, self.settings.theme.approval);
+        }
+        if self.loading.is_some() {
+            return vec![Line::styled(
+                "Loading files… (esc to cancel)",
+                self.settings.theme.status,
+            )];
+        }
         let completions = self.completions();
         if completions.is_empty() {
             return vec![self.status_line()];
@@ -937,23 +1108,53 @@ impl App {
             return Ok(Flow::Continue);
         }
 
+        if self.loading.is_some() || self.removing.is_some() {
+            return Ok(Flow::Continue);
+        }
+        let paths = injection::paths(&text);
+        if paths.is_empty() {
+            self.commit_submission(text, Vec::new())?;
+        } else {
+            self.loading = Some(PendingInjection::start(text, paths, self.repo.clone()));
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// A failed attachment batch changes neither history nor draft; no partial files are sent.
+    fn finish_injection(
+        &mut self,
+        result: anyhow::Result<Vec<PreparedInjection>>,
+    ) -> anyhow::Result<()> {
+        let Some(mut pending) = self.loading.take() else {
+            return Ok(());
+        };
+        match result {
+            Ok(injections) => self.commit_submission(std::mem::take(&mut pending.text), injections),
+            Err(error) => {
+                self.notice = Some(format!("couldn't inject files: {error:#}"));
+                Ok(())
+            }
+        }
+    }
+
+    /// Persist attachments as completed calls; only FYI/help enter the execution queue.
+    fn commit_submission(
+        &mut self,
+        text: String,
+        injections: Vec<PreparedInjection>,
+    ) -> anyhow::Result<()> {
+        if let Err(error) = self.session.submit(text, injections) {
+            self.notice = Some(format!("couldn't submit: {error:#}"));
+            return Ok(());
+        }
         self.textarea.clear();
+        self.input_changed();
         self.view.scroll_to_bottom();
-        // Only the current turn's synthetic calls stay in context: remove every
-        // earlier call made only of `FYI()`/`help()` (synthetic or the model's own)
-        // before adding this turn's. The session file is the prompt, so they leave
-        // the file too.
+        // FYI/help are the only per-turn cleanup cases. Tracked file injections persist.
         let removed = self
             .session
             .remove_calls(|call| code_of(call).is_ok_and(|code| is_exempt(&code)))?;
-        // Notes placed after a message keep their place among the messages left.
-        for note in &mut self.notes {
-            if let Anchor::After(n) = &mut note.anchor {
-                *n -= removed.partition_point(|&index| index < *n);
-            }
-        }
-        self.session.push(Message::user(text))?;
-
+        self.messages_removed(&removed);
         // Each turn opens with two synthetic calls that the app makes as if the model
         // had: `FYI()` and `help()`, both exempt from approval. `advance` runs them,
         // then sends the first request.
@@ -972,7 +1173,17 @@ impl App {
             repl: None,
         });
         saved?;
-        Ok(Flow::Continue)
+        Ok(())
+    }
+
+    /// Keep display-only note positions attached to surviving conversation messages.
+    fn messages_removed(&mut self, removed: &[usize]) {
+        // Notes placed after a message keep their place among the messages left.
+        for note in &mut self.notes {
+            if let Anchor::After(n) = &mut note.anchor {
+                *n -= removed.partition_point(|&index| index < *n);
+            }
+        }
     }
 
     /// Show the current permission and the exact host operation awaiting approval.
@@ -1450,6 +1661,39 @@ async fn next_turn_event(turn: &mut Option<Turn>) -> TurnEvent {
     }
 }
 
+/// Wrap confirmation text by terminal cells so full paths remain reviewable before removal.
+fn confirmation_lines(text: &str, width: u16, style: Style) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(1));
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        let cells = Span::raw(character.to_string()).width();
+        if used + cells > width && !line.is_empty() {
+            lines.push(Line::styled(std::mem::take(&mut line), style));
+            used = 0;
+        }
+        line.push(character);
+        used += cells;
+    }
+    if !line.is_empty() {
+        lines.push(Line::styled(line, style));
+    }
+    lines
+}
+
+/// Poll only the current batch; dropping it prevents canceled reads from submitting later.
+async fn next_injection(
+    pending: &mut Option<PendingInjection>,
+) -> anyhow::Result<Vec<PreparedInjection>> {
+    let Some(pending) = pending else {
+        return std::future::pending().await;
+    };
+    (&mut pending.task)
+        .await
+        .context("joining file injection reads")?
+}
+
 /// Await only the current approval's request; cancellation never queues a stale result.
 async fn next_description(prompt: &mut Option<PendingPrompt>) -> anyhow::Result<String> {
     let Some(task) = prompt
@@ -1492,6 +1736,53 @@ fn spawn_input_reader() -> UnboundedReceiver<io::Result<Event>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed asynchronous batch retains the exact held draft for correction.
+    #[tokio::test]
+    async fn failed_injection_keeps_held_draft() {
+        let text = "Review these\n@\n trailing space ".to_string();
+        let mut pending = Some(PendingInjection::start(
+            text.clone(),
+            injection::paths(&text),
+            std::env::temp_dir(),
+        ));
+        let error = next_injection(&mut pending).await.err().unwrap();
+        assert!(format!("{error:#}").contains("attachment path is empty"));
+        assert_eq!(pending.as_ref().unwrap().text, text);
+    }
+
+    /// Abandoning a read cannot produce a later submission event, even if its task was ready.
+    #[tokio::test]
+    async fn canceled_injection_cannot_submit_late() {
+        let canceled = Arc::new(AtomicBool::new(false));
+        let mut pending = Some(PendingInjection {
+            text: "@file".into(),
+            task: tokio::spawn(async { Ok(Vec::new()) }),
+            canceled: canceled.clone(),
+        });
+        tokio::task::yield_now().await;
+        pending.take();
+        assert!(canceled.load(Ordering::Relaxed));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), next_injection(&mut pending))
+                .await
+                .is_err()
+        );
+    }
+
+    /// Confirmation wrapping preserves all characters rather than shortening the path.
+    #[test]
+    fn confirmation_retains_full_path() {
+        let text = "Remove \"長い名前/a file with spaces.txt\" from context? (y/n, esc to cancel)";
+        let lines = confirmation_lines(text, 20, Style::default());
+        assert!(lines.iter().all(|line| line.width() <= 20));
+        let rendered: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(rendered, text);
+    }
 
     /// Read the explicit example palette instead of maintaining hidden test defaults.
     fn test_theme() -> Theme {

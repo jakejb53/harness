@@ -5,6 +5,7 @@ mod config;
 mod failures;
 mod host;
 mod hostfs;
+mod injection;
 mod input;
 mod repl;
 mod session;
