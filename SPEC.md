@@ -1,10 +1,10 @@
 # harness
 
-Terminal chat client for an OpenAI-compatible chat completions endpoint, with one tool: a Python REPL.
+Terminal chat client for an OpenAI-compatible chat completions endpoint, with one tool: a sandboxed Monty Python-subset REPL. Read `SPEC-sandbox.md` for the detailed runtime, permissions, host-command, library, failure-log, and approval-description contracts.
 
 ## Files
 
-All paths are relative to the harness directory, `~/.harness` (home directory from the OS; not found is an error before the TUI starts), shared by every working directory. The working directory is only where the REPL runs and the classifier's repository root.
+All paths are relative to the harness directory, `~/.harness` (home directory from the OS; not found is an error before the TUI starts), shared by every working directory. The launch working directory is the repository root for sandbox filesystem access and the default host-command working directory.
 
 - `config.toml`:
   ```toml
@@ -17,28 +17,36 @@ All paths are relative to the harness directory, `~/.harness` (home directory fr
   prompt = """..."""                 # chat system message; omitted = none
   tool_reasoning = false             # see Tool reasoning; rewritten by /tool-reasoning
 
-  [classifier]
-  prompt = """..."""                 # required: classifier system prompt
-
   [repl]
-  approval_mode = "auto"             # "allow" | "ask" | "auto"; rewritten by Shift+Tab
+  tool_description = "..."           # sent verbatim in the REPL tool definition
+  permission = "none"                # "none" | "read-only" | "read-write"; rewritten by Shift+Tab
+  max_memory_mb = 2048               # worker memory limit in MiB
   output_limit = 100000              # bytes of output per call sent to the model
+
+  [commands]
+  deny = ["git", "rm"]               # command names; deny takes precedence over allow
+  env_filter = ["GITHUB_TOKEN"]      # exact names removed from command environments
+
+  [commands.allow]                   # command name = absolute executable path
   ```
-  `tool_reasoning`, `approval_mode`, and `output_limit` are required; the values above are examples, not runtime defaults. Unknown keys are rejected. A missing or invalid config, a missing required setting, or an `api_key_env` naming an unset variable is an error before the TUI starts. Shift+Tab rewrites only `approval_mode`, and `/tool-reasoning` only `tool_reasoning`, preserving the rest of the file.
-- `.env`: read if present, only to resolve `api_key_env`; shell variables take precedence. It is never added to the process environment, so the REPL doesn't inherit it. No permission checks; the app never edits `.gitignore`.
+  All settings shown are required except `api_key_env` and `chat.prompt`; the values above are examples, not runtime defaults. The required `[theme]` table is specified under Terminal UI. Keep `[commands.allow]` even when empty; its values must be absolute paths. Unknown keys are rejected. A missing or invalid config, a missing required setting, or an `api_key_env` naming an unset variable is an error before the TUI starts. Shift+Tab rewrites only `permission`, and `/tool-reasoning` only `tool_reasoning`, preserving the rest of the file.
+  Optional `[approval_description]` configuration is specified in `SPEC-sandbox.md`; absent or disabled means no description requests.
+- `.env`: read if present, only to resolve endpoint credentials; shell variables take precedence. Its values are never exported to host commands. The sandbox environment is empty. No permission checks; the app never edits `.gitignore`.
 - `sessions/<name>.json`: `{ "messages": [...] }`. A new session's name is its start time, `YYYYMMDD-HHMMSS` (local time); `/rename` changes it. Valid names are non-empty, without `/`, and don't start with `.`. Created on first save. Every save writes a synced temp file and renames it over the session file.
 - `replib/*.py`: optional REPL function library (see REPL).
+- `repl-notes.md`: optional guidance included by `help()`.
+- `failures.jsonl`: app denials and unsupported Monty operations, with occurrence counts shown as display-only call notes; format and counting rules are specified in `SPEC-sandbox.md`.
 
 ## Messages
 
-- `messages` is exactly the array sent to the endpoint, after the system message. `--system-prompt <TEXT>` overrides `[chat] prompt` for this invocation, including resumed sessions. The argument is literal text used verbatim, including an empty string. Without it, the configured prompt is used. The effective prompt is displayed and added at send time, never saved to configuration or session files.
+- `messages` is the saved conversation. Requests use it after applying the optional Tool reasoning conversion and prepending the effective system message. `--system-prompt <TEXT>` overrides `[chat] prompt` for this invocation, including resumed sessions. The argument is literal text used verbatim, including an empty string. Without it, the configured prompt is used. The effective prompt is displayed and added at send time, never saved to configuration or session files.
   - user: `{"role": "user", "content"}`
-  - assistant: `{"role": "assistant", "content", "tool_calls"?, ...}`; `tool_calls` entries are `{"id", "type": "function", "function": {"name", "arguments"}}`. Every other field the endpoint streamed (reasoning under whatever name it uses, and unknown fields, here and inside tool calls) is kept and sent back unchanged.
+  - assistant: `{"role": "assistant", "content", "tool_calls"?, ...}`; `tool_calls` entries are `{"id", "type": "function", "function": {"name", "arguments"}}`. Every other field the endpoint streamed (reasoning under whatever name it uses, and unknown fields, here and inside tool calls) is kept; outgoing reasoning fields change only through Tool reasoning conversion.
   - tool: `{"role": "tool", "tool_call_id", "content"}`
 - The user message is saved on send. An assistant message is saved once when its response ends (completed, Esc, error, `/exit`, or app exit), with every field that arrived, if any (besides `role`) has a value; `null`, `""`, `[]`, and `{}` don't count. A tool call without an `id` or `function.name` is dropped. A tool call still streaming when the response is interrupted or cut off at the token limit (`finish_reason: "length"`), meaning its arguments aren't valid JSON, is dropped.
 - Every tool call in a saved assistant message is followed by exactly one tool message before the next request.
 - Messages are only removed by the per-turn `FYI()`/`help()` cleanup (see Tool calling).
-- Errors and classifier verdicts are shown in the transcript and never saved.
+- Display-only errors, failure-count notes, and approval descriptions are never saved in the conversation. Tool error results are saved and sent to the model.
 - `--resume` without a name prints the session names, one per line, by file modification time, oldest first, and exits without loading the config or starting the TUI. `--resume <NAME>` loads `sessions/<NAME>.json`, shows the whole conversation, and appends to the same file. An invalid name or a missing or unparseable file is an error before the TUI starts. Any tool call without a result gets `[not run: turn stopped]`, inserted after its call's existing results and saved at once, with a line printed to the normal screen before the TUI starts (visible after exit).
 
 ## Requests
@@ -46,25 +54,21 @@ All paths are relative to the harness directory, `~/.harness` (home directory fr
 - Optional `[endpoint.parameters]` entries are forwarded as top-level JSON request fields; omitted entries are not sent. Endpoint-specific names and ranges are validated by the endpoint. Harness rejects `model`, `messages`, `tools`, `stream`, `stream_options`, and `n` as reserved keys, and rejects non-finite floats and TOML dates/times at any nesting depth. Strings, integers, finite floats, booleans, arrays, and tables retain their JSON-compatible values.
 - Chat: `POST {base_url}/chat/completions` with `{"model", "stream": true, "stream_options": {"include_usage": true}, "tools": [REPL], "messages"}`, plus bearer auth when a key is configured. When an effective system prompt is present, `messages` starts with `{"role": "system", "content": <effective prompt>}`.
 - SSE `data:` lines: each `delta` is merged into the reply by the OpenAI SDK's `accumulate_delta` rule, whatever its fields: strings appended, numbers added, objects merged recursively, lists of entries with an `index` merged by matching `index` value (a fragment without one is appended), other lists extended; `index` and `type` are replaced; a value of a different type (such as a later `null`) is ignored. `role` is always `assistant`; `index` is removed from saved tool calls. `usage.total_tokens` is the context count and `usage.prompt_tokens` is retained for the next turn's FYI snapshot, an `error` object is an error. `[DONE]` ends the stream. EOF without `[DONE]` is an error unless a `finish_reason` was seen. A non-2xx response is an error showing status and body.
-- Classifier: non-streaming request to the same endpoint and model. System message: `[classifier] prompt`. User message: `Repository root: <absolute working directory>` and the code in a fenced block. `response_format` is a strict JSON schema `{"effects": string, "verdict": "safe" | "unsafe" | "inconclusive"}`, both required, in that order.
+- Optional approval descriptions use an independent, non-streaming endpoint request containing only the configured prompt with the pending operation substituted. Configuration, request contents, cancellation, and display behavior are specified in `SPEC-sandbox.md`.
 
 ## Tool calling
 
-- The REPL tool definition is fixed in code:
+- The REPL tool definition:
   - name `REPL`, one required string parameter `code`
-  - description: "Execute Python in a REPL session. State persists for the lifetime of the current turn — variables and data survive across the tool calls you make during the current turn, but never carry over to a later turn. Call help() to see the available functions and libraries."
+  - description: `[repl] tool_description`, loaded at startup and sent verbatim.
 - A turn starts with a user message. Each response's tool calls are handled in order, their results are sent, and the next response is requested. The turn ends when a response has no tool calls, on Esc, or on a stream error.
-- **Situational awareness.** Each turn opens with synthetic calls. First, every earlier `REPL` call whose code is made only of `FYI()`/`help()` statements (synthetic or the model's own) is removed with its result; an assistant message left with no calls, content, or other field with a value is removed too, and the session is saved. Then, after the user message, the app saves an assistant message with two `REPL` calls, `{"code": "FYI()"}` and `{"code": "help()"}` (ids `fyi-<unix millis>-<counter>`), and runs them in the REPL like any other calls, before the first request. So the context always holds exactly one environment snapshot and one library listing: the current turn's. `FYI()` is the driver's only snapshot implementation; it prints the lines `FYI()`, `Date: <%a %b %d %H:%M:%S %:z %Y>`, `Prompt tokens: <latest usage.prompt_tokens>` (omitted until a response reports usage), and `Model: <model>`, and returns `None`. Honesty rule: a synthetic call is a real call the model could make itself, so an explicit `FYI()` works the same way (its token count is the latest at call time). `FYI()` is not in the registry, so `help()` doesn't list it.
-- **Approval exemption contract.** All synthetic tool calls, present and future, including `FYI()` and `help()`, never require approval, whether generated by the app or explicitly called by the model. This holds in every approval mode and sandbox permission level. Code consisting only of these calls is exempt; unrelated code bundled with them, including code evaluated in arguments, does not inherit the exemption and follows normal approval rules.
-- `reasoning()` is not a synthetic tool call and has a separate approval exemption. Code that is exactly `reasoning(<one string literal>)` (optional `r`/`u` prefix, any quoting; not f-strings, bytes, concatenation, keyword arguments, or other code alongside) is never approved, classified, or run: its result is `(no output)` in every mode and permission level, since `reasoning()` is a no-op the model is meant to call freely and the REPL's `reasoning` may have been rebound. Its exemption never extends to unrelated code.
-- Approval for non-exempt calls, per `approval_mode` at the moment each call is handled:
-  - `allow`: run.
-  - `ask`: prompt `allow? (y/n)`.
-  - `auto`: classify. `safe` runs; `unsafe` returns `Blocked: <effects>`; `inconclusive` or a classifier failure prompts.
-  - At the prompt, `y` runs and `n` returns `Denied by user: <effects>` (or `Denied by user.` without effects).
+- **Situational awareness.** Each turn opens with synthetic calls. First, every earlier `REPL` call whose code is made only of `FYI()`/`help()` statements (synthetic or the model's own) is removed with its result; an assistant message left with no calls, content, or other field with a value is removed too, and the session is saved. Then, after the user message, the app saves an assistant message with two `REPL` calls, `{"code": "FYI()"}` and `{"code": "help()"}` (ids `fyi-<unix millis>-<counter>`), and runs them in the REPL like any other calls, before the first request. `FYI()` is a host function implemented in `src/host.rs`; it prints the lines `FYI()`, `Date: <%a %b %d %H:%M:%S %:z %Y>`, `Prompt tokens: <latest usage.prompt_tokens>` (omitted until a response reports usage), and `Model: <model>`, and returns `None`. Honesty rule: a synthetic call is a real call the model could make itself, so an explicit `FYI()` works the same way (its token count is the latest at call time). `help()` lists `FYI()` among the host functions.
+- **Approval exemption contract.** All synthetic tool calls, present and future, including `FYI()` and `help()`, never require approval, whether generated by the app or explicitly called by the model. This holds at every sandbox permission level. Code consisting only of these calls is exempt; unrelated code bundled with them, including code evaluated in arguments, does not inherit the exemption and follows normal permission and approval rules.
+- `reasoning()` is not a synthetic tool call and has a separate approval exemption. Code that is exactly `reasoning(<one string literal>)` (optional `r`/`u` prefix, any quoting; not f-strings, bytes, concatenation, keyword arguments, or other code alongside) is answered without approval or execution: its result is `(no output)` at every permission level, since `reasoning()` is a no-op the model is meant to call freely and the REPL's `reasoning` may have been rebound. Its exemption never extends to unrelated code.
+- Calls run in Monty; individual filesystem and host-command operations enforce the permissions and approvals specified in `SPEC-sandbox.md`. At a host-operation prompt, `y` allows that operation and `n` raises a permission error at the call.
 - A call that isn't `REPL`, or whose arguments aren't JSON with a string `code`, returns an error result without running.
-- Result: stdout and stderr in written order, then the repr of a trailing expression if not `None`, then a traceback if the code raised; `(no output)` if empty. Truncated at `output_limit` bytes on a character boundary, followed by `[output truncated: N more bytes]`.
-- Esc (or exit) while code runs kills the REPL's process group; the result is the output so far plus `[stopped by user]`. Every complete call that never ran gets `[not run: turn stopped]`.
+- Result: printed output in order, then the repr of a trailing expression if not `None`, then the runtime error if the code raised; `(no output)` if empty. Host commands return captured stdout and stderr rather than printing them. Truncated at `output_limit` bytes on a character boundary, followed by `[output truncated: N more bytes]`.
+- Esc (or exit) while code runs discards the REPL worker and kills any active host command's process group; the result is the output so far plus `[stopped by user]`. Every complete call that never ran gets `[not run: turn stopped]`.
 - SIGHUP, SIGTERM, and SIGINT stop the turn the same way (recording only, no transcript output) and exit.
 
 ## Tool reasoning
@@ -77,11 +81,12 @@ Experimental. With `[chat] tool_reasoning` on, each request and the transcript s
 
 ## REPL
 
-- `python3 -u -c <embedded driver>` from `PATH`, in the working directory, as the user, unsandboxed. The driver first calls `setsid()`: it has no controlling terminal (programs opening `/dev/tty` fail immediately), and it leads a process group that is killed as a whole. Started by a turn's first call (the synthetic `FYI()`, so every turn), reused for the turn's later calls, killed when the turn ends. If it dies mid-call, the result ends with `[REPL process exited: …]` and the next call starts a new process.
-- Protocol: JSON lines over the process's original stdin/stdout. Host sends `{"code", "prompt_tokens"}` (the latest `usage.prompt_tokens` or `null`, stored for `FYI()`); driver sends `{"output"}` chunks as written, then `{"done": true, "value", "error"}`. The code's stdin is `/dev/null`, and its fds 1 and 2 (inherited by subprocesses) go to a pipe the driver reads.
-- Code runs in one namespace per process. A trailing expression's value is returned and bound to `_`. `exit()` doesn't end the REPL.
-- `replib/*.py` (in the harness directory; the driver gets its absolute path as `HARNESS_LIBRARY_DIR`) are executed in sorted order at startup with `register` in scope; `@register` adds a function to the namespace and to `help()`. Load errors are printed in the first call's output.
-- `help()` prints the output limit, then each registered function's signature and docstring, or `No registered functions.`. `help(obj)` is Python's `help`.
+- Monty runs in a worker of the harness binary, managed by a single-worker pool. The first call of each turn checks out a fresh session and loads the library. State persists across that turn's calls; normal turn completion finishes the session and returns the worker. Cancellation discards it.
+- Static type checking is disabled. Ordinary runtime exceptions preserve completed effects and surviving state. A worker crash or memory-limit failure discards state, reports that loss explicitly, and causes the next call to start a fresh session and reload the library without replaying failed code. Limits and recovery messages are specified in `SPEC-sandbox.md`.
+- Filesystem operations use the repository mount and the current permission level: `none` denies reads and writes, `read-only` allows reads, and `read-write` allows both. Outside access is denied at every level. Permission changes apply to the next operation, including mid-call; path-containment rules are specified in `SPEC-sandbox.md`.
+- `run(argv, cwd=None)` executes host commands outside the sandbox, independently of filesystem permissions. Command resolution, approvals, working-directory restrictions, environment filtering, and cancellation are specified in `SPEC-sandbox.md`.
+- `replib/*.py` files execute in name order at session start under normal operation permissions. Public top-level functions are listed by source signature and docstring; names beginning with `_` are omitted. Load errors appear in the first call's output, failed files are omitted from the listing, and loading continues after ordinary errors.
+- `help()` takes no arguments and prints the output limit, optional `repl-notes.md`, host functions, loaded public library functions, and allow-listed command names. `lib_source(name)` returns the current contents of `replib/<name>.py`. Starter-library behavior is specified in `SPEC-sandbox.md`.
 
 ## Terminal UI
 
@@ -99,7 +104,7 @@ Experimental. With `[chat] tool_reasoning` on, each request and the transcript s
 - Selection: dragging selects transcript text (reverse video); dragging onto the top row or below the transcript scrolls one row per mouse event. Releasing copies the selection's source text (without wrap breaks) with OSC 52. The selection stays until the next click or key press. A failed copy shows the notice `couldn't copy: <error>`.
 - Each frame is one synchronized update.
 - Bottom region: a top rule in `theme.status`, a `> ` prompt and input text in `theme.input` (word-wrapped, growing up to half the screen height), and a status line, or the command completion list in its place (see Commands); the region grows to fit the list. Completion labels use `theme.status`, with the selected row reversed. A click there only clears the selection.
-- Status line uses `theme.status`, approval prompts/descriptions use `theme.approval`, and notices use `theme.warning`. The sandbox status fields are specified in `SPEC-sandbox.md`.
+- Status line shows the model, reported token count when available, permission level, and `tool reasoning` when enabled. It uses `theme.status`, approval prompts/descriptions use `theme.approval`, and notices use `theme.warning`. Prompt and description behavior is specified in `SPEC-sandbox.md`.
 - Bracketed paste is enabled. Pasted text is inserted as-is (CR and CRLF become LF) and never sends.
 
 ## Keys
@@ -111,7 +116,7 @@ Experimental. With `[chat] tool_reasoning` on, each request and the transcript s
 | ^K | Delete to end of line; at end of line, join the next line |
 | ^U | Delete to start of line; at start of line, join the previous line |
 | Esc | Stop the turn; with the completion list open, only close it |
-| Shift+Tab | Cycle approval mode: ask → auto → allow |
+| Shift+Tab | Cycle filesystem permission: none → read-only → read-write → none; saved to configuration |
 | Up / Down, Tab | With the completion list open: move the highlight (wrapping), complete to the highlighted command |
 | y / n | Answer an approval prompt (while it shows, only y, n, Esc, Shift+Tab, PageUp/PageDown, and the mouse act) |
 | PageUp / PageDown | Scroll the transcript a screen, less two rows |
@@ -141,10 +146,15 @@ Experimental. With `[chat] tool_reasoning` on, each request and the transcript s
 | `src/transcript.rs` | Transcript view: word wrap, scrolling, selection |
 | `src/input.rs` | Textarea setup, key map, paste |
 | `src/commands.rs` | Command table: names, aliases, descriptions, actions, arguments |
-| `src/client.rs` | REPL tool definition, streaming request, SSE parsing and delta merging, classifier request |
-| `src/repl.rs` | REPL process lifecycle and protocol |
-| `src/repl_driver.py` | Embedded Python driver |
-| `src/config.rs` | Harness directory, `config.toml` (including `approval_mode` and `tool_reasoning` persistence) and `.env` |
+| `src/client.rs` | REPL tool definition, streaming request, SSE parsing and delta merging, approval-description request |
+| `src/repl.rs` | Monty pool and per-turn session lifecycle, suspension handling, library loading, recovery |
+| `src/worker.rs` | Monty worker protocol and memory limits |
+| `src/host.rs` | Host functions, command execution and approvals, library metadata |
+| `src/hostfs.rs` | Per-operation filesystem permissions and repository-mount dispatch |
+| `src/failures.rs` | Failure-log persistence and occurrence counts |
+| `src/config.rs` | Harness directory, configuration and endpoint credentials, permission and tool-reasoning persistence |
 | `src/session.rs` | Message types, session file I/O, listing, renaming |
 | `src/tool_reasoning.rs` | Tool reasoning conversion and the `reasoning()` approval exemption |
 | `replib/reasoning.py` | `reasoning()` library function |
+| `replib/glob.py` | Sorted relative-path globbing |
+| `replib/search.py` | Regex file search with path, line, and text results |
