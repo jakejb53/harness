@@ -31,21 +31,30 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::client::{self, StreamEvent};
-use crate::commands::{self, Action, Completion};
+use crate::commands::{self, Action};
 use crate::config::{self, Settings, Theme};
 use crate::failures::FailureLog;
 use crate::injection::{self, PreparedInjection};
 use crate::input::{self, InputAction};
 use crate::repl::{Repl, ReplEvent, Runtime};
-use crate::session::{FunctionCall, Message, NOT_RUN, Role, Session, ToolCall, reasoning_text};
+use crate::session::{
+    FunctionCall, Injection, Message, NOT_RUN, Role, Session, ToolCall, reasoning_text,
+};
+use crate::tool_call_id;
 use crate::tool_reasoning;
 use crate::transcript::{Block, Key, View};
 use crate::tui::{InjectionOverlay, Tui};
 
 const STOPPED: &str = "[stopped by user]";
 
-/// Most rows the command completion list shows at once.
+/// Most rows either completion list shows at once.
 const COMPLETION_ROWS: usize = 8;
+
+/// Shared list entry; a missing command identifies a literal `@filename` completion.
+struct Completion {
+    spelling: String,
+    command: Option<&'static commands::Command>,
+}
 
 /// Validate persistent failure history and start workers before taking over the terminal.
 pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
@@ -69,6 +78,8 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
         signaled: false,
         completion: 0,
         completion_dismissed: None,
+        file_completions: Vec::new(),
+        file_completion_context: None,
         repo: std::env::current_dir().context("finding launch directory")?,
         loading: None,
         removing: None,
@@ -114,6 +125,9 @@ struct App {
     /// Input text for which Esc closed the completion list; it stays closed until
     /// the input changes.
     completion_dismissed: Option<String>,
+    /// Directory-derived candidates refresh on editor changes, never during transcript redraws.
+    file_completions: Vec<String>,
+    file_completion_context: Option<(usize, String)>,
     /// User paths resolve from launch, independently of the sandbox's working directory.
     repo: PathBuf,
     /// No session changes occur until every explicit attachment has loaded successfully.
@@ -125,7 +139,7 @@ struct App {
     overlay_gesture: bool,
 }
 
-/// Owns one pre-submission read; dropping it makes late results ineligible for submission.
+/// Owns one local attachment batch; dropping it prevents late reads from changing history.
 struct PendingInjection {
     text: String,
     task: JoinHandle<anyhow::Result<Vec<PreparedInjection>>>,
@@ -302,7 +316,9 @@ impl App {
         let mut interrupt = signal(SignalKind::interrupt())?;
 
         loop {
-            let footer = self.footer(tui.width()?);
+            // Attachment rows are a projection of saved calls, never a separate source of truth.
+            let injections = self.session.injections()?;
+            let footer = self.footer(tui.width()?, &injections);
             let blocks = build_blocks(
                 self.settings.chat_prompt.as_deref(),
                 &self.session.messages,
@@ -318,7 +334,7 @@ impl App {
                 &footer,
                 &self.settings.theme,
                 InjectionOverlay {
-                    entries: &self.session.injections,
+                    entries: &injections,
                     scroll: self.injection_scroll,
                     selected: self.removing.as_deref(),
                 },
@@ -427,7 +443,7 @@ impl App {
         let mut event = Some(event);
         while let Some(current) = event.take() {
             match current {
-                StreamEvent::Delta(delta) => client::accumulate(&mut reply.fields, delta),
+                StreamEvent::Delta(delta) => accumulate_reply(&mut reply.fields, delta)?,
                 StreamEvent::Usage { total, prompt } => {
                     self.context_tokens = Some(total);
                     if let Some(prompt) = prompt {
@@ -470,8 +486,8 @@ impl App {
 
     /// Save the response as an assistant message. Returns its complete tool calls and
     /// the save result (the message is in the session either way; a failed save is
-    /// retried by the next one). Every field the endpoint sent is kept, so it gets
-    /// its own format back. A call without an id or name is dropped, and when
+    /// retried by the next one). Provider call IDs are replaced before saving;
+    /// other endpoint fields are retained. A call without an id or name is dropped, and when
     /// `interrupted`, so is a call whose arguments aren't valid JSON: it was still
     /// streaming and never ran, so nothing it did needs recording.
     fn save_reply(
@@ -826,15 +842,22 @@ impl App {
                             return Ok(Flow::Continue);
                         }
                         KeyCode::Tab => {
-                            self.textarea.clear();
-                            self.textarea.insert_str(completions[selected].spelling);
+                            let completion = &completions[selected];
+                            if completion.command.is_some() {
+                                self.textarea.clear();
+                                self.textarea.insert_str(&completion.spelling);
+                            } else {
+                                // File spellings always begin with the attachment marker.
+                                input::complete_file(&mut self.textarea, &completion.spelling[1..]);
+                            }
                             self.input_changed();
                             return Ok(Flow::Continue);
                         }
-                        KeyCode::Enter => {
+                        KeyCode::Enter if completions[selected].command.is_some() => {
                             let completion = &completions[selected];
-                            if !completion.command.takes_argument {
-                                return self.run_command(completion.command.action, "");
+                            let command = completion.command.expect("guarded command completion");
+                            if !command.takes_argument {
+                                return self.run_command(command.action, "");
                             }
                             // Can't run without its argument: complete it, followed by a
                             // space (which closes the list), ready for the argument.
@@ -851,10 +874,17 @@ impl App {
                         _ => {}
                     }
                 }
+                // No filename match means Tab leaves the literal path untouched.
+                if key.code == KeyCode::Tab && input::file_prefix(&self.textarea).is_some() {
+                    return Ok(Flow::Continue);
+                }
                 let before = self.textarea.lines().to_vec();
+                let before_cursor = self.textarea.cursor();
                 let action = input::handle_key(&mut self.textarea, key);
                 if self.textarea.lines() != before.as_slice() {
                     self.input_changed();
+                } else if self.textarea.cursor() != before_cursor {
+                    self.refresh_file_completions();
                 }
                 match action {
                     InputAction::Submit(text) => return self.submit(text),
@@ -1006,23 +1036,16 @@ impl App {
         Ok(Flow::Continue)
     }
 
-    /// Completions for the input, or none when the list isn't showing: the input must
-    /// be one line starting with `/` and without whitespace, Esc must not have closed
-    /// the list for it, and no approval prompt may be showing (the list replaces the
-    /// status line, which carries the prompt).
+    /// Both providers share the list; modal operations retain ownership of the footer.
     fn completions(&self) -> Vec<Completion> {
-        let approving = self.pending_prompt().is_some();
-        let [input] = self.textarea.lines() else {
-            return Vec::new();
-        };
-        if approving
-            || !input.starts_with('/')
-            || input.contains(char::is_whitespace)
-            || self.completion_dismissed.as_ref() == Some(input)
-        {
+        if self.pending_prompt().is_some() || self.loading.is_some() || self.removing.is_some() {
             return Vec::new();
         }
-        commands::completions(input)
+        completion_candidates(
+            &self.textarea,
+            &self.file_completions,
+            self.completion_dismissed.as_deref(),
+        )
     }
 
     /// The input text changed: highlight the first completion again and reopen a
@@ -1030,17 +1053,33 @@ impl App {
     fn input_changed(&mut self) {
         self.completion = 0;
         self.completion_dismissed = None;
+        self.refresh_file_completions();
+    }
+
+    /// Read filenames only when an attachment prefix activates or changes, never on redraw.
+    fn refresh_file_completions(&mut self) {
+        let context =
+            input::file_prefix(&self.textarea).map(|(row, prefix)| (row, prefix.to_owned()));
+        if context == self.file_completion_context {
+            return;
+        }
+        self.completion = 0;
+        self.completion_dismissed = None;
+        self.file_completions.clear();
+        if let Some((_, prefix)) = &context {
+            match injection::completions(&self.repo, prefix) {
+                Ok(files) => self.file_completions = files,
+                Err(error) => self.notice = Some(format!("couldn't complete files: {error:#}")),
+            }
+        }
+        self.file_completion_context = context;
     }
 
     /// Rows below the input: the completion list while it shows, otherwise the
     /// status line.
-    fn footer(&self, width: u16) -> Vec<Line<'static>> {
+    fn footer(&self, width: u16, injections: &[Injection]) -> Vec<Line<'static>> {
         if let Some(id) = &self.removing
-            && let Some(entry) = self
-                .session
-                .injections
-                .iter()
-                .find(|entry| &entry.call_id == id)
+            && let Some(entry) = injections.iter().find(|entry| &entry.call_id == id)
         {
             // Escape control characters and wrap the full path, not the overlay's shortened label.
             let prompt = format!("Remove {:?} from context? (y/n, esc to cancel)", entry.path);
@@ -1053,7 +1092,10 @@ impl App {
             )];
         }
         let completions = self.completions();
-        if completions.is_empty() {
+        // A failed attachment must remain visible even when its typed prefix still has matches.
+        if completions.is_empty()
+            || (self.notice.is_some() && input::file_prefix(&self.textarea).is_some())
+        {
             return vec![self.status_line()];
         }
         let selected = self.completion.min(completions.len() - 1);
@@ -1072,7 +1114,7 @@ impl App {
             .map(|(index, completion)| {
                 // Indented to line up with the input text after the `> ` prompt.
                 let name = format!("  {:width$}   ", completion.spelling);
-                let description = completion.command.description;
+                let description = completion.command.map_or("", |command| command.description);
                 if index == selected {
                     let reversed = self.settings.theme.status.reversed();
                     Line::from(vec![
@@ -1113,7 +1155,7 @@ impl App {
         }
         let paths = injection::paths(&text);
         if paths.is_empty() {
-            self.commit_submission(text, Vec::new())?;
+            self.commit_submission(text)?;
         } else {
             self.loading = Some(PendingInjection::start(text, paths, self.repo.clone()));
         }
@@ -1125,11 +1167,19 @@ impl App {
         &mut self,
         result: anyhow::Result<Vec<PreparedInjection>>,
     ) -> anyhow::Result<()> {
-        let Some(mut pending) = self.loading.take() else {
+        let Some(pending) = self.loading.take() else {
             return Ok(());
         };
-        match result {
-            Ok(injections) => self.commit_submission(std::mem::take(&mut pending.text), injections),
+        match result.and_then(|injections| self.session.inject(injections)) {
+            Ok(()) => {
+                // Attachment commands are local. Do not start a turn or save draft text as a message.
+                self.textarea.clear();
+                self.textarea
+                    .insert_str(injection::remaining_text(&pending.text));
+                self.input_changed();
+                self.view.scroll_to_bottom();
+                Ok(())
+            }
             Err(error) => {
                 self.notice = Some(format!("couldn't inject files: {error:#}"));
                 Ok(())
@@ -1137,13 +1187,9 @@ impl App {
         }
     }
 
-    /// Persist attachments as completed calls; only FYI/help enter the execution queue.
-    fn commit_submission(
-        &mut self,
-        text: String,
-        injections: Vec<PreparedInjection>,
-    ) -> anyhow::Result<()> {
-        if let Err(error) = self.session.submit(text, injections) {
+    /// Only an explicit ordinary message starts a turn and queues FYI before its request.
+    fn commit_submission(&mut self, text: String) -> anyhow::Result<()> {
+        if let Err(error) = self.session.submit(text) {
             self.notice = Some(format!("couldn't submit: {error:#}"));
             return Ok(());
         }
@@ -1155,10 +1201,9 @@ impl App {
             .session
             .remove_calls(|call| code_of(call).is_ok_and(|code| is_exempt(&code)))?;
         self.messages_removed(&removed);
-        // Each turn opens with two synthetic calls that the app makes as if the model
-        // had: `FYI()` and `help()`, both exempt from approval. `advance` runs them,
-        // then sends the first request.
-        let calls = fyi_calls();
+        // Each turn opens with an approval-exempt `FYI()` call made as if by the
+        // model. `advance` runs it, then sends the first request.
+        let calls = fyi_calls()?;
         let saved = self.session.push(Message {
             role: Role::Assistant,
             content: String::new(),
@@ -1300,7 +1345,7 @@ fn build_blocks<'a>(
                     .then(|| tool_reasoning::converted(messages, i, turn_start))
                     .flatten();
                 if let Some(text) = &converted {
-                    let part = |n| Key::Call(tool_reasoning::call_id(i), n);
+                    let part = |n| Key::Call(tool_reasoning::call_id(i, text), n);
                     blocks.push(Block::new(part(0), "REPL", theme.tool_call));
                     blocks.push(Block::new(
                         part(1),
@@ -1434,28 +1479,73 @@ fn build_blocks<'a>(
     blocks
 }
 
-/// The two synthetic calls opening each turn: `FYI()` for the environment
-/// snapshot and `help()` for the library listing. Ids only need to be unique within
-/// a session: the timestamp keeps them unique across `--resume`, the counter
-/// within one millisecond.
-fn fyi_calls() -> Vec<ToolCall> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    ["FYI()", "help()"]
+/// Assign each streamed call its local identity once, before previews or persistence can use it.
+fn accumulate_reply(
+    fields: &mut Map<String, Value>,
+    mut delta: Map<String, Value>,
+) -> anyhow::Result<()> {
+    if let Some(Value::Array(calls)) = delta.get_mut("tool_calls") {
+        // The accumulator also merges repeated indices within a single chunk.
+        let mut assigned_indices = Vec::new();
+        for call in calls {
+            let Some(call) = call.as_object_mut() else {
+                continue;
+            };
+            if call
+                .get("id")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                continue;
+            }
+            let index = call.get("index").cloned();
+            let existing = index
+                .as_ref()
+                .and_then(|index| {
+                    fields
+                        .get("tool_calls")?
+                        .as_array()?
+                        .iter()
+                        .find(|entry| entry.get("index") == Some(index))
+                })
+                .and_then(|entry| entry.get("id"))
+                .and_then(Value::as_str);
+            let assigned_here = index
+                .as_ref()
+                .is_some_and(|index| assigned_indices.contains(index));
+            if assigned_here || existing.is_some_and(|id| !id.is_empty()) {
+                // Later provider ID fragments must not append to the already assigned local ID.
+                call.remove("id");
+            } else {
+                call.insert(
+                    "id".into(),
+                    Value::String(tool_call_id::generate(tool_call_id::NORMAL, &[])?),
+                );
+            }
+            if let Some(index) = index {
+                assigned_indices.push(index);
+            }
+        }
+    }
+    client::accumulate(fields, delta);
+    Ok(())
+}
+
+/// The turn-start FYI call uses an ordinary ID with no timestamps or special markers.
+fn fyi_calls() -> anyhow::Result<Vec<ToolCall>> {
+    ["FYI()"]
         .into_iter()
-        .map(|code| ToolCall {
-            id: format!(
-                "fyi-{}-{}",
-                chrono::Local::now().timestamp_millis(),
-                SEQ.fetch_add(1, Ordering::Relaxed)
-            ),
-            kind: "function".to_string(),
-            function: FunctionCall {
-                name: "REPL".to_string(),
-                arguments: format!(r#"{{"code": "{code}"}}"#),
+        .map(|code| {
+            Ok(ToolCall {
+                id: tool_call_id::generate(tool_call_id::NORMAL, &[])?,
+                kind: "function".to_string(),
+                function: FunctionCall {
+                    name: "REPL".to_string(),
+                    arguments: format!(r#"{{"code": "{code}"}}"#),
+                    extra: Map::new(),
+                },
                 extra: Map::new(),
-            },
-            extra: Map::new(),
+            })
         })
         .collect()
 }
@@ -1661,6 +1751,39 @@ async fn next_turn_event(turn: &mut Option<Turn>) -> TurnEvent {
     }
 }
 
+/// Select one completion provider without performing filesystem I/O while drawing or handling keys.
+fn completion_candidates(
+    textarea: &TextArea,
+    files: &[String],
+    dismissed: Option<&str>,
+) -> Vec<Completion> {
+    if dismissed.is_some_and(|text| text == textarea.lines().join("\n")) {
+        return Vec::new();
+    }
+    if input::file_prefix(textarea).is_some() {
+        return files
+            .iter()
+            .map(|name| Completion {
+                spelling: format!("@{name}"),
+                command: None,
+            })
+            .collect();
+    }
+    let [text] = textarea.lines() else {
+        return Vec::new();
+    };
+    if !text.starts_with('/') || text.contains(char::is_whitespace) {
+        return Vec::new();
+    }
+    commands::completions(text)
+        .into_iter()
+        .map(|entry| Completion {
+            spelling: entry.spelling.to_owned(),
+            command: Some(entry.command),
+        })
+        .collect()
+}
+
 /// Wrap confirmation text by terminal cells so full paths remain reviewable before removal.
 fn confirmation_lines(text: &str, width: u16, style: Style) -> Vec<Line<'static>> {
     let width = usize::from(width.max(1));
@@ -1682,7 +1805,7 @@ fn confirmation_lines(text: &str, width: u16, style: Style) -> Vec<Line<'static>
     lines
 }
 
-/// Poll only the current batch; dropping it prevents canceled reads from submitting later.
+/// Poll only the current batch; canceled reads cannot later update local context.
 async fn next_injection(
     pending: &mut Option<PendingInjection>,
 ) -> anyhow::Result<Vec<PreparedInjection>> {
@@ -1737,6 +1860,184 @@ fn spawn_input_reader() -> UnboundedReceiver<io::Result<Event>> {
 mod tests {
     use super::*;
 
+    /// Provider IDs cannot introduce local markers; normalization preserves other call fields.
+    #[test]
+    fn provider_ids_and_results_use_normal_format() {
+        let provider_ids = [
+            "provider-call-id".to_owned(),
+            tool_call_id::generate(tool_call_id::INJECTED_FILE, &[]).unwrap(),
+        ];
+        let calls: Vec<ToolCall> = provider_ids
+            .iter()
+            .map(|id| {
+                serde_json::from_value(serde_json::json!({
+            "id": id, "type": "function", "vendor": "preserved",
+            "function": {"name": "REPL", "arguments": "{\"code\":\"1+1\"}", "vendor_function": 7}
+        })).unwrap()
+            })
+            .collect();
+        let before: Vec<_> = calls
+            .iter()
+            .map(|call| serde_json::to_value(call).unwrap())
+            .collect();
+        let mut fields = Map::new();
+        accumulate_reply(
+            &mut fields,
+            serde_json::json!({"tool_calls": before})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        let calls: Vec<ToolCall> = serde_json::from_value(fields["tool_calls"].clone()).unwrap();
+        for ((call, original), previous_id) in calls.iter().zip(before).zip(provider_ids) {
+            assert_ne!(call.id, previous_id);
+            let metadata = tool_call_id::decode(&call.id).unwrap();
+            assert_eq!(metadata.kind, tool_call_id::NORMAL);
+            assert!(metadata.data.is_empty());
+            let mut expected = original;
+            expected["id"] = Value::String(call.id.clone());
+            assert_eq!(serde_json::to_value(call).unwrap(), expected);
+            let result = Message::tool(call.id.clone(), "2".into());
+            let messages = vec![
+                Message {
+                    role: Role::Assistant,
+                    tool_calls: Some(vec![call.clone()]),
+                    ..Default::default()
+                },
+                result,
+            ];
+            let request = tool_reasoning::request_messages(&messages, false);
+            assert_eq!(
+                request[0]["tool_calls"][0]["id"],
+                request[1]["tool_call_id"]
+            );
+        }
+    }
+
+    /// Provider ID fragments never change the preview identity or concatenate into the saved ID.
+    #[test]
+    fn streamed_call_ids_stay_stable() {
+        let mut fields = Map::new();
+        accumulate_reply(
+            &mut fields,
+            serde_json::json!({"tool_calls": [{
+                "index": 0, "id": "provider-", "type": "function",
+                "function": {"name": "REPL", "arguments": "{\"code\":\""}
+            }]})
+            .as_object()
+            .unwrap()
+            .clone(),
+        )
+        .unwrap();
+        let first = fields["tool_calls"][0]["id"].as_str().unwrap().to_owned();
+        accumulate_reply(
+            &mut fields,
+            serde_json::json!({"tool_calls": [{
+                "index": 0, "id": "suffix", "function": {"arguments": "1+1\"}"}
+            }, {
+                "index": 1, "id": "second", "type": "function",
+                "function": {"name": "REPL", "arguments": "{\"code\":\"2+2\"}"}
+            }]})
+            .as_object()
+            .unwrap()
+            .clone(),
+        )
+        .unwrap();
+        assert_eq!(fields["tool_calls"][0]["id"], first);
+        assert_ne!(fields["tool_calls"][1]["id"], first);
+        assert_eq!(
+            fields["tool_calls"][0]["function"]["arguments"],
+            "{\"code\":\"1+1\"}"
+        );
+        for call in fields["tool_calls"].as_array().unwrap() {
+            let metadata = tool_call_id::decode(call["id"].as_str().unwrap()).unwrap();
+            assert_eq!(metadata.kind, tool_call_id::NORMAL);
+        }
+    }
+
+    /// Several fragments for one index in a single chunk must still produce one 32-character ID.
+    #[test]
+    fn repeated_call_index_in_one_chunk_uses_one_id() {
+        let mut fields = Map::new();
+        accumulate_reply(&mut fields, serde_json::json!({"tool_calls": [
+            {"index": 0, "id": "first", "type": "function", "function": {"name": "REPL", "arguments": "{\"code\":"}},
+            {"index": 0, "id": "second", "function": {"arguments": "\"1\"}"}}
+        ]}).as_object().unwrap().clone()).unwrap();
+        let calls = fields["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1);
+        let id = calls[0]["id"].as_str().unwrap().to_owned();
+        assert_eq!(id.len(), 32);
+        assert_eq!(
+            tool_call_id::decode(&id).unwrap().kind,
+            tool_call_id::NORMAL
+        );
+        assert_eq!(calls[0]["function"]["arguments"], "{\"code\":\"1\"}");
+        accumulate_reply(
+            &mut fields,
+            serde_json::json!({"tool_calls": [
+                {"index": 0, "id": "third"}, {"index": 0, "id": "fourth"}
+            ]})
+            .as_object()
+            .unwrap()
+            .clone(),
+        )
+        .unwrap();
+        assert_eq!(fields["tool_calls"][0]["id"], id);
+    }
+
+    /// Turn start queues only FYI, using the normal ID layout.
+    #[test]
+    fn turn_start_calls_use_uniform_ids() {
+        let calls = fyi_calls().unwrap();
+        assert_eq!(calls.len(), 1);
+        for (call, code) in calls.iter().zip(["FYI()"]) {
+            assert_eq!(code_of(call).unwrap(), code);
+            let metadata = tool_call_id::decode(&call.id).unwrap();
+            assert_eq!(metadata.kind, tool_call_id::NORMAL);
+            assert!(metadata.data.is_empty());
+        }
+    }
+
+    /// The shared list preserves slash actions while file matches remain path edits only.
+    #[test]
+    fn completion_providers_and_dismissal() {
+        let mut textarea = TextArea::default();
+        textarea.insert_str("/q");
+        let commands = completion_candidates(&textarea, &[], None);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].spelling, "/quit");
+        assert!(matches!(commands[0].command.unwrap().action, Action::Exit));
+        assert!(completion_candidates(&textarea, &[], Some("/q")).is_empty());
+        textarea.clear();
+        textarea.insert_str("/rename");
+        assert!(
+            completion_candidates(&textarea, &[], None)[0]
+                .command
+                .unwrap()
+                .takes_argument
+        );
+        textarea.insert_str(" session");
+        assert!(completion_candidates(&textarea, &[], None).is_empty());
+
+        textarea.clear();
+        textarea.insert_str("Review\n@fi");
+        let names = vec!["file".into(), "file with spaces".into()];
+        let files = completion_candidates(&textarea, &names, None);
+        assert_eq!(
+            files
+                .iter()
+                .map(|entry| entry.spelling.as_str())
+                .collect::<Vec<_>>(),
+            ["@file", "@file with spaces"]
+        );
+        assert!(files.iter().all(|entry| entry.command.is_none()));
+        assert!(completion_candidates(&textarea, &names, Some("Review\n@fi")).is_empty());
+        assert!(completion_candidates(&textarea, &[], None).is_empty());
+        textarea.move_cursor(ratatui_textarea::CursorMove::Head);
+        assert!(completion_candidates(&textarea, &names, None).is_empty());
+    }
+
     /// A failed asynchronous batch retains the exact held draft for correction.
     #[tokio::test]
     async fn failed_injection_keeps_held_draft() {
@@ -1751,7 +2052,7 @@ mod tests {
         assert_eq!(pending.as_ref().unwrap().text, text);
     }
 
-    /// Abandoning a read cannot produce a later submission event, even if its task was ready.
+    /// Abandoning a read cannot produce a later attachment event, even if its task was ready.
     #[tokio::test]
     async fn canceled_injection_cannot_submit_late() {
         let canceled = Arc::new(AtomicBool::new(false));

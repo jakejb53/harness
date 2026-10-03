@@ -9,6 +9,7 @@ mod injection;
 mod input;
 mod repl;
 mod session;
+mod tool_call_id;
 mod tool_reasoning;
 mod transcript;
 mod tui;

@@ -1326,6 +1326,7 @@ name = "harness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "crossterm",
@@ -1343,6 +1344,7 @@ dependencies = [
  "ruff_python_parser",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "toml",
  "toml_edit",

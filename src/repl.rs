@@ -401,7 +401,7 @@ impl Driver {
             PoolError::Runtime(exception)
                 if exception.exc_type() == ExcType::NotImplementedError =>
             {
-                self.host.failure("unsupported", exception.to_string());
+                self.host.failure("unsupported", exception.summary());
             }
             _ => {}
         }
@@ -417,7 +417,12 @@ impl Driver {
                 "[{cause}. The REPL was restarted: every variable, import, and function defined earlier in this turn is gone; library functions are reloaded.]"
             )
         } else {
-            error.to_string()
+            // Expected failures carry Python frames too; report the cause without
+            // treating their presence or exception type as evidence of a bug.
+            match error {
+                PoolError::Runtime(exception) => exception.summary(),
+                other => other.to_string(),
+            }
         }
     }
 }
@@ -487,4 +492,102 @@ fn library_paths(directory: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
         }
     }
     Ok(paths)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use monty_types::{CodeLoc, MontyException, StackFrame};
+
+    /// Exercise the reporting boundary with frames, including its failure-log event.
+    #[tokio::test]
+    async fn reports_exception_causes_without_tracebacks() {
+        // Reporting needs neither a running interpreter nor live harness settings.
+        let mut pool_config = PoolConfig::subprocess(std::env::current_exe().unwrap());
+        pool_config.min_processes = 0;
+        pool_config.max_processes = 1;
+        let pool = Arc::new(Pool::new(pool_config).await.unwrap());
+        let repo = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let (events, mut output) = mpsc::unbounded_channel();
+        let (_, permissions) = watch::channel(Permission::None);
+        let mut driver = Driver {
+            pool: pool.clone(),
+            config: Arc::new(ReplConfig::default()),
+            checkout: None,
+            mount: MountSpec::new(repo.to_str().unwrap(), &repo, MountSpecMode::ReadWrite).unwrap(),
+            memory_mb: 64,
+            host: HostContext {
+                repo: repo.clone(),
+                config: Arc::new(HostConfig {
+                    dir: repo,
+                    model: String::new(),
+                    output_limit: 1000,
+                    deny: Vec::new(),
+                    allow: BTreeMap::new(),
+                    environment: Vec::new(),
+                    search_path: Vec::new(),
+                }),
+                permissions,
+                events,
+                library: BTreeMap::new(),
+                prompt_tokens: None,
+                code: "failing_call()".into(),
+            },
+        };
+        for (kind, message, expected) in [
+            (
+                ExcType::FileNotFoundError,
+                Some("read missing.py: file not found"),
+                "FileNotFoundError: read missing.py: file not found",
+            ),
+            (
+                ExcType::PermissionError,
+                Some("write file.py: denied: the permission level is read-only"),
+                "PermissionError: write file.py: denied: the permission level is read-only",
+            ),
+            (
+                ExcType::TypeError,
+                Some("run requires argv: list[str]"),
+                "TypeError: run requires argv: list[str]",
+            ),
+            (
+                ExcType::NotImplementedError,
+                Some("operation is unsupported"),
+                "NotImplementedError: operation is unsupported",
+            ),
+            (ExcType::ValueError, None, "ValueError"),
+        ] {
+            let exception = MontyException::with_traceback(
+                kind,
+                message.map(str::to_owned),
+                vec![StackFrame {
+                    filename: "test.py".into(),
+                    start: CodeLoc::default(),
+                    end: CodeLoc::default(),
+                    frame_name: Some("failing_call".into()),
+                    preview_line: None,
+                    hide_caret: true,
+                    hide_frame_name: false,
+                }],
+            );
+            assert!(exception.to_string().contains("Traceback"));
+            assert_eq!(driver.report_error(PoolError::Runtime(exception)), expected);
+            if kind == ExcType::NotImplementedError {
+                match output.try_recv().unwrap() {
+                    ReplEvent::Failure {
+                        kind,
+                        message,
+                        code,
+                    } => {
+                        assert_eq!(kind, "unsupported");
+                        assert_eq!(message, expected);
+                        assert_eq!(code, "failing_call()");
+                    }
+                    _ => panic!("expected an unsupported-operation failure record"),
+                }
+            }
+            assert!(output.try_recv().is_err());
+        }
+        pool.close().await;
+    }
 }

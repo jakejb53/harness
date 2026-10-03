@@ -44,10 +44,13 @@ pub fn converted<'a>(
     message.reasoning()
 }
 
-/// Synthetic call id. Derived from the message's position so it's the same in every
-/// request built from the same messages; it only needs to be unique within one.
-pub fn call_id(index: usize) -> String {
-    format!("reasoning-{index}")
+/// Derive a stable encoded ID from the message position and exact reasoning text.
+pub fn call_id(index: usize, text: &str) -> String {
+    // A fixed-width index makes the boundary with variable-length text unambiguous.
+    let mut seed = Vec::with_capacity(8 + text.len());
+    seed.extend_from_slice(&(index as u64).to_be_bytes());
+    seed.extend_from_slice(text.as_bytes());
+    crate::tool_call_id::deterministic(&seed)
 }
 
 /// The synthetic call's code. A JSON string literal is also a valid Python one, so
@@ -70,7 +73,7 @@ pub fn request_messages(messages: &[Message], enabled: bool) -> Vec<Value> {
             sent.push(json!(message));
             continue;
         };
-        let id = call_id(index);
+        let id = call_id(index, &text);
         sent.push(json!({
             "role": "assistant",
             "content": "",
@@ -134,4 +137,42 @@ fn is_string_literal(text: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+
+    /// Reasoning request pairs share stable encoded IDs without changing saved messages.
+    #[test]
+    fn request_ids_match_and_are_stable() {
+        let messages = vec![
+            Message::user("first".into()),
+            Message {
+                role: Role::Assistant,
+                content: "answer".into(),
+                extra: serde_json::Map::from_iter([("reasoning".into(), json!("thought 雪"))]),
+                ..Default::default()
+            },
+            Message::user("next".into()),
+        ];
+        let original = json!(messages);
+        let sent = request_messages(&messages, true);
+        assert_eq!(sent, request_messages(&messages, true));
+        let id = sent[1]["tool_calls"][0]["id"].as_str().unwrap();
+        assert_eq!(sent[2]["tool_call_id"], id);
+        assert_eq!(id, call_id(1, "thought 雪"));
+        assert_eq!(id.len(), 32);
+        assert_eq!(
+            crate::tool_call_id::decode(id),
+            Some(crate::tool_call_id::Metadata {
+                kind: crate::tool_call_id::NORMAL,
+                data: vec![],
+            })
+        );
+        assert_ne!(id, call_id(2, "thought 雪"));
+        assert_ne!(id, call_id(1, "different"));
+        assert_eq!(json!(messages), original);
+        assert_eq!(json!(request_messages(&messages, false)), original);
+    }
 }

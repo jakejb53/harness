@@ -13,10 +13,10 @@ Working log. Behavior contract: `SPEC.md`.
 7. **Context tokens.** `stream_options.include_usage`; status line shows `total_tokens`.
 8. **Tool calling.** Single `REPL` tool; per-turn local Python driver (`src/repl_driver.py`) with `replib/` registry and `help()`; `approval_mode` allow/ask/auto (Shift+Tab, persisted via `toml_edit`); LLM classifier for `auto`; `output_limit` (default 100 KB).
 9. **Tool-calling hardening (review).** Results recorded before terminal I/O; driver `setsid()` (no controlling tty); request-reader thread; driver survives closed stdout; config save keeps decor, handles inline tables, atomic; `finish_reason: "length"` drops cut-off calls; SIGHUP/SIGTERM/SIGINT cleanup; resume answers unanswered calls; `.env` read privately.
-10. **Situational awareness.** Each turn opens with synthetic `FYI()` and `help()` REPL calls, run in the REPL like any other (honesty rule: synthetic calls must work when made explicitly). `FYI()` is implemented only in the driver: date, latest `prompt_tokens` (sent with every code request), model.
+10. **Situational awareness.** Each turn opens with only a synthetic `FYI()` REPL call, run in the REPL like any other (honesty rule: synthetic calls must work when made explicitly). `FYI()` is implemented in `src/host.rs`: date, latest `prompt_tokens` (sent with every code request), model. `help()` runs only on demand. The focused turn-start test and `cargo check` passed after removing automatic `help()`.
 11. **Approval exemption.** Code made only of `FYI()` and `help()` statements never needs approval. The governing contract in `SPEC.md` covers all present and future synthetic tool calls, whether app-generated or explicitly called by the model, in every approval mode and permission level. `reasoning()` is separately exempt and is not synthetic. Neither exemption covers unrelated code bundled with the calls, including code evaluated in arguments.
 12. **Instant resume replay.** The session replays as one batched write, so it appears at once instead of visibly scrolling. Superseded by 15.
-13. **Synthetic-call cleanup.** Each turn removes all earlier `FYI()`/`help()`-only calls (and results, and emptied assistant messages) from the session before adding its own, so exactly one of each is in context. First case of the app removing messages.
+13. **Synthetic-call cleanup.** Each turn removes all earlier `FYI()`/`help()`-only calls (and results, and emptied assistant messages) from the session before adding its `FYI()` call. First case of the app removing messages.
 14. **Chat system message.** Optional `[chat] prompt`, prepended to each chat request at send time and never saved, so the current config applies to resumed sessions.
 15. **App-managed scrollback.** Alternate screen with mouse capture; the transcript is drawn each frame from the system message, messages, the turn in progress, and display-only notes, so it always matches the model's context. App word wrap, scrolling (follow at bottom, PageUp/PageDown, wheel), drag selection with OSC 52 copy on release.
 16. **Endpoint-neutral replies.** Each streamed `delta` is merged whole by the OpenAI SDK's `accumulate_delta` rule, and every field is saved and sent back unchanged, so any endpoint's reasoning format (`reasoning`, `reasoning_content`, `reasoning_details`) round-trips. Only display picks known reasoning fields.
@@ -27,12 +27,11 @@ Working log. Behavior contract: `SPEC.md`.
 
 Decided against:
 - Audit-hook gating as the first permission layer (classifier chosen instead).
-- A driver → app callback for `FYI()` (Python must not call Rust).
 - Saving the system message in the session (config edits wouldn't reach resumed sessions).
 
 ## Next
 
-1. **AGENTS.md.** Optional `[chat] agents_file` (absolute path). A synthetic `REPL` call (id `agents-…`) reads the file and prints it as a JSON object; it lives in the first turn's synthetic assistant message, ahead of `FYI()`/`help()`. Every turn, before cleanup: run it; insert it after the first user message if missing; replace code and result if changed; remove it if the setting is removed. Result truncated at `output_limit` like any call.
+1. **AGENTS.md.** Optional `[chat] agents_file` (absolute path). A synthetic `REPL` call using the shared encoded call-ID format reads the file and prints it as a JSON object; it lives in the first turn's synthetic assistant message, ahead of `FYI()`. Every turn, before cleanup: run it; insert it after the first user message if missing; replace code and result if changed; remove it if the setting is removed. Result truncated at `output_limit` like any call.
 2. **Context management.** Proactive pruning so compaction is never needed; replaces the interim `output_limit`.
 3. **`replib/` functions.** File helpers (`read`/`write`/`edit`), subagents (as host functions), knowledge-base search.
 4. **Final-turn tool reasoning** (to revisit): convert the turn in progress's reasoning too. Design: `SPEC-final-turn-tool-reasoning.md`.
@@ -41,7 +40,6 @@ Decided against:
 ## Open
 
 - Two instances started in the same second, in any repos, share a session file name and overwrite each other.
-- Process-group kill uses `/bin/kill` to avoid a direct `libc` dependency.
 - `serde_json` lacks `preserve_order`, so kept fields are saved and sent back with object keys sorted (values unchanged). Fix: enable the feature in `Cargo.toml`.
 
 ## Reference

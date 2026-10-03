@@ -70,7 +70,7 @@ A variable already set in your shell takes precedence over `.env`. The app reads
 
 Build with `cargo build`, then run `harness` (in `target/debug/`) from the directory the agent should work in, normally the root of a repository.
 
-Each run starts a new conversation, saved to `~/.harness/sessions/YYYYMMDD-HHMMSS.json` when you send the first message. The file name without `.json` is the session's name; `/rename <name>` changes it. To list saved sessions, oldest first, or continue one:
+Each run starts a new conversation, saved to `~/.harness/sessions/YYYYMMDD-HHMMSS.json` when you send the first message or attach a file. The file name without `.json` is the session's name; `/rename <name>` changes it. To list saved sessions, oldest first, or continue one:
 
 ```
 harness --resume
@@ -97,9 +97,9 @@ The status line under the prompt shows the model, the number of tokens in use (a
 
 While the model is working, you can keep typing your next message. It sends once the turn finishes and you press Enter.
 
-**Situational awareness.** Each turn starts with the app calling `FYI()` and then `help()` in the REPL on the model's behalf. `FYI()` prints the current date, the prompt-token count of the latest reply (once there is one), and the model; `help()` lists the output limit and library functions. The calls and their output are shown and saved like any other, and the model can call either itself at any time. Before adding them, the app removes every earlier call made only of `FYI()`/`help()` from the conversation and its session file, so only the current turn's copies are in context.
+**Situational awareness.** Each turn starts with the app calling `FYI()` in the REPL on the model's behalf. It prints the current date, the prompt-token count of the latest reply (once there is one), and the model. The call and its output are shown and saved like any other. The model can call `FYI()` or `help()` itself at any time; `help()` lists the output limit and library functions and runs only on demand. Before adding `FYI()`, the app removes every earlier call made only of `FYI()`/`help()` from the conversation and its session file.
 
-**Approval exemptions.** Except for the file-injection mechanism below, all synthetic tool calls, present and future, including `FYI()` and `help()`, never require approval, whether the app generates them or the model calls them explicitly. This applies at every permission level. Unrelated code bundled with them, including code evaluated in arguments, follows normal permissions and approval rules. File injection authorizes only the app's attachment read; model-generated reads keep normal permissions.
+**Approval exemptions.** Except for the file-injection mechanism below, all synthetic tool calls, present and future, including `FYI()`, never require approval, whether the app generates them or the model calls them explicitly. Explicit `help()` calls also require no approval. This applies at every permission level. Unrelated code bundled with them, including code evaluated in arguments, follows normal permissions and approval rules. File injection authorizes only the app's attachment read; model-generated reads keep normal permissions.
 
 ### File injection
 
@@ -113,11 +113,13 @@ Review these files.
 
 Everything after `@` is the path, including spaces; there is no trimming, quoting, glob, variable, or `~` expansion. Relative paths start at the launch directory; absolute paths and files outside the repository are allowed. A leading space makes the line ordinary text.
 
-The app reads each UTF-8 regular file in full, independently of REPL permissions and `output_limit`, and adds a synthetic `REPL` call with Python file-reading code and its result before requesting the model. Neither the model nor Monty executes that call. Empty files produce empty results. The original message, including attachment lines, remains in history. Every occurrence adds a separate instance; later turns and resumed sessions retain it without refreshing or replacing its contents.
+At the end of an attachment line, typing `@fi` lists matching files in the launch directory. Matches use case-sensitive prefixes and alphabetical order, including hidden files and symlinks to regular files. Up/Down selects, Tab completes only that line, and Esc dismisses the list. Enter loads the path as typed, not a different highlighted match. Other paths can be entered manually. Directory errors appear in the status line.
 
-All files must load before the draft clears or history changes. Missing, unreadable, nonregular, or non-UTF-8 files block submission and preserve both. Loading holds draft editing; Esc cancels and preserves the draft.
+Enter loads attachments locally without starting a turn or requesting the model. The app reads each UTF-8 regular file in full, independently of REPL permissions and `output_limit`, and saves a synthetic `REPL` call with Python file-reading code and its result. The call ID identifies it as an injected file; the filename stays in the code. Neither the model nor Monty executes that call; `FYI()` and `help()` do not run. Empty files produce empty results. Every occurrence adds a separate instance; later turns and resumed sessions retain it without refreshing or replacing its contents.
 
-A bordered overlay in the transcript's upper right lists each instance, including duplicate filenames. Its size is capped at half the transcript width and height; long paths shorten and the mouse wheel over the box scrolls the list. It does not change transcript wrapping or input width and is hidden when empty. Between turns, click an instance's `-` to highlight it and confirm its full path with `y`; `n` or Esc cancels. Removal deletes only that instance's synthetic call, result, and tracking entry from the saved conversation. It leaves the disk file, original user message, and later references intact.
+Attachment command lines never enter the prompt or history. After successful loading, an attachment-only draft clears; mixed input keeps its ordinary text unsent, ready for a separate Enter. The next explicit message includes the files in model context. All files must load before changing the draft or history. Missing, unreadable, nonregular, or non-UTF-8 files block loading and preserve both. Loading holds draft editing; Esc cancels and preserves the original full draft and history.
+
+A bordered overlay in the transcript's upper right lists each instance, including duplicate filenames. Its size is capped at half the transcript width and height; long paths shorten and the mouse wheel over the box scrolls the list. It does not change transcript wrapping or input width and is hidden when empty. Between turns, click an instance's `-` to highlight it and confirm its full path with `y`; `n` or Esc cancels. Removal deletes only that instance's synthetic call and result from the saved conversation. It leaves the disk file, prior user messages, and later discussion intact.
 
 ### Approval descriptions
 
@@ -225,11 +227,11 @@ App denials and unsupported Monty operations are appended to `~/.harness/failure
 
 Experimental. When on, the model sees its reasoning from earlier turns as `reasoning("...")` REPL calls, each followed by its `(no output)` result, instead of as native reasoning. The current turn keeps its native reasoning. Turn it on or off with `/tool-reasoning`; the status line shows `| tool reasoning` while it's on.
 
-Only what's sent and shown changes: the session file keeps replies as the endpoint sent them, so switching it off restores the original view at once, including for resumed conversations. It requires `reasoning()` in `replib/` (above).
+This conversion changes only what's sent and shown; saved reasoning stays unchanged, so switching it off restores the saved view at once, including for resumed conversations. It requires `reasoning()` in `replib/` (above).
 
 ## Conversation files
 
-Session files hold conversation messages, including tool calls and results, plus file-injection tracking. Requests use only the messages, with the optional tool-reasoning conversion. The system message isn't saved; each request uses this invocation's `--system-prompt` override or the prompt loaded from `config.toml`, including for resumed conversations:
+The saved conversation is authoritative. The app may transform messages before saving and modify the saved conversation; requests use those saved values, with only the explicit tool-reasoning conversion described above. Session files contain only messages, including tool calls and results. The system message is added separately and isn't saved; each request uses this invocation's `--system-prompt` override or the prompt loaded from `config.toml`, including for resumed conversations:
 
 ```json
 { "messages": [
@@ -237,9 +239,9 @@ Session files hold conversation messages, including tool calls and results, plus
   { "role": "assistant", "content": "", "reasoning": "...", "tool_calls": [ ... ] },
   { "role": "tool", "tool_call_id": "...", "content": "..." },
   { "role": "assistant", "content": "...", "reasoning": "..." }
-], "injections": [{ "call_id": "...", "path": "src/app.rs" }] }
+] }
 ```
 
-`injections` links each displayed file instance to its tool call; it is never sent to the endpoint. File contents live only in the matching tool result. Older sessions without this field load with an empty list.
+The file list is derived from encoded call IDs and filenames in the saved Python code; there is no separate tracking field or sidecar. File contents live only in the matching tool result. New call IDs use one 32-character Base64url format; provider IDs are replaced before saving, and results use the saved IDs. Existing IDs and code are not migrated. Old IDs are not recognized as tracked attachments; an obsolete top-level `injections` field is ignored on load and omitted on the next ordinary save.
 
-Replies keep every field the endpoint sent, such as reasoning under whatever name it uses (`reasoning`, `reasoning_content`, `reasoning_details`, …); outgoing reasoning changes only when tool reasoning is enabled. A reply you stop partway through is kept as far as it got. Tool results include their errors; display-only notices and failure-count notes are not saved in the conversation.
+Replies preserve other endpoint fields, such as reasoning under whatever name it uses (`reasoning`, `reasoning_content`, `reasoning_details`, …); outgoing reasoning changes only when tool reasoning is enabled. A reply you stop partway through is kept as far as it got. Tool results include their errors; display-only notices and failure-count notes are not saved in the conversation.
