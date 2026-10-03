@@ -47,6 +47,26 @@ fn patch_tool() -> Value {
     })
 }
 
+/// File reads expose only a relative path and optional inclusive line bounds.
+fn read_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a UTF-8 text file with its original line numbers. Paths must be repository-relative. Optional start_line and end_line are 1-based and inclusive; omit them to read from line 1 through EOF. Requires read-only or read-write permission. Relative symlinks may resolve within the repository; absolute paths and escaping resolution are rejected. Results use the existing output limit.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer", "minimum": 1},
+                    "end_line": {"type": "integer", "minimum": 1}
+                },
+                "required": ["path"]
+            }
+        }
+    })
+}
+
 pub enum StreamEvent {
     /// One chunk's `delta`, every field as sent. The reply is assembled from these
     /// with `accumulate`.
@@ -81,7 +101,7 @@ pub fn start(
         "model": endpoint.model,
         "stream": true,
         "stream_options": { "include_usage": true },
-        "tools": [repl_tool(tool_description), patch_tool()],
+        "tools": [repl_tool(tool_description), patch_tool(), read_tool()],
         "messages": messages,
     });
     // Config validation reserves the fields above; server-specific parameters

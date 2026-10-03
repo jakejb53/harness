@@ -1,6 +1,6 @@
 # harness
 
-A terminal coding agent for OpenAI-compatible chat completions endpoints. The model uses a Python REPL for computation and commands, and a dedicated `apply_patch` tool for direct file edits.
+A terminal coding agent for OpenAI-compatible chat completions endpoints. The model uses a Python REPL for computation and commands, plus direct `read_file` and `apply_patch` tools for files.
 
 The app runs full screen and draws the conversation exactly as the model sees it, word-wrapped to your terminal's width. Replies stream as they are generated, including the model's reasoning when the server provides it. When you exit, your terminal returns to what it showed before.
 
@@ -144,6 +144,8 @@ The repository is the directory from which you launch the app. Access outside it
 Host command approvals are independent of these levels (see Host commands). `reasoning()` is not synthetic: a standalone `reasoning("...")` on a plain string has its own approval exemption at every level. It cannot exempt unrelated code.
 
 ### Direct file editing
+
+`read_file(path, start_line?, end_line?)` returns numbered UTF-8 text. Bounds are 1-based and inclusive; omitted bounds mean line 1 and EOF. Reads use repository-relative paths, follow relative symlinks within the repository, and work in `read-only` or `read-write` mode. The existing `output_limit` applies; request smaller ranges when needed.
 
 `apply_patch` accepts the familiar `*** Begin Patch` format with add, update, delete, and rename operations. Patch text is decoded once from JSON and handled directly by Rust, without Python or shell interpretation. Context must match exactly and uniquely; errors include hunk locations and relevant source context.
 

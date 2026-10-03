@@ -1,7 +1,7 @@
 //! Chat loop: input events, the tool-calling turn, and session persistence.
 //!
 //! A turn starts with a user message and alternates between streaming a response and
-//! handling ordered REPL and direct patch calls, with prompts at host operations. It ends
+//! handling ordered tool calls, with prompts at host operations. It ends
 //! when a response has no tool calls, on Esc, or on a stream error.
 //!
 //! The screen is drawn from state every frame (`build_blocks`): the session's
@@ -37,6 +37,7 @@ use crate::failures::FailureLog;
 use crate::injection::{self, PreparedInjection};
 use crate::input::{self, InputAction};
 use crate::patch;
+use crate::read;
 use crate::repl::{Repl, ReplEvent, Runtime};
 use crate::session::{
     FunctionCall, Injection, Message, NOT_RUN, Role, Session, ToolCall, reasoning_text,
@@ -65,12 +66,17 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
         &std::env::current_dir().context("finding launch directory")?,
         settings.permission == config::Permission::ReadWrite,
     )?;
+    let read_runtime = read::Runtime::new(
+        &std::env::current_dir().context("finding launch directory")?,
+        settings.permission != config::Permission::None,
+    )?;
     let mut tui = Tui::enter()?;
     let textarea = input::new_textarea(&settings.theme);
     let mut app = App {
         settings,
         runtime,
         patch_runtime,
+        read_runtime,
         failures,
         session,
         http: reqwest::Client::new(),
@@ -106,6 +112,7 @@ struct App {
     settings: Settings,
     runtime: Runtime,
     patch_runtime: patch::Runtime,
+    read_runtime: read::Runtime,
     failures: FailureLog,
     session: Session,
     http: reqwest::Client,
@@ -194,6 +201,11 @@ enum Phase {
     Patching {
         call: ToolCall,
         job: patch::Job,
+    },
+    /// Reads run independently of the REPL and use the same ordered tool queue.
+    Reading {
+        call: ToolCall,
+        job: read::Job,
     },
     Running {
         call: PendingCall,
@@ -302,6 +314,7 @@ enum TurnEvent {
     Finished(anyhow::Result<()>),
     Repl(anyhow::Result<ReplEvent>),
     Patch(String),
+    Read(String),
     Description(anyhow::Result<String>),
 }
 
@@ -385,6 +398,14 @@ impl App {
                 Step::Turn(TurnEvent::Patch(result)) => {
                     if let Some(turn) = self.turn.as_mut()
                         && let Phase::Patching { call, .. } =
+                            std::mem::replace(&mut turn.phase, Phase::Idle)
+                    {
+                        self.record_result(&call, result)?;
+                    }
+                }
+                Step::Turn(TurnEvent::Read(result)) => {
+                    if let Some(turn) = self.turn.as_mut()
+                        && let Phase::Reading { call, .. } =
                             std::mem::replace(&mut turn.phase, Phase::Idle)
                     {
                         self.record_result(&call, result)?;
@@ -562,6 +583,18 @@ impl App {
     /// or the call is placed back in turn state, before anything that can fail, so an
     /// error exit still leaves a result for every call.
     fn begin_call(&mut self, call: ToolCall) -> anyhow::Result<()> {
+        if call.function.name == "read_file" {
+            let args = match serde_json::from_str::<read::Arguments>(&call.function.arguments) {
+                Ok(args) => args,
+                Err(error) => {
+                    return self
+                        .record_result(&call, format!("Invalid read_file arguments: {error}"));
+                }
+            };
+            let job = self.read_runtime.start(args);
+            self.set_phase(Phase::Reading { call, job });
+            return Ok(());
+        }
         if call.function.name == "apply_patch" {
             let text = match patch_of(&call) {
                 Ok(text) => text,
@@ -780,6 +813,10 @@ impl App {
                 task.abort();
             }
             Phase::Ready(call) => not_run.push(call.call),
+            Phase::Reading { call, job } => {
+                drop(job);
+                check(self.record_result(&call, STOPPED.into()));
+            }
             Phase::Patching { call, mut job } => {
                 // Join the writer after signaling cancellation: never save "stopped"
                 // while a detached task could still mutate files or lose its receipt.
@@ -1042,6 +1079,8 @@ impl App {
         self.runtime.set_permission(permission);
         self.patch_runtime
             .set_permission(permission == config::Permission::ReadWrite);
+        self.read_runtime
+            .set_permission(permission != config::Permission::None);
         if let Err(error) = config::save_permission(&self.settings.dir, permission) {
             self.notice = Some(format!("couldn't save permission: {error:#}"));
         }
@@ -1287,6 +1326,7 @@ impl App {
         let activity = match self.turn.as_ref().map(|t| &t.phase) {
             Some(Phase::Streaming(_)) => Some("responding… (esc to stop)"),
             Some(Phase::Patching { .. }) => Some("applying patch… (esc to stop)"),
+            Some(Phase::Reading { .. }) => Some("reading… (esc to stop)"),
             Some(Phase::Running { prompt: None, .. }) | Some(Phase::Finishing(_)) => {
                 Some("running… (esc to stop)")
             }
@@ -1423,6 +1463,8 @@ fn build_blocks<'a>(
                     let part = |n| Key::Call(call.id.clone(), n);
                     match if call.function.name == "apply_patch" {
                         patch_of(call)
+                    } else if call.function.name == "read_file" {
+                        Ok(call.function.arguments.clone())
                     } else {
                         code_of(call)
                     } {
@@ -1816,6 +1858,7 @@ async fn next_turn_event(turn: &mut Option<Turn>) -> TurnEvent {
             None => std::future::pending().await,
         },
         Phase::Patching { job, .. } => TurnEvent::Patch(job.result().await),
+        Phase::Reading { job, .. } => TurnEvent::Read(job.result().await),
         Phase::Idle | Phase::Ready(_) => std::future::pending().await,
     }
 }
@@ -2158,6 +2201,35 @@ mod tests {
     fn test_theme() -> Theme {
         let config: toml::Value = toml::from_str(include_str!("../config.toml.example")).unwrap();
         config["theme"].clone().try_into().unwrap()
+    }
+
+    /// Read calls keep their path and range visible when saved and replayed.
+    #[test]
+    fn read_arguments_and_replay() {
+        let arguments = r#"{"path":"src/main.rs","start_line":3,"end_line":5}"#;
+        let args: read::Arguments = serde_json::from_str(arguments).unwrap();
+        assert_eq!(args.start_line.unwrap().get(), 3);
+        assert_eq!(args.end_line.unwrap().get(), 5);
+        let all: read::Arguments = serde_json::from_str(r#"{"path":"src/main.rs"}"#).unwrap();
+        assert!(all.start_line.is_none() && all.end_line.is_none());
+        assert!(serde_json::from_str::<read::Arguments>(r#"{"path":"f","start_line":0}"#).is_err());
+        let call: ToolCall = serde_json::from_value(serde_json::json!({
+            "id": "read-test", "type": "function",
+            "function": {"name": "read_file", "arguments": arguments}
+        }))
+        .unwrap();
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                tool_calls: Some(vec![call]),
+                ..Default::default()
+            },
+            Message::tool("read-test".into(), "3\tline three\n".into()),
+        ];
+        let blocks = build_blocks(None, &messages, &[], None, false, &test_theme());
+        assert_eq!(blocks[0].text.as_ref(), "read_file");
+        assert_eq!(blocks[1].text.as_ref(), arguments);
+        assert_eq!(blocks[2].text.as_ref(), "3\tline three");
     }
 
     /// Patch previews and saved calls expose the same literal text, including backslashes.
