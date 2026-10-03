@@ -7,6 +7,7 @@ mod host;
 mod hostfs;
 mod injection;
 mod input;
+mod patch;
 mod repl;
 mod session;
 mod tool_call_id;

@@ -1,7 +1,7 @@
 //! Chat loop: input events, the tool-calling turn, and session persistence.
 //!
 //! A turn starts with a user message and alternates between streaming a response and
-//! handling its tool calls in the turn's REPL, with prompts at host operations. It ends
+//! handling ordered REPL and direct patch calls, with prompts at host operations. It ends
 //! when a response has no tool calls, on Esc, or on a stream error.
 //!
 //! The screen is drawn from state every frame (`build_blocks`): the session's
@@ -36,6 +36,7 @@ use crate::config::{self, Settings, Theme};
 use crate::failures::FailureLog;
 use crate::injection::{self, PreparedInjection};
 use crate::input::{self, InputAction};
+use crate::patch;
 use crate::repl::{Repl, ReplEvent, Runtime};
 use crate::session::{
     FunctionCall, Injection, Message, NOT_RUN, Role, Session, ToolCall, reasoning_text,
@@ -60,11 +61,16 @@ struct Completion {
 pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
     let failures = FailureLog::load(&settings.dir)?;
     let runtime = Runtime::new(&settings).await?;
+    let patch_runtime = patch::Runtime::new(
+        &std::env::current_dir().context("finding launch directory")?,
+        settings.permission == config::Permission::ReadWrite,
+    )?;
     let mut tui = Tui::enter()?;
     let textarea = input::new_textarea(&settings.theme);
     let mut app = App {
         settings,
         runtime,
+        patch_runtime,
         failures,
         session,
         http: reqwest::Client::new(),
@@ -99,6 +105,7 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
 struct App {
     settings: Settings,
     runtime: Runtime,
+    patch_runtime: patch::Runtime,
     failures: FailureLog,
     session: Session,
     http: reqwest::Client,
@@ -183,6 +190,11 @@ enum Phase {
     Streaming(Reply),
     /// Arguments validated; `advance` runs it.
     Ready(PendingCall),
+    /// Direct Rust editing owns its worker until every committed change is reported.
+    Patching {
+        call: ToolCall,
+        job: patch::Job,
+    },
     Running {
         call: PendingCall,
         output: String,
@@ -289,6 +301,7 @@ enum TurnEvent {
     Stream(StreamEvent),
     Finished(anyhow::Result<()>),
     Repl(anyhow::Result<ReplEvent>),
+    Patch(String),
     Description(anyhow::Result<String>),
 }
 
@@ -369,6 +382,14 @@ impl App {
                     result.context("ending REPL session")?;
                 }
                 Step::Turn(TurnEvent::Repl(event)) => self.on_repl(event)?,
+                Step::Turn(TurnEvent::Patch(result)) => {
+                    if let Some(turn) = self.turn.as_mut()
+                        && let Phase::Patching { call, .. } =
+                            std::mem::replace(&mut turn.phase, Phase::Idle)
+                    {
+                        self.record_result(&call, result)?;
+                    }
+                }
                 Step::Turn(TurnEvent::Description(result)) => {
                     if let Some(Turn {
                         phase:
@@ -541,6 +562,19 @@ impl App {
     /// or the call is placed back in turn state, before anything that can fail, so an
     /// error exit still leaves a result for every call.
     fn begin_call(&mut self, call: ToolCall) -> anyhow::Result<()> {
+        if call.function.name == "apply_patch" {
+            let text = match patch_of(&call) {
+                Ok(text) => text,
+                Err(error) => return self.record_result(&call, error),
+            };
+            return match self.patch_runtime.start(text) {
+                Ok(job) => {
+                    self.set_phase(Phase::Patching { call, job });
+                    Ok(())
+                }
+                Err(error) => self.record_result(&call, format!("Not applied: {error}")),
+            };
+        }
         let code = match code_of(&call) {
             Ok(code) => code,
             Err(error) => return self.record_result(&call, error),
@@ -746,6 +780,11 @@ impl App {
                 task.abort();
             }
             Phase::Ready(call) => not_run.push(call.call),
+            Phase::Patching { call, mut job } => {
+                // Join the writer after signaling cancellation: never save "stopped"
+                // while a detached task could still mutate files or lose its receipt.
+                check(self.record_result(&call, job.stop()));
+            }
             Phase::Running {
                 call,
                 mut output,
@@ -1001,6 +1040,8 @@ impl App {
         let permission = self.settings.permission.next();
         self.settings.permission = permission;
         self.runtime.set_permission(permission);
+        self.patch_runtime
+            .set_permission(permission == config::Permission::ReadWrite);
         if let Err(error) = config::save_permission(&self.settings.dir, permission) {
             self.notice = Some(format!("couldn't save permission: {error:#}"));
         }
@@ -1245,6 +1286,7 @@ impl App {
         let mut spans = vec![Span::styled(info, status)];
         let activity = match self.turn.as_ref().map(|t| &t.phase) {
             Some(Phase::Streaming(_)) => Some("responding… (esc to stop)"),
+            Some(Phase::Patching { .. }) => Some("applying patch… (esc to stop)"),
             Some(Phase::Running { prompt: None, .. }) | Some(Phase::Finishing(_)) => {
                 Some("running… (esc to stop)")
             }
@@ -1379,9 +1421,17 @@ fn build_blocks<'a>(
                 for call in message.tool_calls.iter().flatten() {
                     // Parts: 0 label, 1 code, 2 result or live output, 3 blank, 4+ notes.
                     let part = |n| Key::Call(call.id.clone(), n);
-                    match code_of(call) {
+                    match if call.function.name == "apply_patch" {
+                        patch_of(call)
+                    } else {
+                        code_of(call)
+                    } {
                         Ok(code) => {
-                            blocks.push(Block::new(part(0), "REPL", theme.tool_call));
+                            blocks.push(Block::new(
+                                part(0),
+                                call.function.name.as_str(),
+                                theme.tool_call,
+                            ));
                             blocks.push(Block::new(part(1), code, theme.tool_call));
                         }
                         Err(_) => {
@@ -1469,6 +1519,8 @@ fn build_blocks<'a>(
             blocks.push(Block::new(part(0), name, theme.tool_call));
             let code = if name == "REPL" {
                 streamed_code(arguments)
+            } else if name == "apply_patch" {
+                streamed_argument(arguments, "patch")
             } else {
                 arguments.to_owned()
             };
@@ -1563,12 +1615,17 @@ fn is_exempt(code: &str) -> bool {
 
 /// Display the code available so far without accepting incomplete JSON for execution.
 fn streamed_code(arguments: &str) -> String {
+    streamed_argument(arguments, "code")
+}
+
+/// Both tools preview literal payloads without accepting partial JSON for execution.
+fn streamed_argument(arguments: &str, field: &str) -> String {
     let parsed = serde_json::from_str::<Value>(arguments);
     if let Ok(value) = &parsed {
-        return value["code"].as_str().unwrap_or(arguments).to_owned();
+        return value[field].as_str().unwrap_or(arguments).to_owned();
     }
-    // Walk only top-level object fields, so nested or quoted "code" text cannot
-    // masquerade as the REPL argument. Complete preceding values use serde's parser.
+    // Walk only top-level fields so nested or quoted keys cannot masquerade
+    // as a tool payload. Complete preceding values use serde's parser.
     let preview = || -> Option<String> {
         let mut rest = arguments.trim_start().strip_prefix('{')?.trim_start();
         loop {
@@ -1589,7 +1646,7 @@ fn streamed_code(arguments: &str) -> String {
             if rest.is_empty() {
                 return Some(String::new());
             }
-            if key == "code" {
+            if key == field {
                 let (code, closed) = streamed_string(rest)?;
                 // A complete string in malformed JSON must remain visibly malformed.
                 if closed && !parsed.as_ref().unwrap_err().is_eof() {
@@ -1683,6 +1740,17 @@ fn streamed_hex(chars: &mut std::str::Chars<'_>) -> Option<Option<u32>> {
     Some(Some(value))
 }
 
+/// Reject malformed patch arguments before the editor can touch the filesystem.
+fn patch_of(call: &ToolCall) -> Result<String, String> {
+    #[derive(serde::Deserialize)]
+    struct Arguments {
+        patch: String,
+    }
+    serde_json::from_str::<Arguments>(&call.function.arguments)
+        .map(|args| args.patch)
+        .map_err(|error| format!("Invalid apply_patch arguments: {error}"))
+}
+
 /// The `code` argument of a REPL call, or the error to return to the model.
 fn code_of(call: &ToolCall) -> Result<String, String> {
     if call.function.name != "REPL" {
@@ -1747,6 +1815,7 @@ async fn next_turn_event(turn: &mut Option<Turn>) -> TurnEvent {
             },
             None => std::future::pending().await,
         },
+        Phase::Patching { job, .. } => TurnEvent::Patch(job.result().await),
         Phase::Idle | Phase::Ready(_) => std::future::pending().await,
     }
 }
@@ -2089,6 +2158,43 @@ mod tests {
     fn test_theme() -> Theme {
         let config: toml::Value = toml::from_str(include_str!("../config.toml.example")).unwrap();
         config["theme"].clone().try_into().unwrap()
+    }
+
+    /// Patch previews and saved calls expose the same literal text, including backslashes.
+    #[test]
+    fn patch_arguments_preview_and_replay() {
+        let patch = "*** Begin Patch\n*** Add File: f\n+\\n \"café\"\n*** End Patch";
+        let arguments = serde_json::json!({"patch": patch}).to_string();
+        let mut previous = String::new();
+        for end in 0..=arguments.len() {
+            if !arguments.is_char_boundary(end) {
+                continue;
+            }
+            let preview = streamed_argument(&arguments[..end], "patch");
+            assert!(patch.starts_with(&preview), "{preview:?}");
+            assert!(preview.starts_with(&previous));
+            previous = preview;
+        }
+        assert_eq!(previous, patch);
+        let call: ToolCall = serde_json::from_value(serde_json::json!({
+            "id": "patch-test", "type": "function",
+            "function": {"name": "apply_patch", "arguments": arguments}
+        }))
+        .unwrap();
+        assert_eq!(patch_of(&call).unwrap(), patch);
+        let messages = vec![Message {
+            role: Role::Assistant,
+            tool_calls: Some(vec![call.clone()]),
+            ..Default::default()
+        }];
+        let blocks = build_blocks(None, &messages, &[], None, false, &test_theme());
+        assert_eq!(blocks[0].text.as_ref(), "apply_patch");
+        assert_eq!(blocks[1].text.as_ref(), patch);
+        for invalid in [r#"{"patch":1}"#, r#"{"patch":"unfinished"#] {
+            let mut malformed = call.clone();
+            malformed.function.arguments = invalid.into();
+            assert!(patch_of(&malformed).is_err());
+        }
     }
 
     /// Every fragment boundary must display only a decoded prefix, including split escapes.

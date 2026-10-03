@@ -8,7 +8,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::{ApprovalDescriptionSettings, ResolvedEndpoint};
 
-/// The only tool the model has. Each request uses the configured description verbatim.
+/// REPL requests use the configured description verbatim.
 fn repl_tool(tool_description: &str) -> Value {
     json!({
         "type": "function",
@@ -24,6 +24,24 @@ fn repl_tool(tool_description: &str) -> Value {
                     }
                 },
                 "required": ["code"]
+            }
+        }
+    })
+}
+
+/// Patch text is decoded once from JSON and passed directly to the Rust editor.
+fn patch_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "apply_patch",
+            "description": crate::patch::DESCRIPTION,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patch": {"type": "string", "description": "The complete *** Begin Patch ... *** End Patch text."}
+                },
+                "required": ["patch"]
             }
         }
     })
@@ -63,7 +81,7 @@ pub fn start(
         "model": endpoint.model,
         "stream": true,
         "stream_options": { "include_usage": true },
-        "tools": [repl_tool(tool_description)],
+        "tools": [repl_tool(tool_description), patch_tool()],
         "messages": messages,
     });
     // Config validation reserves the fields above; server-specific parameters
@@ -292,6 +310,17 @@ fn post(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The editor uses the portable function-call shape, with no interpreter argument.
+    #[test]
+    fn patch_definition_is_a_literal_string_function() {
+        let tool = patch_tool();
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["function"]["name"], "apply_patch");
+        let parameters = &tool["function"]["parameters"];
+        assert_eq!(parameters["required"], json!(["patch"]));
+        assert_eq!(parameters["properties"]["patch"]["type"], "string");
+    }
 
     /// The request carries exactly the pending operation, independent endpoint parameters, and no tools.
     #[test]

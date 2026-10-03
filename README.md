@@ -1,6 +1,6 @@
 # harness
 
-A terminal coding agent for OpenAI-compatible chat completions endpoints. The model works through a single tool, a Python REPL, so it can read, write, and edit files, run commands, and combine them in ordinary code.
+A terminal coding agent for OpenAI-compatible chat completions endpoints. The model uses a Python REPL for computation and commands, and a dedicated `apply_patch` tool for direct file edits.
 
 The app runs full screen and draws the conversation exactly as the model sees it, word-wrapped to your terminal's width. Replies stream as they are generated, including the model's reasoning when the server provides it. When you exit, your terminal returns to what it showed before.
 
@@ -91,7 +91,7 @@ This also works with `--resume <NAME>`. The text is used verbatim, including an 
 
 Type at the `> ` prompt and press Enter to send. The reply streams above the prompt: reasoning uses `theme.reasoning`, followed by the answer in `theme.assistant`.
 
-When the model uses the REPL, its code appears as the tool-call arguments stream in. Execution waits for the complete response; printed REPL output appears while it runs. Host commands return captured output when they finish. The model keeps calling the REPL until it answers without one. Esc stops it at any point.
+Tool code or patch text appears as the arguments stream in; execution waits for the complete response. Printed REPL output appears while it runs. Host commands return captured output when they finish. The model keeps calling tools until it answers without one. Esc stops the turn; a patch finishes accounting for any current file commit before reporting what changed.
 
 The status line under the prompt shows the model, the number of tokens in use (after the first reply), and the filesystem permission level. Pending approvals use `theme.approval`; press `y` to allow or `n` to deny.
 
@@ -142,6 +142,14 @@ Shift+Tab cycles `none → read-only → read-write`; the choice is saved to `co
 The repository is the directory from which you launch the app. Access outside it is denied at every level, including traversal and symlink escapes, without an approval prompt. Monty also rejects absolute symlink targets inside the repository; use relative targets. `Path.resolve()` normalizes paths lexically rather than following host symlinks.
 
 Host command approvals are independent of these levels (see Host commands). `reasoning()` is not synthetic: a standalone `reasoning("...")` on a plain string has its own approval exemption at every level. It cannot exempt unrelated code.
+
+### Direct file editing
+
+`apply_patch` accepts the familiar `*** Begin Patch` format with add, update, delete, and rename operations. Patch text is decoded once from JSON and handled directly by Rust, without Python or shell interpretation. Context must match exactly and uniquely; errors include hunk locations and relevant source context.
+
+Editing requires `read-write` permission. All paths must be repository-relative, even for files inside the repository. Text updates follow relative symlinks within the repository; rename and deletion act on the named entries. Following absolute symlink targets or escaping the repository is rejected. Add/rename destinations are checked for absence during validation; ordinary filesystem errors are reported.
+
+The complete patch is parsed first, then each operation is validated and applied in order against the current filesystem. A later failure stops the patch and leaves earlier changes applied. Text replacements preserve existing line endings, final-newline state, and executable permissions; they replace file identity rather than updating other hard links, and do not copy other metadata. Rename-only operations use filesystem rename without reading contents. Results report actual changes before numbered file views; the entire result is subject to `output_limit`.
 
 ### Keys
 
