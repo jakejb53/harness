@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 
 pub const NORMAL: u8 = 0;
 pub const INJECTED_FILE: u8 = 1;
+/// App-generated calls in the saved session that the compact overlay omits.
+pub const SYNTHETIC: u8 = 2;
 const VERSION: u8 = 1;
 const MAX_DATA: usize = 17;
 const MASK_DOMAIN: &[u8] = b"harness/tool-call-id/mask/v1\0";
@@ -91,7 +93,7 @@ mod tests {
     fn binary_roundtrip_and_format() {
         for length in 0..=MAX_DATA {
             let data: Vec<_> = (0..length).map(|index| (index * 83) as u8).collect();
-            for kind in [NORMAL, INJECTED_FILE, 255] {
+            for kind in [NORMAL, INJECTED_FILE, SYNTHETIC, 255] {
                 let id = generate(kind, &data).unwrap();
                 assert_eq!(id.len(), 32);
                 assert!(

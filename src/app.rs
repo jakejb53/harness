@@ -45,7 +45,7 @@ use crate::session::{FunctionCall, Message, NOT_RUN, Role, Session, ToolCall, re
 use crate::tool_call_id;
 use crate::tool_reasoning;
 use crate::transcript::{Block, Key, View};
-use crate::tui::{MessageOverlay, Tui};
+use crate::tui::{MessageEntry, MessageOverlay, Tui};
 
 const STOPPED: &str = "[stopped by user]";
 
@@ -371,7 +371,7 @@ impl App {
         loop {
             // Preserve the existing fail-fast check for marked attachment pairs.
             self.session.validate_injections()?;
-            let messages = message_overlay_entries(&self.session.messages)?;
+            let messages = message_overlay_entries(&self.session.messages, &self.settings.theme)?;
             let footer = self.footer();
             let blocks = build_blocks(
                 self.settings.chat_prompt.as_deref(),
@@ -1393,7 +1393,10 @@ impl App {
 }
 
 /// Project durable messages into ordered positions; tool results share their call's row.
-fn message_overlay_entries(messages: &[Message]) -> anyhow::Result<Vec<String>> {
+fn message_overlay_entries(
+    messages: &[Message],
+    theme: &Theme,
+) -> anyhow::Result<Vec<MessageEntry>> {
     let called: HashSet<&str> = messages
         .iter()
         .filter_map(|message| message.tool_calls.as_ref())
@@ -1401,22 +1404,53 @@ fn message_overlay_entries(messages: &[Message]) -> anyhow::Result<Vec<String>> 
         .map(|call| call.id.as_str())
         .collect();
     let mut entries = Vec::new();
-    let mut add = |label: String| {
-        entries.push(format!("{} {label}", entries.len()));
+    let mut add = |role: &str, payload: String, style: Style, nested: bool| {
+        let position = entries.len();
+        let indent = if nested { "  " } else { "" };
+        let separator = if payload.is_empty() { "" } else { " " };
+        entries.push(MessageEntry {
+            label: format!("{position} {indent}{role}{separator}"),
+            payload,
+            payload_style: style,
+        });
     };
     for message in messages {
         match message.role {
-            Role::User => add(format!("user {}", compact_preview(&message.content))),
+            Role::User => add("user", compact_preview(&message.content), theme.user, false),
             Role::Assistant => {
-                // The header remains even when the assistant only made tool calls.
-                let content = compact_preview(&message.content);
-                add(if content.is_empty() {
-                    "assistant".into()
-                } else {
-                    format!("assistant {content}")
-                });
+                let visible_calls: Vec<_> = message
+                    .tool_calls
+                    .iter()
+                    .flatten()
+                    .filter(|call| {
+                        !tool_call_id::decode(&call.id)
+                            .is_some_and(|metadata| metadata.kind == tool_call_id::SYNTHETIC)
+                    })
+                    .collect();
+                // A dedicated synthetic assistant message has no visible group content.
+                if message.content.is_empty()
+                    && message.extra.is_empty()
+                    && message
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|calls| !calls.is_empty() && visible_calls.is_empty())
+                {
+                    continue;
+                }
+                // The header remains even when ordinary tool calls are its only content.
+                add(
+                    "assistant",
+                    compact_preview(&message.content),
+                    theme.assistant,
+                    false,
+                );
                 if let Some(reasoning) = message.reasoning() {
-                    add(format!("  reasoning {}", compact_preview(&reasoning)));
+                    add(
+                        "reasoning",
+                        compact_preview(&reasoning),
+                        theme.reasoning,
+                        true,
+                    );
                 } else if message
                     .extra
                     .get("reasoning_details")
@@ -1424,10 +1458,10 @@ fn message_overlay_entries(messages: &[Message]) -> anyhow::Result<Vec<String>> 
                     .is_some_and(|blocks| !blocks.is_empty())
                 {
                     // Encrypted reasoning has no text preview, but still has a position.
-                    add("  reasoning [opaque]".into());
+                    add("reasoning", "[opaque]".into(), theme.reasoning, true);
                 }
-                for call in message.tool_calls.iter().flatten() {
-                    add(format!("  tool {}", tool_preview(call)?));
+                for call in visible_calls {
+                    add("tool", tool_preview(call)?, theme.tool_call, true);
                 }
             }
             Role::Tool => {
@@ -1437,10 +1471,16 @@ fn message_overlay_entries(messages: &[Message]) -> anyhow::Result<Vec<String>> 
                     .as_deref()
                     .is_none_or(|id| !called.contains(id))
                 {
-                    add(format!(
-                        "tool result {}",
-                        message.tool_call_id.as_deref().unwrap_or("[no call id]")
-                    ));
+                    add(
+                        "tool result",
+                        message
+                            .tool_call_id
+                            .as_deref()
+                            .unwrap_or("[no call id]")
+                            .into(),
+                        theme.tool_result,
+                        false,
+                    );
                 }
             }
         }
@@ -1752,13 +1792,13 @@ fn accumulate_reply(
     Ok(())
 }
 
-/// The turn-start FYI call uses an ordinary ID with no timestamps or special markers.
+/// Mark app-generated FYI separately so the saved call stays available but its overlay row hides.
 fn fyi_calls() -> anyhow::Result<Vec<ToolCall>> {
     ["FYI()"]
         .into_iter()
         .map(|code| {
             Ok(ToolCall {
-                id: tool_call_id::generate(tool_call_id::NORMAL, &[])?,
+                id: tool_call_id::generate(tool_call_id::SYNTHETIC, &[])?,
                 kind: "function".to_string(),
                 function: FunctionCall {
                     name: "REPL".to_string(),
@@ -2083,7 +2123,7 @@ mod tests {
     /// Assistant parts keep their own positions while each call absorbs its result.
     #[test]
     fn message_overlay_groups_saved_messages() {
-        let messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+        let mut messages: Vec<Message> = serde_json::from_value(serde_json::json!([
             {"role":"user", "content":"hello\nthere"},
             {"role":"assistant", "content":"answer", "reasoning":"think\nmore",
              "tool_calls":[
@@ -2097,8 +2137,25 @@ mod tests {
             ]},
             {"role":"tool", "tool_call_id":"third", "content":"hidden again"}
         ])).unwrap();
+        let synthetic = fyi_calls().unwrap().remove(0);
+        let synthetic_id = synthetic.id.clone();
+        messages.push(Message {
+            role: Role::Assistant,
+            tool_calls: Some(vec![synthetic]),
+            ..Default::default()
+        });
+        messages.push(Message::tool(
+            synthetic_id,
+            "hidden synthetic result".into(),
+        ));
+        let theme = test_theme();
+        let rows = message_overlay_entries(&messages, &theme).unwrap();
+        let visible: Vec<_> = rows
+            .iter()
+            .map(|entry| format!("{}{}", entry.label, entry.payload))
+            .collect();
         assert_eq!(
-            message_overlay_entries(&messages).unwrap(),
+            visible,
             [
                 "0 user hello there",
                 "1 assistant answer",
@@ -2109,6 +2166,35 @@ mod tests {
                 "6   tool REPL FYI()",
             ]
         );
+        assert_eq!(rows[0].payload_style, theme.user);
+        assert_eq!(rows[1].payload_style, theme.assistant);
+        assert_eq!(rows[2].payload_style, theme.reasoning);
+        assert_eq!(rows[3].payload_style, theme.tool_call);
+    }
+
+    /// A marked user attachment stays visible even though app-generated FYI calls hide.
+    #[test]
+    fn message_overlay_keeps_file_injections() {
+        let id = tool_call_id::generate(tool_call_id::INJECTED_FILE, &[]).unwrap();
+        let code = "from pathlib import Path\nprint(Path(\"notes.txt\").read_bytes().decode('utf-8'), end='')";
+        let call: ToolCall = serde_json::from_value(serde_json::json!({
+            "id": id, "type": "function",
+            "function": {"name": "REPL", "arguments": serde_json::json!({"code": code}).to_string()}
+        }))
+        .unwrap();
+        let messages = vec![
+            Message {
+                role: Role::Assistant,
+                tool_calls: Some(vec![call]),
+                ..Default::default()
+            },
+            Message::tool(id, "file contents".into()),
+        ];
+        let rows = message_overlay_entries(&messages, &test_theme()).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "0 assistant");
+        assert_eq!(rows[1].label, "1   tool ");
+        assert_eq!(rows[1].payload, "REPL @notes.txt");
     }
 
     /// Provider IDs cannot introduce local markers; normalization preserves other call fields.
@@ -2237,7 +2323,7 @@ mod tests {
         assert_eq!(fields["tool_calls"][0]["id"], id);
     }
 
-    /// Turn start queues only FYI, using the normal ID layout.
+    /// Turn start marks only app-generated FYI, not model-authored calls.
     #[test]
     fn turn_start_calls_use_uniform_ids() {
         let calls = fyi_calls().unwrap();
@@ -2245,7 +2331,7 @@ mod tests {
         for (call, code) in calls.iter().zip(["FYI()"]) {
             assert_eq!(code_of(call).unwrap(), code);
             let metadata = tool_call_id::decode(&call.id).unwrap();
-            assert_eq!(metadata.kind, tool_call_id::NORMAL);
+            assert_eq!(metadata.kind, tool_call_id::SYNTHETIC);
             assert!(metadata.data.is_empty());
         }
     }

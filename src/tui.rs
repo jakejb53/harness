@@ -23,6 +23,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block as Border, Borders, Clear, Widget};
 use ratatui_textarea::{CursorMove, TextArea};
@@ -53,8 +54,15 @@ pub struct Tui {
 
 /// Rows are a compact projection of the saved session, not request-time messages.
 pub struct MessageOverlay<'a> {
-    pub entries: &'a [String],
+    pub entries: &'a [MessageEntry],
     pub scroll: usize,
+}
+
+/// Labels are UI chrome; previews use the saved message's role color.
+pub struct MessageEntry {
+    pub label: String,
+    pub payload: String,
+    pub payload_style: Style,
 }
 
 /// Mouse routing and scroll bounds belong to the displayed frame.
@@ -239,7 +247,11 @@ fn render_messages(
     let content_width = overlay
         .entries
         .iter()
-        .map(|entry| Line::raw(entry.as_str()).width())
+        .map(|entry| {
+            Line::raw(entry.label.as_str())
+                .width()
+                .saturating_add(Line::raw(entry.payload.as_str()).width())
+        })
         .max()
         .unwrap_or("(empty)".len());
     let width = content_width.saturating_add(2).min(max_width as usize) as u16;
@@ -260,15 +272,26 @@ fn render_messages(
         .render(area, buf);
     let entries = &overlay.entries[scroll..overlay.entries.len().min(scroll + rows)];
     for row in 0..rows {
-        let entry = entries.get(row).map(String::as_str).unwrap_or("(empty)");
         let y = area.y + 1 + row as u16;
-        buf.set_style(Rect::new(area.x + 1, y, width - 2, 1), theme.status);
-        buf.set_string(
-            area.x + 1,
-            y,
-            clip_line(entry, (width - 2) as usize),
-            theme.status,
-        );
+        let x = area.x + 1;
+        let available = (width - 2) as usize;
+        buf.set_style(Rect::new(x, y, width - 2, 1), theme.status);
+        let Some(entry) = entries.get(row) else {
+            buf.set_string(x, y, "(empty)", theme.status);
+            continue;
+        };
+        let label = clip_line(&entry.label, available);
+        let label_width = Line::raw(label.as_str()).width();
+        buf.set_string(x, y, &label, theme.status);
+        // A clipped label owns the whole row; payload starts only after a full label.
+        if label == entry.label && label_width < available {
+            buf.set_string(
+                x + label_width as u16,
+                y,
+                clip_line(&entry.payload, available - label_width),
+                entry.payload_style,
+            );
+        }
     }
     MessageGeometry {
         area,
@@ -361,7 +384,11 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         buffer.set_string(10, 1, "abcdefghij", theme.status);
         let entries: Vec<_> = (0..8)
-            .map(|index| format!("{index} long preview"))
+            .map(|index| MessageEntry {
+                label: format!("{index} "),
+                payload: "long preview".into(),
+                payload_style: theme.user,
+            })
             .collect();
         let mut overlay = MessageOverlay {
             entries: &entries,
@@ -372,6 +399,8 @@ mod tests {
         assert_eq!(geometry.scroll, 5);
         assert_eq!(geometry.max_scroll, 5);
         assert_eq!(buffer[(11, 1)].symbol(), "5");
+        assert_eq!(buffer[(11, 1)].fg, theme.status.fg.unwrap());
+        assert_eq!(buffer[(13, 1)].fg, theme.user.fg.unwrap());
         assert_eq!(buffer[(18, 1)].symbol(), "…");
         assert_eq!(buffer[(19, 1)].symbol(), "│");
         overlay.scroll = 1;
