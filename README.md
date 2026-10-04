@@ -123,11 +123,11 @@ A bordered context overlay in the transcript's upper right includes each injecti
 
 ### Context display
 
-The upper-right overlay is a compact view of the durable session message array. User and assistant content, reasoning, and tool calls have separate rows; a call and its result share one row. App-generated synthetic calls are omitted. Each turn header shows the token count for its complete message slice, and each row shows its contribution within that turn. Turn labels use `theme.context_turn`; turn and row counts use `theme.context_tokens`. File-injection call/result pairs are standalone turns.
+The upper-right overlay is a compact view of the durable session message array. User and assistant content, reasoning, and tool calls have separate rows; a call and its result share one row. App-generated synthetic calls are omitted. Each turn header shows the token count for its complete message slice, and each row shows its contribution within that turn. Turn labels use `theme.context_turn`; turn counts use `theme.context_tokens`; role labels use `theme.context_role`; row counts use `theme.context_message_tokens`; previews use `theme.status`. File-injection call/result pairs are standalone turns.
 
 Counts are cached incrementally. Missing or changed turns are sent as progressive prefixes to the provider's `/tokenize` endpoint, derived by removing a final `/v1` from `[endpoint] base_url`. File-injection requests prepend an empty user message only for tokenization. If any prefix request fails, the complete turn uses `ceil(compact JSON UTF-8 bytes / 3.25)` estimates; `~` marks estimated counts. Unchanged cached turns make no tokenizer requests.
 
-The expanded overlay is capped at three-eighths of the transcript width and height. The mouse wheel scrolls it. Click `[-]` in its border to collapse it to `Messages (N) [+]`; click the tab to reopen it at the retained scroll position. The overlay covers transcript cells without changing transcript wrapping or input width.
+The expanded overlay is capped at nine-sixteenths of the transcript width and height. Its top border centers a bright `Context` header and the mouse wheel scrolls its rows. Click `[-]` to collapse the overlay to that one-row header; click `[+]` to reopen it at the retained width and scroll position. The overlay covers transcript cells without changing transcript wrapping or input width.
 
 ### Approval descriptions
 

@@ -49,6 +49,10 @@ pub struct Theme {
     #[serde(deserialize_with = "theme_style")]
     pub context_tokens: ratatui::style::Style,
     #[serde(deserialize_with = "theme_style")]
+    pub context_role: ratatui::style::Style,
+    #[serde(deserialize_with = "theme_style")]
+    pub context_message_tokens: ratatui::style::Style,
+    #[serde(deserialize_with = "theme_style")]
     pub input: ratatui::style::Style,
 }
 

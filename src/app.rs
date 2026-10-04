@@ -406,7 +406,6 @@ impl App {
                 &self.settings.theme,
                 MessageOverlay {
                     entries: &messages,
-                    position_count: messages.iter().filter(|entry| !entry.turn_label).count(),
                     scroll: if self.follow_messages {
                         usize::MAX
                     } else {
