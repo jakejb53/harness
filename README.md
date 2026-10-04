@@ -1,6 +1,6 @@
 # harness
 
-A terminal coding agent for OpenAI-compatible chat completions endpoints. The model uses a Python REPL for computation and commands, plus direct `read_file` and `apply_patch` tools for files.
+A terminal coding agent for OpenAI-compatible chat completions endpoints. The model uses a Python REPL for computation and commands, plus direct `read_file`, `apply_patch`, and `grep` tools for files.
 
 The app runs full screen and draws the conversation exactly as the model sees it, word-wrapped to your terminal's width. Replies stream as they are generated, including the model's reasoning when the server provides it. When you exit, your terminal returns to what it showed before.
 
@@ -91,7 +91,7 @@ This also works with `--resume <NAME>`. The text is used verbatim, including an 
 
 Type at the `> ` prompt and press Enter to send. The reply streams above the prompt: reasoning uses `theme.reasoning`, followed by the answer in `theme.assistant`.
 
-Tool code or patch text appears as the arguments stream in; execution waits for the complete response. Printed REPL output appears while it runs. Host commands return captured output when they finish. The model keeps calling tools until it answers without one. Esc stops the turn; a patch finishes accounting for any current file commit before reporting what changed.
+Tool arguments appear as they stream in; execution waits for the complete response. Printed REPL output appears while it runs. Host commands return captured output when they finish. The model keeps calling tools until it answers without one. Esc stops the turn; a patch finishes accounting for any current file commit before reporting what changed.
 
 The status line under the prompt shows the model, the number of tokens in use (after the first reply), and the filesystem permission level. Pending approvals use `theme.approval`; press `y` to allow or `n` to deny.
 
@@ -152,6 +152,20 @@ Host command approvals are independent of these levels (see Host commands). `rea
 Editing requires `read-write` permission. All paths must be repository-relative, even for files inside the repository. Text updates follow relative symlinks within the repository; rename and deletion act on the named entries. Following absolute symlink targets or escaping the repository is rejected. Add/rename destinations are checked for absence during validation; ordinary filesystem errors are reported.
 
 The complete patch is parsed first, then each operation is validated and applied in order against the current filesystem. A later failure stops the patch and leaves earlier changes applied. Text replacements preserve existing line endings, final-newline state, and executable permissions; they replace file identity rather than updating other hard links, and do not copy other metadata. Rename-only operations use filesystem rename without reading contents. Results report actual changes before numbered file views; the entire result is subject to `output_limit`.
+
+### Searching files
+
+The `grep` tool accepts structured search parameters:
+
+```json
+{"pattern":"this|that","path":"src","include":"*.rs","context":2}
+```
+
+`pattern` is required and uses extended regex syntax. Defaults are `path="."` (the repository root), `fixed=false`, `ignore_case=false`, `context=0`, and `include=""`. `fixed` selects literal strings; `ignore_case` controls content matching. `include` is a case-sensitive file-basename glob applied at every depth, with empty meaning no filter. Paths are literal and repository-relative; directories are always searched recursively.
+
+Matching and context lines always use `file:line:text`, with `--` between context groups. Binary files are skipped. Searches require `read-only` or `read-write` permission and stay inside the repository. The existing `output_limit` applies, and Esc cancels the search.
+
+Searches cover regular files; named pipes, sockets, and devices are skipped with brief warnings. Recursive searches include hidden and ignored files and skip symlinks with warnings. Every warning names the skipped repository-relative path in the tool result.
 
 ### Keys
 

@@ -21,8 +21,23 @@ Use *** Begin Patch and *** End Patch around operations:
 *** Add File: path (each content line prefixed +)
 *** Delete File: path
 *** Update File: path (optionally followed by *** Move to: new-path)
-Update hunks start with @@ or @@ followed by an exact anchor line. Prefix unchanged context with space, removed lines with -, and new lines with +. Match the complete context/removal sequence exactly and uniquely after its anchor. Hunks refer to the original file and changed ranges must not overlap. Use *** End of File to constrain a hunk to the file end. An insertion without old lines or an anchor appends at EOF.
-Backslashes and quotes in the decoded patch are literal. No shell or Python interpretation occurs. Read files before editing. Existing line endings and final-newline state are preserved; new files use LF. The complete patch is parsed first, then operations are validated and applied in order against the current filesystem. A later failure leaves earlier changes applied; inspect the receipt before retrying."#;
+Start a hunk with @@ alone. An optional anchor goes on that SAME line after "@@ ": for example, "@@ fn example() {" searches after the exact source line "fn example() {". The anchor is not part of the replacement. Omit it when the hunk's context/removal lines already identify one exact match.
+Prefix unchanged context with one space, removed lines with -, and added lines with +. After removing these prefixes, context/removal lines form the old text and context/addition lines form the new text, each in the order written. Put additions where they belong relative to unchanged context. For example:
+*** Begin Patch
+*** Update File: example.rs
+@@
+-    old_call();
++    new_call();
+     unchanged_call();
+*** End Patch
+This replaces old_call before unchanged_call. Replacing @@ with @@ fn example() { adds a same-line anchor; it does not change the resulting line order.
+Within one file update, hunks match its original contents and changed ranges must not overlap. Use *** End of File to constrain a hunk to the file end. An insertion without old lines or an anchor appends at EOF.
+JSON escaping happens once, before patch parsing. In the JSON string, \r and \t decode to actual CR and TAB characters; \\r and \\t decode to literal backslash-r and backslash-t. Patch text is then literal: there is no shell, Python, or replacement-string interpretation. LF separates lines, CRLF is recognized, and a bare CR or TAB inside a line is data. An actual LF in old text requires a separate - line for each physical line.
+To add the Rust source line:
+    out.push_str("\\r");
+the JSON string representing that single added patch line is:
+"+    out.push_str(\"\\\\r\");"
+Read files before editing. Existing line endings and final-newline state are preserved; new files use LF. The complete patch is parsed first, then operations are validated and applied in order against the current filesystem. A later failure leaves earlier changes applied; inspect the receipt before retrying."#;
 
 pub struct Runtime {
     repo: Arc<Repository>,

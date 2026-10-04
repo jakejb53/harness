@@ -140,36 +140,18 @@ pub fn parse(patch: &str) -> Result<Vec<Operation>, String> {
     Ok(operations)
 }
 
-// Split all supported line endings without normalizing source bytes or treating CRLF as two lines.
+// Use the same LF boundaries as read_file and patch parsing. A bare CR is data,
+// including inside a quoted literal; retain terminators so untouched bytes survive.
 pub(super) fn source_lines(text: &str) -> Vec<&str> {
-    let bytes = text.as_bytes();
-    let mut lines = Vec::new();
-    let mut start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\r' || bytes[i] == b'\n' {
-            if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
-                i += 1;
-            }
-            lines.push(&text[start..=i]);
-            start = i + 1;
-        }
-        i += 1;
-    }
-    if start < text.len() {
-        lines.push(&text[start..]);
-    }
-    lines
+    text.split_inclusive('\n').collect()
 }
 
-// Recognize only the final physical terminator, including classic CR-only files.
+// A CR terminates a line only when paired with LF; standalone CR bytes remain literal text.
 fn line_ending(line: &str) -> &'static str {
     if line.ends_with("\r\n") {
         "\r\n"
     } else if line.ends_with('\n') {
         "\n"
-    } else if line.ends_with('\r') {
-        "\r"
     } else {
         ""
     }
@@ -415,6 +397,116 @@ mod tests {
         apply(original, chunks)
     }
 
+    // Exercise JSON decoding, raw controls, line boundaries, and hunk order together.
+    #[test]
+    fn quoted_controls_round_trip_through_json_and_patch() {
+        let original = concat!(
+            "match c {\n",
+            r#"    '"' => out.push_str("\""),"#,
+            "\n",
+            r#"    '\\' => out.push_str("\\\\"),"#,
+            "\n",
+            "    '\n' => out.push_str(\"\\n\"),\n",
+            "    '\r' => out.push_str(\"\\r\"),\n",
+            "    '\t' => out.push_str(\"\\t\"),\n",
+            "}"
+        );
+        let body = concat!(
+            "@@ match c {\n",
+            r#"-    '"' => out.push_str("\""),"#,
+            "\n",
+            r#"+    '"' => out.push_str("\\\""),"#,
+            "\n",
+            r#"     '\\' => out.push_str("\\\\"),"#,
+            "\n",
+            "-    '\n-' => out.push_str(\"\\n\"),\n",
+            "-    '\r' => out.push_str(\"\\r\"),\n",
+            "-    '\t' => out.push_str(\"\\t\"),\n",
+            r#"+    '\n' => out.push_str("\\n"),"#,
+            "\n",
+            r#"+    '\r' => out.push_str("\\r"),"#,
+            "\n",
+            r#"+    '\t' => out.push_str("\\t"),"#,
+            "\n",
+            " }"
+        );
+        let expected = concat!(
+            "match c {\n",
+            r#"    '"' => out.push_str("\\\""),"#,
+            "\n",
+            r#"    '\\' => out.push_str("\\\\"),"#,
+            "\n",
+            r#"    '\n' => out.push_str("\\n"),"#,
+            "\n",
+            r#"    '\r' => out.push_str("\\r"),"#,
+            "\n",
+            r#"    '\t' => out.push_str("\\t"),"#,
+            "\n",
+            "}"
+        );
+        let patch = format!("*** Begin Patch\n*** Update File: f\n{body}\n*** End Patch");
+        let encoded = serde_json::json!({"patch": patch}).to_string();
+        let decoded: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        let operations = parse(decoded["patch"].as_str().unwrap()).unwrap();
+        let Operation::Update { chunks, .. } = &operations[0] else {
+            panic!("expected update")
+        };
+        for ending in ["\n", "\r\n"] {
+            let source = original.replace('\n', ending);
+            let result = apply(&source, chunks).unwrap();
+            assert_eq!(
+                result.contents.as_bytes(),
+                expected.replace('\n', ending).as_bytes()
+            );
+            assert_eq!(source_lines(&source).len(), 8);
+        }
+    }
+
+    // The examples presented to the model must parse and produce the illustrated order and bytes.
+    #[test]
+    fn tool_description_examples_are_executable() {
+        let description = crate::patch::DESCRIPTION;
+        let start = description.find("*** Begin Patch\n").unwrap();
+        let end =
+            start + description[start..].find("*** End Patch").unwrap() + "*** End Patch".len();
+        let example = &description[start..end];
+        for patch in [
+            example.to_owned(),
+            example.replace("\n@@\n", "\n@@ fn example() {\n"),
+        ] {
+            let operations = parse(&patch).unwrap();
+            let Operation::Update { chunks, .. } = &operations[0] else {
+                panic!("expected update")
+            };
+            let result = apply(
+                "fn example() {\n    old_call();\n    unchanged_call();\n}\n",
+                chunks,
+            )
+            .unwrap();
+            assert_eq!(
+                result.contents,
+                "fn example() {\n    new_call();\n    unchanged_call();\n}\n"
+            );
+        }
+        let json_line = description
+            .split_once("the JSON string representing that single added patch line is:\n")
+            .unwrap()
+            .1
+            .lines()
+            .next()
+            .unwrap();
+        let added: String = serde_json::from_str(json_line).unwrap();
+        let result = update(
+            "    old_call();\n",
+            &format!("@@\n-    old_call();\n{added}"),
+        )
+        .unwrap();
+        assert_eq!(
+            result.contents,
+            concat!(r#"    out.push_str("\\r");"#, "\n")
+        );
+    }
+
     // Literal backslashes must survive exactly; neither regex nor string replacement interprets them.
     #[test]
     fn literal_text_and_final_newline() {
@@ -500,19 +592,20 @@ mod tests {
         assert!(parse("*** Begin Patch\n*** End Patch").unwrap().is_empty());
     }
 
-    // Rename-only operations must preserve every source byte, including all newline conventions.
+    // An unchanged file retains every byte; CR-only content is one line, not several boundaries.
     #[test]
-    fn rename_only_and_cr_endings() {
+    fn unchanged_bytes_and_bare_cr_data() {
         for original in ["", "a", "a\r", "a\r\nb\nc\rd", "\r\n\r\n"] {
             let result = apply(original, &[]).unwrap();
             assert_eq!(result.contents, original);
             assert!(result.regions.is_empty());
         }
+        assert_eq!(source_lines("a\rb\rc\r"), vec!["a\rb\rc\r"]);
+        assert_eq!(line_text("a\rb\rc\r"), "a\rb\rc\r");
         assert_eq!(
-            update("a\rb\rc\r", "@@\n-b\n+B").unwrap().contents,
-            "a\rB\rc\r"
+            update("a\rb", "@@\n-a\rb\n+A\\rB").unwrap().contents,
+            "A\\rB"
         );
-        assert_eq!(update("a\rb", "@@\n-b\n+B").unwrap().contents, "a\rB");
     }
 
     // Invalid boundary syntax is rejected rather than indexing beyond the patch envelope.

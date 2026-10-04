@@ -34,6 +34,7 @@ use crate::client::{self, StreamEvent};
 use crate::commands::{self, Action};
 use crate::config::{self, Settings, Theme};
 use crate::failures::FailureLog;
+use crate::grep;
 use crate::injection::{self, PreparedInjection};
 use crate::input::{self, InputAction};
 use crate::patch;
@@ -70,6 +71,10 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
         &std::env::current_dir().context("finding launch directory")?,
         settings.permission != config::Permission::None,
     )?;
+    let grep_runtime = grep::Runtime::new(
+        &std::env::current_dir().context("finding launch directory")?,
+        settings.permission != config::Permission::None,
+    )?;
     let mut tui = Tui::enter()?;
     let textarea = input::new_textarea(&settings.theme);
     let mut app = App {
@@ -77,6 +82,7 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
         runtime,
         patch_runtime,
         read_runtime,
+        grep_runtime,
         failures,
         session,
         http: reqwest::Client::new(),
@@ -113,6 +119,7 @@ struct App {
     runtime: Runtime,
     patch_runtime: patch::Runtime,
     read_runtime: read::Runtime,
+    grep_runtime: grep::Runtime,
     failures: FailureLog,
     session: Session,
     http: reqwest::Client,
@@ -206,6 +213,11 @@ enum Phase {
     Reading {
         call: ToolCall,
         job: read::Job,
+    },
+    /// Grep owns a confined read worker until completion or cancellation.
+    Searching {
+        call: ToolCall,
+        job: grep::Job,
     },
     Running {
         call: PendingCall,
@@ -315,6 +327,7 @@ enum TurnEvent {
     Repl(anyhow::Result<ReplEvent>),
     Patch(String),
     Read(String),
+    Grep(String),
     Description(anyhow::Result<String>),
 }
 
@@ -403,9 +416,9 @@ impl App {
                         self.record_result(&call, result)?;
                     }
                 }
-                Step::Turn(TurnEvent::Read(result)) => {
+                Step::Turn(TurnEvent::Read(result) | TurnEvent::Grep(result)) => {
                     if let Some(turn) = self.turn.as_mut()
-                        && let Phase::Reading { call, .. } =
+                        && let Phase::Reading { call, .. } | Phase::Searching { call, .. } =
                             std::mem::replace(&mut turn.phase, Phase::Idle)
                     {
                         self.record_result(&call, result)?;
@@ -583,6 +596,16 @@ impl App {
     /// or the call is placed back in turn state, before anything that can fail, so an
     /// error exit still leaves a result for every call.
     fn begin_call(&mut self, call: ToolCall) -> anyhow::Result<()> {
+        if call.function.name == "grep" {
+            return match serde_json::from_str::<grep::Arguments>(&call.function.arguments) {
+                Ok(args) => {
+                    let job = self.grep_runtime.start(args);
+                    self.set_phase(Phase::Searching { call, job });
+                    Ok(())
+                }
+                Err(error) => self.record_result(&call, format!("Invalid grep arguments: {error}")),
+            };
+        }
         if call.function.name == "read_file" {
             let args = match serde_json::from_str::<read::Arguments>(&call.function.arguments) {
                 Ok(args) => args,
@@ -814,6 +837,10 @@ impl App {
             }
             Phase::Ready(call) => not_run.push(call.call),
             Phase::Reading { call, job } => {
+                drop(job);
+                check(self.record_result(&call, STOPPED.into()));
+            }
+            Phase::Searching { call, job } => {
                 drop(job);
                 check(self.record_result(&call, STOPPED.into()));
             }
@@ -1081,6 +1108,8 @@ impl App {
             .set_permission(permission == config::Permission::ReadWrite);
         self.read_runtime
             .set_permission(permission != config::Permission::None);
+        self.grep_runtime
+            .set_permission(permission != config::Permission::None);
         if let Err(error) = config::save_permission(&self.settings.dir, permission) {
             self.notice = Some(format!("couldn't save permission: {error:#}"));
         }
@@ -1327,6 +1356,7 @@ impl App {
             Some(Phase::Streaming(_)) => Some("responding… (esc to stop)"),
             Some(Phase::Patching { .. }) => Some("applying patch… (esc to stop)"),
             Some(Phase::Reading { .. }) => Some("reading… (esc to stop)"),
+            Some(Phase::Searching { .. }) => Some("searching… (esc to stop)"),
             Some(Phase::Running { prompt: None, .. }) | Some(Phase::Finishing(_)) => {
                 Some("running… (esc to stop)")
             }
@@ -1463,7 +1493,7 @@ fn build_blocks<'a>(
                     let part = |n| Key::Call(call.id.clone(), n);
                     match if call.function.name == "apply_patch" {
                         patch_of(call)
-                    } else if call.function.name == "read_file" {
+                    } else if matches!(call.function.name.as_str(), "read_file" | "grep") {
                         Ok(call.function.arguments.clone())
                     } else {
                         code_of(call)
@@ -1859,6 +1889,7 @@ async fn next_turn_event(turn: &mut Option<Turn>) -> TurnEvent {
         },
         Phase::Patching { job, .. } => TurnEvent::Patch(job.result().await),
         Phase::Reading { job, .. } => TurnEvent::Read(job.result().await),
+        Phase::Searching { job, .. } => TurnEvent::Grep(job.result().await),
         Phase::Idle | Phase::Ready(_) => std::future::pending().await,
     }
 }
@@ -2230,6 +2261,36 @@ mod tests {
         assert_eq!(blocks[0].text.as_ref(), "read_file");
         assert_eq!(blocks[1].text.as_ref(), arguments);
         assert_eq!(blocks[2].text.as_ref(), "3\tline three");
+    }
+
+    /// Structured and historical grep calls display their stored arguments without conversion.
+    #[test]
+    fn grep_arguments_replay() {
+        for parameters in [
+            serde_json::json!({"pattern":"this|that|\\w+","path":"src café","context":2,"include":"*.rs"}),
+            serde_json::json!({"command":"grep -rn 'this|that' 'src café'"}),
+        ] {
+            let arguments = parameters.to_string();
+            let call: ToolCall = serde_json::from_value(serde_json::json!({
+                "id": "grep-test", "type": "function",
+                "function": {"name": "grep", "arguments": arguments}
+            }))
+            .unwrap();
+            let messages = vec![
+                Message {
+                    role: Role::Assistant,
+                    tool_calls: Some(vec![call]),
+                    ..Default::default()
+                },
+                Message::tool("grep-test".into(), "src café/f:2:this\n".into()),
+            ];
+            let saved = serde_json::to_string(&messages).unwrap();
+            let restored: Vec<Message> = serde_json::from_str(&saved).unwrap();
+            let blocks = build_blocks(None, &restored, &[], None, false, &test_theme());
+            assert_eq!(blocks[0].text.as_ref(), "grep");
+            assert_eq!(blocks[1].text.as_ref(), arguments);
+            assert_eq!(blocks[2].text.as_ref(), "src café/f:2:this");
+        }
     }
 
     /// Patch previews and saved calls expose the same literal text, including backslashes.

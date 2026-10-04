@@ -180,6 +180,33 @@ mod tests {
         }
     }
 
+    /// Bare CR and TAB stay on the same numbered line; only LF separates physical lines.
+    #[tokio::test]
+    async fn line_ranges_preserve_embedded_controls() {
+        let dir = Fixture::new();
+        let runtime = Runtime::new(&dir.0, true).unwrap();
+        for ending in ["\n", "\r\n"] {
+            std::fs::write(
+                dir.0.join("f"),
+                format!("header{ending}    '\r' '\t'{ending}tail\r"),
+            )
+            .unwrap();
+            let mut job = runtime.start(Arguments {
+                path: "f".into(),
+                start_line: NonZeroUsize::new(2),
+                end_line: NonZeroUsize::new(3),
+            });
+            assert_eq!(job.result().await, "2\t    '\r' '\t'\n3\ttail\r\n");
+        }
+        std::fs::write(dir.0.join("f"), "a\rb\rc\r").unwrap();
+        let mut job = runtime.start(Arguments {
+            path: "f".into(),
+            start_line: None,
+            end_line: None,
+        });
+        assert_eq!(job.result().await, "1\ta\rb\rc\r\n");
+    }
+
     /// Reads use the same permission and containment boundary for literal paths and symlinks.
     #[tokio::test]
     async fn permissions_paths_and_errors() {

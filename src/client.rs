@@ -67,6 +67,29 @@ fn read_tool() -> Value {
     })
 }
 
+/// Describe structured search inputs and their defaults directly to the endpoint.
+fn grep_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": crate::grep::DESCRIPTION,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Extended regex to search for, or literal strings when fixed is true."},
+                    "path": {"type": "string", "default": ".", "description": "Literal repository-relative file or directory. Directories are searched recursively; omitted means repository root."},
+                    "fixed": {"type": "boolean", "default": false, "description": "Match fixed strings instead of regex syntax."},
+                    "ignore_case": {"type": "boolean", "default": false, "description": "Use case-insensitive content matching."},
+                    "context": {"type": "integer", "minimum": 0, "default": 0, "description": "Lines before and after each match."},
+                    "include": {"type": "string", "default": "", "description": "Case-sensitive file-basename glob at every depth, for example *.rs. Empty means no filter."}
+                },
+                "required": ["pattern"]
+            }
+        }
+    })
+}
+
 pub enum StreamEvent {
     /// One chunk's `delta`, every field as sent. The reply is assembled from these
     /// with `accumulate`.
@@ -101,7 +124,7 @@ pub fn start(
         "model": endpoint.model,
         "stream": true,
         "stream_options": { "include_usage": true },
-        "tools": [repl_tool(tool_description), patch_tool(), read_tool()],
+        "tools": [repl_tool(tool_description), patch_tool(), read_tool(), grep_tool()],
         "messages": messages,
     });
     // Config validation reserves the fields above; server-specific parameters

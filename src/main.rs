@@ -3,6 +3,7 @@ mod client;
 mod commands;
 mod config;
 mod failures;
+mod grep;
 mod host;
 mod hostfs;
 mod injection;
