@@ -8,7 +8,7 @@
 //! messages, the turn in progress, and display-only notes. Handlers only change
 //! state; drawing is the loop's job.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{
@@ -41,13 +41,11 @@ use crate::list;
 use crate::patch;
 use crate::read;
 use crate::repl::{Repl, ReplEvent, Runtime};
-use crate::session::{
-    FunctionCall, Injection, Message, NOT_RUN, Role, Session, ToolCall, reasoning_text,
-};
+use crate::session::{FunctionCall, Message, NOT_RUN, Role, Session, ToolCall, reasoning_text};
 use crate::tool_call_id;
 use crate::tool_reasoning;
 use crate::transcript::{Block, Key, View};
-use crate::tui::{InjectionOverlay, Tui};
+use crate::tui::{MessageOverlay, Tui};
 
 const STOPPED: &str = "[stopped by user]";
 
@@ -106,8 +104,8 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
         file_completion_context: None,
         repo: std::env::current_dir().context("finding launch directory")?,
         loading: None,
-        removing: None,
-        injection_scroll: 0,
+        message_scroll: usize::MAX,
+        follow_messages: false,
         overlay_gesture: false,
     };
     let result = app.run(&mut tui).await;
@@ -160,9 +158,10 @@ struct App {
     repo: PathBuf,
     /// No session changes occur until every explicit attachment has loaded successfully.
     loading: Option<PendingInjection>,
-    /// Stable call id, not filename or row index, identifies the instance being confirmed.
-    removing: Option<String>,
-    injection_scroll: usize,
+    /// First visible display position, held while idle or after manual scrolling.
+    message_scroll: usize,
+    /// Follow appended positions only until the user scrolls during this turn.
+    follow_messages: bool,
     /// A gesture touching the overlay must not select or copy the transcript underneath it.
     overlay_gesture: bool,
 }
@@ -370,9 +369,10 @@ impl App {
         let mut interrupt = signal(SignalKind::interrupt())?;
 
         loop {
-            // Attachment rows are a projection of saved calls, never a separate source of truth.
-            let injections = self.session.injections()?;
-            let footer = self.footer(tui.width()?, &injections);
+            // Preserve the existing fail-fast check for marked attachment pairs.
+            self.session.validate_injections()?;
+            let messages = message_overlay_entries(&self.session.messages)?;
+            let footer = self.footer();
             let blocks = build_blocks(
                 self.settings.chat_prompt.as_deref(),
                 &self.session.messages,
@@ -387,13 +387,20 @@ impl App {
                 &self.textarea,
                 &footer,
                 &self.settings.theme,
-                InjectionOverlay {
-                    entries: &injections,
-                    scroll: self.injection_scroll,
-                    selected: self.removing.as_deref(),
+                MessageOverlay {
+                    entries: &messages,
+                    scroll: if self.follow_messages {
+                        usize::MAX
+                    } else {
+                        self.message_scroll
+                    },
                 },
             )?;
-            self.injection_scroll = self.injection_scroll.min(tui.injection_max_scroll());
+            self.message_scroll = tui.message_scroll();
+            // Capture the last followed position when a turn ends; idle changes keep it.
+            if self.turn.is_none() {
+                self.follow_messages = false;
+            }
             // Biased toward input so keys (Esc above all) are handled before more
             // output from a fast stream.
             let step = tokio::select! {
@@ -842,7 +849,6 @@ impl App {
     fn stop_turn(&mut self, error: Option<String>) -> anyhow::Result<()> {
         // Pre-submission cancellation preserves the draft and has no session effects.
         self.loading = None;
-        self.removing = None;
         let Some(mut turn) = self.turn.take() else {
             return Ok(());
         };
@@ -920,7 +926,7 @@ impl App {
     /// Route terminal events, restricting input while a host operation awaits approval.
     fn on_input(&mut self, tui: &mut Tui, event: Event) -> anyhow::Result<Flow> {
         if let Event::Mouse(mouse) = &event
-            && self.injection_mouse(tui, *mouse)
+            && self.message_mouse(tui, *mouse)
         {
             return Ok(Flow::Continue);
         }
@@ -938,18 +944,10 @@ impl App {
                     self.view.page(direction);
                     return Ok(Flow::Continue);
                 }
-                // Submission and removal are modal: neither can edit or send the held draft.
+                // Attachment loading holds the draft until all reads finish.
                 if self.loading.is_some() {
                     if key.code == KeyCode::Esc {
                         self.stop_turn(None)?;
-                    }
-                    return Ok(Flow::Continue);
-                }
-                if self.removing.is_some() {
-                    match key.code {
-                        KeyCode::Char('y') => self.confirm_removal(),
-                        KeyCode::Char('n') | KeyCode::Esc => self.removing = None,
-                        _ => {}
                     }
                     return Ok(Flow::Continue);
                 }
@@ -1044,11 +1042,7 @@ impl App {
                 }
                 _ => {}
             },
-            Event::Paste(text)
-                if self.pending_prompt().is_none()
-                    && self.loading.is_none()
-                    && self.removing.is_none() =>
-            {
+            Event::Paste(text) if self.pending_prompt().is_none() && self.loading.is_none() => {
                 input::paste(&mut self.textarea, &text);
                 self.input_changed();
             }
@@ -1059,36 +1053,24 @@ impl App {
     }
 
     /// Consume overlay gestures before transcript selection, even when a drag leaves the box.
-    fn injection_mouse(&mut self, tui: &Tui, mouse: MouseEvent) -> bool {
-        let over = tui.over_injections(mouse.column, mouse.row);
+    fn message_mouse(&mut self, tui: &Tui, mouse: MouseEvent) -> bool {
+        let over = tui.over_messages(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if over => {
-                if self.removing.is_none() {
-                    self.injection_scroll = if mouse.kind == MouseEventKind::ScrollUp {
-                        self.injection_scroll.saturating_sub(1)
-                    } else {
-                        self.injection_scroll
-                            .saturating_add(1)
-                            .min(tui.injection_max_scroll())
-                    };
-                }
+                self.follow_messages = false;
+                self.message_scroll = if mouse.kind == MouseEventKind::ScrollUp {
+                    tui.message_scroll().saturating_sub(1)
+                } else {
+                    tui.message_scroll()
+                        .saturating_add(1)
+                        .min(tui.message_max_scroll())
+                };
                 true
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.overlay_gesture = over;
                 if over {
                     self.view.clear_selection();
-                    if self.removing.is_none()
-                        && self.loading.is_none()
-                        && let Some(id) = tui.injection_at(mouse.column, mouse.row)
-                    {
-                        if self.turn.is_some() {
-                            self.notice =
-                                Some("files can be removed between turns (esc to stop)".into());
-                        } else {
-                            self.removing = Some(id.to_owned());
-                        }
-                    }
                 }
                 over
             }
@@ -1103,25 +1085,6 @@ impl App {
                 true
             }
             _ => over,
-        }
-    }
-
-    /// Only an idle-turn keyboard confirmation can remove the selected saved instance.
-    fn confirm_removal(&mut self) {
-        let Some(id) = self.removing.take() else {
-            return;
-        };
-        if self.turn.is_some() || self.loading.is_some() {
-            return;
-        }
-        match self.session.remove_injection(&id) {
-            Ok(removed) => {
-                self.messages_removed(&removed);
-                self.notes
-                    .retain(|note| !matches!(&note.anchor, Anchor::Call(call) if call == &id));
-                self.view.clear_selection();
-            }
-            Err(error) => self.notice = Some(format!("couldn't remove file: {error:#}")),
         }
     }
 
@@ -1197,7 +1160,7 @@ impl App {
 
     /// Both providers share the list; modal operations retain ownership of the footer.
     fn completions(&self) -> Vec<Completion> {
-        if self.pending_prompt().is_some() || self.loading.is_some() || self.removing.is_some() {
+        if self.pending_prompt().is_some() || self.loading.is_some() {
             return Vec::new();
         }
         completion_candidates(
@@ -1236,14 +1199,7 @@ impl App {
 
     /// Rows below the input: the completion list while it shows, otherwise the
     /// status line.
-    fn footer(&self, width: u16, injections: &[Injection]) -> Vec<Line<'static>> {
-        if let Some(id) = &self.removing
-            && let Some(entry) = injections.iter().find(|entry| &entry.call_id == id)
-        {
-            // Escape control characters and wrap the full path, not the overlay's shortened label.
-            let prompt = format!("Remove {:?} from context? (y/n, esc to cancel)", entry.path);
-            return confirmation_lines(&prompt, width, self.settings.theme.approval);
-        }
+    fn footer(&self) -> Vec<Line<'static>> {
         if self.loading.is_some() {
             return vec![Line::styled(
                 "Loading files… (esc to cancel)",
@@ -1309,7 +1265,7 @@ impl App {
             return Ok(Flow::Continue);
         }
 
-        if self.loading.is_some() || self.removing.is_some() {
+        if self.loading.is_some() {
             return Ok(Flow::Continue);
         }
         let paths = injection::paths(&text);
@@ -1355,6 +1311,8 @@ impl App {
         self.textarea.clear();
         self.input_changed();
         self.view.scroll_to_bottom();
+        // A new turn returns the compact session view to its newest positions.
+        self.follow_messages = true;
         // FYI/help are the only per-turn cleanup cases. Tracked file injections persist.
         let removed = self
             .session
@@ -1432,6 +1390,87 @@ impl App {
         }
         Line::from(spans)
     }
+}
+
+/// Project durable messages into ordered positions; tool results share their call's row.
+fn message_overlay_entries(messages: &[Message]) -> anyhow::Result<Vec<String>> {
+    let called: HashSet<&str> = messages
+        .iter()
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flatten()
+        .map(|call| call.id.as_str())
+        .collect();
+    let mut entries = Vec::new();
+    let mut add = |label: String| {
+        entries.push(format!("{} {label}", entries.len()));
+    };
+    for message in messages {
+        match message.role {
+            Role::User => add(format!("user {}", compact_preview(&message.content))),
+            Role::Assistant => {
+                // The header remains even when the assistant only made tool calls.
+                let content = compact_preview(&message.content);
+                add(if content.is_empty() {
+                    "assistant".into()
+                } else {
+                    format!("assistant {content}")
+                });
+                if let Some(reasoning) = message.reasoning() {
+                    add(format!("  reasoning {}", compact_preview(&reasoning)));
+                } else if message
+                    .extra
+                    .get("reasoning_details")
+                    .and_then(Value::as_array)
+                    .is_some_and(|blocks| !blocks.is_empty())
+                {
+                    // Encrypted reasoning has no text preview, but still has a position.
+                    add("  reasoning [opaque]".into());
+                }
+                for call in message.tool_calls.iter().flatten() {
+                    add(format!("  tool {}", tool_preview(call)?));
+                }
+            }
+            Role::Tool => {
+                // A result without its call is still a saved message; keep it visible.
+                if message
+                    .tool_call_id
+                    .as_deref()
+                    .is_none_or(|id| !called.contains(id))
+                {
+                    add(format!(
+                        "tool result {}",
+                        message.tool_call_id.as_deref().unwrap_or("[no call id]")
+                    ));
+                }
+            }
+        }
+    }
+    Ok(entries)
+}
+
+/// Keep the full single-line preview until the overlay's available width clips it.
+fn compact_preview(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Use the same decoded call content as the transcript, with attachment paths identified.
+fn tool_preview(call: &ToolCall) -> anyhow::Result<String> {
+    let content = if tool_call_id::decode(&call.id)
+        .is_some_and(|metadata| metadata.kind == tool_call_id::INJECTED_FILE)
+    {
+        format!("@{}", injection::filename(call)?)
+    } else if call.function.name == "apply_patch" {
+        patch_of(call).unwrap_or_else(|_| call.function.arguments.clone())
+    } else if matches!(call.function.name.as_str(), "read_file" | "grep" | "list") {
+        call.function.arguments.clone()
+    } else {
+        code_of(call).unwrap_or_else(|_| call.function.arguments.clone())
+    };
+    Ok(format!(
+        "{} {}",
+        call.function.name,
+        compact_preview(&content)
+    ))
 }
 
 /// The transcript as drawn, so it always matches what the model sees: the system
@@ -1986,27 +2025,6 @@ fn completion_candidates(
         .collect()
 }
 
-/// Wrap confirmation text by terminal cells so full paths remain reviewable before removal.
-fn confirmation_lines(text: &str, width: u16, style: Style) -> Vec<Line<'static>> {
-    let width = usize::from(width.max(1));
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    let mut used = 0;
-    for character in text.chars() {
-        let cells = Span::raw(character.to_string()).width();
-        if used + cells > width && !line.is_empty() {
-            lines.push(Line::styled(std::mem::take(&mut line), style));
-            used = 0;
-        }
-        line.push(character);
-        used += cells;
-    }
-    if !line.is_empty() {
-        lines.push(Line::styled(line, style));
-    }
-    lines
-}
-
 /// Poll only the current batch; canceled reads cannot later update local context.
 async fn next_injection(
     pending: &mut Option<PendingInjection>,
@@ -2061,6 +2079,37 @@ fn spawn_input_reader() -> UnboundedReceiver<io::Result<Event>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Assistant parts keep their own positions while each call absorbs its result.
+    #[test]
+    fn message_overlay_groups_saved_messages() {
+        let messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+            {"role":"user", "content":"hello\nthere"},
+            {"role":"assistant", "content":"answer", "reasoning":"think\nmore",
+             "tool_calls":[
+                {"id":"first", "type":"function", "function":{"name":"list", "arguments":"{\"path\":\"src\"}"}},
+                {"id":"second", "type":"function", "function":{"name":"REPL", "arguments":"{\"code\":\"print(1)\"}"}}
+             ]},
+            {"role":"tool", "tool_call_id":"first", "content":"hidden result"},
+            {"role":"tool", "tool_call_id":"second", "content":"1"},
+            {"role":"assistant", "content":"", "tool_calls":[
+                {"id":"third", "type":"function", "function":{"name":"REPL", "arguments":"{\"code\":\"FYI()\"}"}}
+            ]},
+            {"role":"tool", "tool_call_id":"third", "content":"hidden again"}
+        ])).unwrap();
+        assert_eq!(
+            message_overlay_entries(&messages).unwrap(),
+            [
+                "0 user hello there",
+                "1 assistant answer",
+                "2   reasoning think more",
+                "3   tool list {\"path\":\"src\"}",
+                "4   tool REPL print(1)",
+                "5 assistant",
+                "6   tool REPL FYI()",
+            ]
+        );
+    }
 
     /// Provider IDs cannot introduce local markers; normalization preserves other call fields.
     #[test]
@@ -2271,20 +2320,6 @@ mod tests {
                 .await
                 .is_err()
         );
-    }
-
-    /// Confirmation wrapping preserves all characters rather than shortening the path.
-    #[test]
-    fn confirmation_retains_full_path() {
-        let text = "Remove \"長い名前/a file with spaces.txt\" from context? (y/n, esc to cancel)";
-        let lines = confirmation_lines(text, 20, Style::default());
-        assert!(lines.iter().all(|line| line.width() <= 20));
-        let rendered: String = lines
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert_eq!(rendered, text);
     }
 
     /// Tool output keeps distinct styles and one blank separator, even with trailing REPL newlines.

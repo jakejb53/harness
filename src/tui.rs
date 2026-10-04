@@ -23,14 +23,12 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Modifier;
 use ratatui::text::Line;
 use ratatui::widgets::{Block as Border, Borders, Clear, Widget};
 use ratatui_textarea::{CursorMove, TextArea};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::config::Theme;
-use crate::session::Injection;
 use crate::transcript::{Block, View};
 
 /// Prompt marker at the start of the input box.
@@ -50,37 +48,27 @@ impl Command for EnableMouseButtons {
 
 pub struct Tui {
     terminal: Terminal<CrosstermBackend<Stdout>>,
-    injections: InjectionGeometry,
+    messages: MessageGeometry,
 }
 
-/// Each entry identifies one persisted call, even when paths are identical.
-pub struct InjectionOverlay<'a> {
-    pub entries: &'a [Injection],
+/// Rows are a compact projection of the saved session, not request-time messages.
+pub struct MessageOverlay<'a> {
+    pub entries: &'a [String],
     pub scroll: usize,
-    pub selected: Option<&'a str>,
 }
 
-/// Hit targets belong to the displayed frame, not a newly changed session list.
+/// Mouse routing and scroll bounds belong to the displayed frame.
 #[derive(Default)]
-struct InjectionGeometry {
+struct MessageGeometry {
     area: Rect,
-    call_ids: Vec<String>,
+    scroll: usize,
     max_scroll: usize,
 }
 
-impl InjectionGeometry {
+impl MessageGeometry {
     /// Borders absorb mouse events too, preventing selection of covered transcript text.
     fn contains(&self, x: u16, y: u16) -> bool {
         self.area.contains((x, y).into())
-    }
-
-    /// Resolve only a visible minus cell to its persisted injection instance.
-    fn at(&self, x: u16, y: u16) -> Option<&str> {
-        if !self.contains(x, y) || x != self.area.x + 1 {
-            return None;
-        }
-        let row = y.checked_sub(self.area.y + 1)? as usize;
-        self.call_ids.get(row).map(String::as_str)
     }
 }
 
@@ -99,7 +87,7 @@ impl Tui {
         // terminal if setup fails partway.
         let mut tui = Tui {
             terminal,
-            injections: InjectionGeometry::default(),
+            messages: MessageGeometry::default(),
         };
         let out = tui.terminal.backend_mut();
         queue!(
@@ -124,10 +112,10 @@ impl Tui {
         textarea: &TextArea,
         footer: &[Line],
         theme: &Theme,
-        overlay: InjectionOverlay<'_>,
+        overlay: MessageOverlay<'_>,
     ) -> io::Result<()> {
         queue!(self.terminal.backend_mut(), BeginSynchronizedUpdate)?;
-        let mut injections = InjectionGeometry::default();
+        let mut messages = MessageGeometry::default();
         let drawn = self
             .terminal
             .draw(|frame| {
@@ -141,11 +129,11 @@ impl Tui {
                     footer,
                     theme,
                 );
-                injections = render_injections(frame.buffer_mut(), transcript, &overlay, theme);
+                messages = render_messages(frame.buffer_mut(), transcript, &overlay, theme);
             })
             .map(|_| ());
         if drawn.is_ok() {
-            self.injections = injections;
+            self.messages = messages;
         }
         let out = self.terminal.backend_mut();
         queue!(out, EndSynchronizedUpdate)?;
@@ -153,24 +141,19 @@ impl Tui {
         drawn
     }
 
-    /// Only the minus cell removes an injection; the rest of the overlay absorbs input.
-    pub fn injection_at(&self, x: u16, y: u16) -> Option<&str> {
-        self.injections.at(x, y)
-    }
-
     /// Route all mouse events inside the displayed overlay away from the transcript.
-    pub fn over_injections(&self, x: u16, y: u16) -> bool {
-        self.injections.contains(x, y)
+    pub fn over_messages(&self, x: u16, y: u16) -> bool {
+        self.messages.contains(x, y)
     }
 
-    /// Bound wheel scrolling by the latest frame's available attachment rows.
-    pub fn injection_max_scroll(&self) -> usize {
-        self.injections.max_scroll
+    /// Use the frame's effective scroll after clamping to the available rows.
+    pub fn message_scroll(&self) -> usize {
+        self.messages.scroll
     }
 
-    /// Use the current terminal width when wrapping full-path confirmation text.
-    pub fn width(&self) -> io::Result<u16> {
-        self.terminal.size().map(|size| size.width)
+    /// Bound wheel scrolling by the latest frame's available message rows.
+    pub fn message_max_scroll(&self) -> usize {
+        self.messages.max_scroll
     }
 
     /// Put `text` on the system clipboard (OSC 52). Terminals without OSC 52 support
@@ -240,41 +223,29 @@ fn render(
     Rect::new(0, 0, width, region_top)
 }
 
-/// Paint last so attachments cover transcript cells without changing its wrapping.
-fn render_injections(
+/// Paint last so the message list covers transcript cells without changing wrapping.
+fn render_messages(
     buf: &mut Buffer,
     transcript: Rect,
-    overlay: &InjectionOverlay<'_>,
+    overlay: &MessageOverlay<'_>,
     theme: &Theme,
-) -> InjectionGeometry {
+) -> MessageGeometry {
     let max_width = transcript.width / 2;
     let max_height = transcript.height / 2;
-    // A border, minus, separator and at least one filename cell must fit.
-    if overlay.entries.is_empty() || max_width < 5 || max_height < 3 {
-        return InjectionGeometry::default();
+    // Keep a border and one text row even before the session has messages.
+    if max_width < 5 || max_height < 3 {
+        return MessageGeometry::default();
     }
-    let name_width = overlay
+    let content_width = overlay
         .entries
         .iter()
-        .map(|entry| Line::raw(entry.path.as_str()).width())
+        .map(|entry| Line::raw(entry.as_str()).width())
         .max()
-        .unwrap_or(1);
-    let width = name_width.saturating_add(4).min(max_width as usize) as u16;
-    let rows = overlay.entries.len().min((max_height - 2) as usize);
-    let max_scroll = overlay.entries.len() - rows;
-    let mut scroll = overlay.scroll.min(max_scroll);
-    // A wrapped confirmation shrinks the transcript; keep its selected row visible.
-    if let Some(index) = overlay
-        .entries
-        .iter()
-        .position(|entry| overlay.selected == Some(entry.call_id.as_str()))
-    {
-        if index < scroll {
-            scroll = index;
-        } else if index >= scroll + rows {
-            scroll = index + 1 - rows;
-        }
-    }
+        .unwrap_or("(empty)".len());
+    let width = content_width.saturating_add(2).min(max_width as usize) as u16;
+    let rows = overlay.entries.len().max(1).min((max_height - 2) as usize);
+    let max_scroll = overlay.entries.len().saturating_sub(rows);
+    let scroll = overlay.scroll.min(max_scroll);
     let area = Rect::new(
         transcript.right() - width,
         transcript.y,
@@ -287,46 +258,41 @@ fn render_injections(
         .borders(Borders::ALL)
         .border_style(theme.status)
         .render(area, buf);
-    let entries = &overlay.entries[scroll..scroll + rows];
-    for (row, entry) in entries.iter().enumerate() {
-        let style = if overlay.selected == Some(entry.call_id.as_str()) {
-            theme.status.add_modifier(Modifier::REVERSED)
-        } else {
-            theme.status
-        };
+    let entries = &overlay.entries[scroll..overlay.entries.len().min(scroll + rows)];
+    for row in 0..rows {
+        let entry = entries.get(row).map(String::as_str).unwrap_or("(empty)");
         let y = area.y + 1 + row as u16;
-        buf.set_style(Rect::new(area.x + 1, y, width - 2, 1), style);
-        buf.set_string(area.x + 1, y, "- ", style);
+        buf.set_style(Rect::new(area.x + 1, y, width - 2, 1), theme.status);
         buf.set_string(
-            area.x + 3,
+            area.x + 1,
             y,
-            shorten_path(&entry.path, (width - 4) as usize),
-            style,
+            clip_line(entry, (width - 2) as usize),
+            theme.status,
         );
     }
-    InjectionGeometry {
+    MessageGeometry {
         area,
-        call_ids: entries.iter().map(|entry| entry.call_id.clone()).collect(),
+        scroll,
         max_scroll,
     }
 }
 
 /// Preserve grapheme boundaries and reserve one terminal cell for the ellipsis.
-fn shorten_path(path: &str, width: usize) -> String {
-    // Filenames can contain controls; never let them change terminal row layout.
-    let path: String = path
+fn clip_line(text: &str, width: usize) -> String {
+    // Stored messages can contain controls; never let them change terminal row layout.
+    let text: String = text
         .chars()
         .map(|ch| if ch.is_control() { '�' } else { ch })
         .collect();
-    if Line::raw(path.as_str()).width() <= width {
-        return path;
+    if Line::raw(text.as_str()).width() <= width {
+        return text;
     }
     if width == 0 {
         return String::new();
     }
     let mut short = String::new();
     let mut used = 0;
-    for grapheme in path.graphemes(true) {
+    for grapheme in text.graphemes(true) {
         let cells = Line::raw(grapheme).width();
         if used + cells > width - 1 {
             break;
@@ -381,147 +347,71 @@ fn wrapped_rows(textarea: &TextArea, width: u16) -> u16 {
 mod tests {
     use super::*;
 
+    /// Load the example's colors for buffer assertions.
     fn theme() -> Theme {
         let config: toml::Value = toml::from_str(include_str!("../config.toml.example")).unwrap();
         config["theme"].clone().try_into().unwrap()
     }
 
+    /// New positions appear at the bottom, while scrolling keeps older rows available.
     #[test]
-    fn overlay_tracks_duplicate_instances_and_only_minus_hits() {
-        let theme = theme();
-        let area = Rect::new(0, 0, 40, 16);
-        let mut buffer = Buffer::empty(area);
-        buffer.set_string(39, 15, "x", theme.status);
-        let entries = vec![
-            Injection {
-                call_id: "first".into(),
-                path: "same.rs".into(),
-            },
-            Injection {
-                call_id: "second".into(),
-                path: "same.rs".into(),
-            },
-        ];
-        let geometry = render_injections(
-            &mut buffer,
-            area,
-            &InjectionOverlay {
-                entries: &entries,
-                scroll: 0,
-                selected: Some("second"),
-            },
-            &theme,
-        );
-        assert_eq!(geometry.area, Rect::new(29, 0, 11, 4));
-        assert_eq!(geometry.at(30, 1), Some("first"));
-        assert_eq!(geometry.at(30, 2), Some("second"));
-        assert_eq!(geometry.at(31, 1), None);
-        assert_eq!(geometry.at(30, 0), None);
-        assert_eq!(geometry.at(30, 3), None);
-        assert!(geometry.contains(39, 3));
-        assert!(!geometry.contains(39, 4));
-        assert_eq!(buffer[(30, 1)].symbol(), "-");
-        assert!(buffer[(30, 2)].modifier.contains(Modifier::REVERSED));
-        assert!(!buffer[(30, 1)].modifier.contains(Modifier::REVERSED));
-        assert_eq!(buffer[(39, 15)].symbol(), "x");
-    }
-
-    #[test]
-    fn overlay_clamps_scrolling_and_clears_covered_transcript() {
+    fn overlay_scrolls_and_clips_to_existing_limits() {
         let theme = theme();
         let area = Rect::new(0, 0, 20, 10);
         let mut buffer = Buffer::empty(area);
         buffer.set_string(10, 1, "abcdefghij", theme.status);
         let entries: Vec<_> = (0..8)
-            .map(|index| Injection {
-                call_id: index.to_string(),
-                path: "a/very/long/path".into(),
-            })
+            .map(|index| format!("{index} long preview"))
             .collect();
-        let geometry = render_injections(
-            &mut buffer,
-            area,
-            &InjectionOverlay {
-                entries: &entries,
-                scroll: usize::MAX,
-                selected: None,
-            },
-            &theme,
-        );
+        let mut overlay = MessageOverlay {
+            entries: &entries,
+            scroll: usize::MAX,
+        };
+        let geometry = render_messages(&mut buffer, area, &overlay, &theme);
         assert_eq!(geometry.area, Rect::new(10, 0, 10, 5));
+        assert_eq!(geometry.scroll, 5);
         assert_eq!(geometry.max_scroll, 5);
-        assert_eq!(geometry.call_ids, ["5", "6", "7"]);
-        assert_eq!(buffer[(12, 1)].symbol(), " ");
+        assert_eq!(buffer[(11, 1)].symbol(), "5");
         assert_eq!(buffer[(18, 1)].symbol(), "…");
-        assert_eq!(geometry.at(11, 1), Some("5"));
-        // A confirmation footer can shrink the box to one row after clicking.
-        for (scroll, selected) in [(0, "7"), (usize::MAX, "0")] {
-            let geometry = render_injections(
-                &mut buffer,
-                Rect::new(0, 0, 20, 6),
-                &InjectionOverlay {
-                    entries: &entries,
-                    scroll,
-                    selected: Some(selected),
-                },
-                &theme,
-            );
-            assert_eq!(geometry.call_ids, [selected]);
-            assert_eq!(geometry.at(11, 1), Some(selected));
-            assert!(buffer[(11, 1)].modifier.contains(Modifier::REVERSED));
-        }
+        assert_eq!(buffer[(19, 1)].symbol(), "│");
+        overlay.scroll = 1;
+        let geometry = render_messages(&mut buffer, area, &overlay, &theme);
+        assert_eq!(geometry.scroll, 1);
+        assert_eq!(buffer[(11, 1)].symbol(), "1");
     }
 
+    /// The permanent box shows an empty state when space permits and yields on tiny screens.
     #[test]
-    fn empty_or_tiny_overlay_has_no_hit_targets() {
+    fn empty_and_tiny_overlays() {
         let theme = theme();
-        let entries = [Injection {
-            call_id: "one".into(),
-            path: "file".into(),
-        }];
+        let overlay = MessageOverlay {
+            entries: &[],
+            scroll: 0,
+        };
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        let geometry = render_messages(&mut buffer, area, &overlay, &theme);
+        assert!(geometry.contains(79, 2));
+        assert_eq!(buffer[(72, 1)].symbol(), "(");
         for area in [
             Rect::default(),
             Rect::new(0, 0, 9, 20),
             Rect::new(0, 0, 80, 5),
         ] {
             let mut buffer = Buffer::empty(area);
-            let geometry = render_injections(
-                &mut buffer,
-                area,
-                &InjectionOverlay {
-                    entries: &entries,
-                    scroll: 0,
-                    selected: None,
-                },
-                &theme,
-            );
-            assert!(geometry.call_ids.is_empty());
-            assert!(!geometry.contains(0, 0));
+            assert!(!render_messages(&mut buffer, area, &overlay, &theme).contains(0, 0));
         }
-        let area = Rect::new(0, 0, 80, 24);
-        let mut buffer = Buffer::empty(area);
-        let geometry = render_injections(
-            &mut buffer,
-            area,
-            &InjectionOverlay {
-                entries: &[],
-                scroll: 0,
-                selected: None,
-            },
-            &theme,
-        );
-        assert!(geometry.call_ids.is_empty());
-        assert!(!geometry.contains(0, 0));
     }
 
+    /// Cell clipping preserves graphemes and never emits terminal controls.
     #[test]
-    fn shortened_paths_preserve_graphemes_and_cell_width() {
-        assert_eq!(shorten_path("界界界", 4), "界…");
-        assert_eq!(shorten_path("e\u{301}abc", 3), "e\u{301}a…");
-        assert_eq!(shorten_path("abc", 1), "…");
-        assert_eq!(shorten_path("abc", 0), "");
-        assert_eq!(shorten_path("界", 2), "界");
-        assert_eq!(shorten_path("a\tb", 3), "a�b");
+    fn clipped_lines_preserve_graphemes_and_cell_width() {
+        assert_eq!(clip_line("界界界", 4), "界…");
+        assert_eq!(clip_line("e\u{301}abc", 3), "e\u{301}a…");
+        assert_eq!(clip_line("abc", 1), "…");
+        assert_eq!(clip_line("abc", 0), "");
+        assert_eq!(clip_line("界", 2), "界");
+        assert_eq!(clip_line("a\tb", 3), "a�b");
     }
 
     /// Input glyphs, its prompt, and the separator use explicit colors without dimming.

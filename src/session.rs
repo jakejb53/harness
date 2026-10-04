@@ -1,8 +1,7 @@
 //! Session messages are the durable conversation, before request-time tool reasoning.
-//! Injection rows are derived from marked call IDs and their Python filenames.
 //! Messages are appended, except that resume inserts results for
 //! unanswered tool calls, and each turn removes earlier `FYI()`/`help()`-only calls
-//! (`remove_calls`). Users can explicitly remove individual file injections.
+//! (`remove_calls`).
 //! Partial replies are kept as-is, except that a tool call still
 //! streaming when the reply ended is dropped. Assistant messages keep every field
 //! the endpoint streamed, including ones the app doesn't know.
@@ -152,12 +151,6 @@ struct SessionFileRef<'a> {
     messages: &'a [Message],
 }
 
-/// A derived view of one injected call; no separate tracking state is persisted.
-pub struct Injection {
-    pub call_id: String,
-    pub path: String,
-}
-
 pub struct Session {
     pub path: PathBuf,
     pub messages: Vec<Message>,
@@ -304,78 +297,57 @@ impl Session {
         Ok(())
     }
 
-    /// Remove exactly one tracked pair, restoring memory if persistence fails.
-    pub fn remove_injection(&mut self, id: &str) -> anyhow::Result<Vec<usize>> {
-        if !self.injections()?.iter().any(|entry| entry.call_id == id) {
-            bail!("file injection {id:?} is not tracked");
-        }
-        let index = self.injection_index(id)?;
-        let messages: Vec<_> = self.messages.drain(index..index + 2).collect();
-        if let Err(error) = self.save() {
-            self.messages.splice(index..index, messages);
-            return Err(error);
-        }
-        Ok(vec![index, index + 1])
-    }
-
-    /// A removable instance is a complete, exclusive pair, never unrelated messages.
-    fn injection_index(&self, id: &str) -> anyhow::Result<usize> {
-        let calls: Vec<_> = self
-            .messages
-            .iter()
-            .enumerate()
-            .filter(|(_, message)| {
-                message
-                    .tool_calls
-                    .as_ref()
-                    .is_some_and(|calls| calls.iter().any(|call| call.id == id))
-            })
-            .collect();
-        let valid = calls.first().filter(|(_, message)| {
-            message.role == Role::Assistant
-                && message.content.is_empty()
-                && message.extra.is_empty()
-                && message
-                    .tool_calls
-                    .as_ref()
-                    .is_some_and(|calls| calls.len() == 1 && calls[0].function.name == "REPL")
-        });
-        if calls.len() != 1 || valid.is_none() {
-            bail!("invalid file injection {id:?}: expected one dedicated REPL call");
-        }
-        let index = calls[0].0;
-        let results: Vec<_> = self
-            .messages
-            .iter()
-            .enumerate()
-            .filter(|(_, message)| message.tool_call_id.as_deref() == Some(id))
-            .collect();
-        if results.len() != 1 || results[0].0 != index + 1 || results[0].1.role != Role::Tool {
-            bail!("invalid file injection {id:?}: expected its result immediately after the call");
-        }
-        Ok(index)
-    }
-
-    /// Derive display rows from marked complete pairs; malformed marked calls are errors.
-    pub fn injections(&self) -> anyhow::Result<Vec<Injection>> {
-        let mut entries = Vec::new();
-        for call in self
-            .messages
-            .iter()
-            .filter_map(|message| message.tool_calls.as_ref())
-            .flatten()
-        {
-            if crate::tool_call_id::decode(&call.id)
-                .is_some_and(|metadata| metadata.kind == crate::tool_call_id::INJECTED_FILE)
-            {
-                self.injection_index(&call.id)?;
-                entries.push(Injection {
-                    call_id: call.id.clone(),
-                    path: crate::injection::filename(call)?,
-                });
+    /// Keep marked attachments exclusive and paired, even without a removal control.
+    pub fn validate_injections(&self) -> anyhow::Result<()> {
+        for (index, message) in self.messages.iter().enumerate() {
+            let Some(calls) = &message.tool_calls else {
+                continue;
+            };
+            for call in calls {
+                if !crate::tool_call_id::decode(&call.id)
+                    .is_some_and(|metadata| metadata.kind == crate::tool_call_id::INJECTED_FILE)
+                {
+                    continue;
+                }
+                // A marked call identifies one dedicated attachment, not a mixed message.
+                let call_count = self
+                    .messages
+                    .iter()
+                    .filter_map(|entry| entry.tool_calls.as_ref())
+                    .flatten()
+                    .filter(|entry| entry.id == call.id)
+                    .count();
+                if call_count != 1
+                    || message.role != Role::Assistant
+                    || !message.content.is_empty()
+                    || !message.extra.is_empty()
+                    || calls.len() != 1
+                    || call.function.name != "REPL"
+                {
+                    bail!(
+                        "invalid file injection {:?}: expected one dedicated REPL call",
+                        call.id
+                    );
+                }
+                let results: Vec<_> = self
+                    .messages
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| entry.tool_call_id.as_deref() == Some(call.id.as_str()))
+                    .collect();
+                if results.len() != 1
+                    || results[0].0 != index + 1
+                    || results[0].1.role != Role::Tool
+                {
+                    bail!(
+                        "invalid file injection {:?}: expected its result immediately after the call",
+                        call.id
+                    );
+                }
+                crate::injection::filename(call)?;
             }
         }
-        Ok(entries)
+        Ok(())
     }
 
     /// `/rename`: rename the session file, or before the first save, the file it will
@@ -537,7 +509,7 @@ mod injection_tests {
         json!({"messages": session.messages})
     }
 
-    /// Duplicate rows and full results survive resume using only the saved messages.
+    /// Duplicate injections and full results survive resume as saved messages.
     #[test]
     fn marked_duplicate_instances_persist_as_messages_only() {
         let fixture = Fixture::new();
@@ -549,11 +521,9 @@ mod injection_tests {
         assert_eq!(session.messages.len(), 4);
         assert_eq!(session.messages[1].content, large);
         assert_eq!(session.messages[3].content, "");
-        let rows = session.injections().unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].path, "missing.txt");
-        assert_eq!(rows[0].path, rows[1].path);
-        assert_ne!(rows[0].call_id, rows[1].call_id);
+        let first = &session.messages[0].tool_calls.as_ref().unwrap()[0].id;
+        let second = &session.messages[2].tool_calls.as_ref().unwrap()[0].id;
+        assert_ne!(first, second);
         let saved: Value =
             serde_json::from_str(&std::fs::read_to_string(&session.path).unwrap()).unwrap();
         assert_eq!(saved, state(&session));
@@ -561,7 +531,6 @@ mod injection_tests {
         let (resumed, repaired) = fixture.resume().unwrap();
         assert_eq!(repaired, 0);
         assert_eq!(state(&resumed), saved);
-        assert_eq!(resumed.injections().unwrap()[0].call_id, rows[0].call_id);
         for enabled in [false, true] {
             assert_eq!(
                 json!(crate::tool_reasoning::request_messages(
@@ -576,9 +545,9 @@ mod injection_tests {
         assert_eq!(json!(&session.messages[..4]), saved["messages"]);
     }
 
-    /// Legacy metadata cannot classify calls or cause IDs to be rewritten on resume.
+    /// Legacy metadata is ignored, and call IDs remain unchanged on resume.
     #[test]
-    fn old_metadata_and_unmarked_calls_are_not_tracking() {
+    fn legacy_metadata_is_ignored_and_call_ids_are_preserved() {
         let fixture = Fixture::new();
         let mut session = fixture.session();
         let mut old = prepared("old contents");
@@ -592,14 +561,12 @@ mod injection_tests {
         std::fs::write(&session.path, &text).unwrap();
         let (mut resumed, repaired) = fixture.resume().unwrap();
         assert_eq!(repaired, 0);
-        assert!(resumed.injections().unwrap().is_empty());
         assert_eq!(std::fs::read_to_string(&session.path).unwrap(), text);
         resumed.submit("next".into()).unwrap();
         let saved: Value =
             serde_json::from_str(&std::fs::read_to_string(&session.path).unwrap()).unwrap();
         assert!(saved.get("injections").is_none());
         assert_eq!(json!(&resumed.messages[..4]), messages);
-        assert!(resumed.remove_injection("legacy-id").is_err());
     }
 
     /// Even a broad automatic cleanup preserves instances carrying the injection marker.
@@ -608,19 +575,21 @@ mod injection_tests {
         let fixture = Fixture::new();
         let mut session = fixture.session();
         session.inject(vec![prepared("file")]).unwrap();
-        let id = session.injections().unwrap()[0].call_id.clone();
+        let id = session.messages[0].tool_calls.as_ref().unwrap()[0]
+            .id
+            .clone();
         let mut normal = prepared("environment");
         normal.call.id = "fyi-test".into();
         normal.call.function.arguments = json!({"code": "FYI()"}).to_string();
         session.inject(vec![normal]).unwrap();
         assert_eq!(session.remove_calls(|_| true).unwrap(), [2, 3]);
-        assert_eq!(session.injections().unwrap()[0].call_id, id);
+        assert_eq!(session.messages[0].tool_calls.as_ref().unwrap()[0].id, id);
         assert_eq!(state(&fixture.resume().unwrap().0), state(&session));
     }
 
-    /// Removal leaves other instances and discussion intact; failed saves preserve memory.
+    /// Failed injection and submission saves preserve the in-memory conversation.
     #[test]
-    fn removal_targets_one_instance_and_rolls_back_on_save_failure() {
+    fn failed_saves_preserve_memory() {
         let fixture = Fixture::new();
         let mut session = fixture.session();
         session.submit("earlier".into()).unwrap();
@@ -628,15 +597,8 @@ mod injection_tests {
             .inject(vec![prepared("one"), prepared("two"), prepared("three")])
             .unwrap();
         session.submit("later".into()).unwrap();
-        let rows = session.injections().unwrap();
-        assert_eq!(session.remove_injection(&rows[1].call_id).unwrap(), [3, 4]);
-        let remaining = session.injections().unwrap();
-        assert_eq!(remaining.len(), 2);
-        assert_eq!(remaining[0].call_id, rows[0].call_id);
-        assert_eq!(remaining[1].call_id, rows[2].call_id);
         assert_eq!(session.messages[0].content, "earlier");
-        assert_eq!(session.messages[5].content, "later");
-        assert!(session.remove_injection(&rows[1].call_id).is_err());
+        assert_eq!(session.messages[7].content, "later");
         let before = state(&session);
         assert_eq!(state(&fixture.resume().unwrap().0), before);
         let blocked = fixture.0.join("not-a-directory");
@@ -646,32 +608,39 @@ mod injection_tests {
         assert_eq!(state(&session), before);
         assert!(session.submit("new draft".into()).is_err());
         assert_eq!(state(&session), before);
-        assert!(session.remove_injection(&rows[0].call_id).is_err());
-        assert_eq!(state(&session), before);
         assert_eq!(state(&fixture.resume().unwrap().0), before);
     }
 
-    /// Invalid marked calls report corruption instead of disappearing from the derived list.
+    /// Marked attachments remain exclusive, paired, and decodable after UI removal goes away.
     #[test]
-    fn malformed_marked_pairs_are_explicit_errors() {
+    fn marked_attachment_validation_rejects_malformed_pairs() {
         let fixture = Fixture::new();
         let mut session = fixture.session();
         session.inject(vec![prepared("contents")]).unwrap();
         let original = state(&session);
-        for defect in 0..7 {
+        assert!(session.validate_injections().is_ok());
+        for defect in 0..4 {
             let mut invalid = original.clone();
             match defect {
-                0 => { invalid["messages"].as_array_mut().unwrap().pop(); }
-                1 => invalid["messages"][0]["content"] = json!("unrelated"),
-                2 => invalid["messages"][0]["tool_calls"][0]["function"]["name"] = json!("other"),
-                3 => invalid["messages"][1]["role"] = json!("user"),
-                4 => { invalid["messages"].as_array_mut().unwrap().push(original["messages"][1].clone()); }
-                5 => invalid["messages"][0]["tool_calls"][0]["function"]["arguments"] = json!("not json"),
-                6 => invalid["messages"][0]["tool_calls"][0]["function"]["arguments"] = json!(json!({"code": "from pathlib import Path\nprint(Path(\"/absolute\").read_bytes().decode('utf-8'), end='')"}).to_string()),
+                0 => {
+                    invalid["messages"].as_array_mut().unwrap().pop();
+                }
+                1 => invalid["messages"][0]["content"] = json!("mixed content"),
+                2 => invalid["messages"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(original["messages"][1].clone()),
+                3 => {
+                    invalid["messages"][0]["tool_calls"][0]["function"]["arguments"] =
+                        json!("not JSON")
+                }
                 _ => unreachable!(),
             }
             session.messages = serde_json::from_value(invalid["messages"].clone()).unwrap();
-            assert!(session.injections().is_err(), "accepted defect {defect}");
+            assert!(
+                session.validate_injections().is_err(),
+                "accepted defect {defect}"
+            );
         }
     }
 }
