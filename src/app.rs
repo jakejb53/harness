@@ -313,6 +313,8 @@ struct Reply {
 /// Display-only transcript output, never saved or sent to the model.
 struct Note {
     anchor: Anchor,
+    /// Tool names render above the body with the tool-result style; ordinary notes have no heading.
+    heading: Option<String>,
     text: String,
     style: Style,
 }
@@ -687,6 +689,7 @@ impl App {
     fn note(&mut self, anchor: Anchor, text: String, style: Style) {
         self.notes.push(Note {
             anchor,
+            heading: None,
             text,
             style,
         });
@@ -1167,13 +1170,17 @@ impl App {
             Action::Exit => return Ok(Flow::Exit),
             Action::ToggleToolReasoning => self.toggle_tool_reasoning(),
             Action::ShowTools => {
-                let text = client::tool_descriptions(&self.settings.repl_tool_description);
                 // Local command output belongs to the display, never the saved conversation or model context.
-                self.note(
-                    Anchor::After(self.session.messages.len()),
-                    text,
-                    self.settings.theme.status,
-                );
+                for (name, description) in
+                    client::tool_descriptions(&self.settings.repl_tool_description)
+                {
+                    self.notes.push(Note {
+                        anchor: Anchor::After(self.session.messages.len()),
+                        heading: Some(name),
+                        text: description,
+                        style: self.settings.theme.status,
+                    });
+                }
                 self.view.scroll_to_bottom();
             }
             Action::Rename => {
@@ -1467,6 +1474,13 @@ fn build_blocks<'a>(
     let mut position_notes = position_notes.into_iter().peekable();
     let mut add_position_notes = |through: usize, blocks: &mut Vec<Block<'a>>| {
         while let Some((_, index, note)) = position_notes.next_if(|&(n, ..)| n <= through) {
+            if let Some(heading) = &note.heading {
+                blocks.push(Block::new(
+                    Key::Note(index, 2),
+                    heading.as_str(),
+                    theme.tool_result,
+                ));
+            }
             blocks.push(Block::new(
                 Key::Note(index, 0),
                 note.text.as_str(),
@@ -2273,7 +2287,7 @@ mod tests {
         assert_eq!(rendered, text);
     }
 
-    /// Tool descriptions render before the first message and the slash command takes no arguments.
+    /// Tool output keeps distinct styles and one blank separator, even with trailing REPL newlines.
     #[test]
     fn tools_output_before_first_message() {
         assert!(matches!(
@@ -2285,14 +2299,32 @@ mod tests {
         assert_eq!(completions.len(), 1);
         assert!(matches!(completions[0].command.action, Action::ShowTools));
         let theme = test_theme();
-        let text = client::tool_descriptions("Configured REPL description");
-        let notes = [Note {
-            anchor: Anchor::After(0),
-            text: text.clone(),
-            style: theme.status,
-        }];
+        let descriptions =
+            client::tool_descriptions("Configured REPL description\n\nSecond paragraph\n");
+        let notes: Vec<_> = descriptions
+            .iter()
+            .map(|(name, description)| Note {
+                anchor: Anchor::After(0),
+                heading: Some(name.clone()),
+                text: description.clone(),
+                style: theme.status,
+            })
+            .collect();
         let blocks = build_blocks(None, &[], &notes, None, false, &theme);
-        assert_eq!(blocks[0].text.as_ref(), text);
+        assert_eq!(blocks.len(), descriptions.len() * 3);
+        assert_ne!(theme.status.fg, theme.tool_result.fg);
+        for (entry, (name, description)) in blocks.chunks_exact(3).zip(&descriptions) {
+            assert_eq!(entry[0].text.as_ref(), name);
+            assert_eq!(entry[0].style, theme.tool_result);
+            assert_eq!(entry[1].text.as_ref(), description);
+            assert_eq!(entry[1].style, theme.status);
+            assert!(!entry[1].text.ends_with('\n'));
+            assert!(entry[2].text.is_empty());
+        }
+        assert_eq!(
+            blocks[1].text,
+            "Configured REPL description\n\nSecond paragraph"
+        );
     }
 
     /// Read the explicit example palette instead of maintaining hidden test defaults.

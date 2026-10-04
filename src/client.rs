@@ -121,8 +121,8 @@ fn tool_definitions(tool_description: &str) -> Vec<Value> {
     ]
 }
 
-/// Show full description strings, including the configured REPL text, without JSON escaping or truncation.
-pub fn tool_descriptions(tool_description: &str) -> String {
+/// Keep names separate for styling; trim only display line endings, never the model's definitions.
+pub fn tool_descriptions(tool_description: &str) -> Vec<(String, String)> {
     tool_definitions(tool_description)
         .iter()
         .map(|tool| {
@@ -133,10 +133,12 @@ pub fn tool_descriptions(tool_description: &str) -> String {
             let description = function["description"]
                 .as_str()
                 .expect("tool definition has a description");
-            format!("{name}\n{description}")
+            (
+                name.to_owned(),
+                description.trim_end_matches(['\r', '\n']).to_owned(),
+            )
         })
-        .collect::<Vec<_>>()
-        .join("\n\n")
+        .collect()
 }
 
 pub enum StreamEvent {
@@ -403,22 +405,34 @@ fn post(
 mod tests {
     use super::*;
 
-    /// Local descriptions retain operator-supplied text and every advertised native tool's full prose.
+    /// Display spacing ignores trailing line endings while preserving prose and model-facing text.
     #[test]
     fn tools_descriptions_are_complete() {
         let repl = "Custom REPL description\n\nKeep \\paths and \"quotes\" verbatim.  ";
         let output = tool_descriptions(repl);
-        assert!(output.starts_with(&format!("REPL\n{repl}\n\napply_patch\n")));
+        assert_eq!(output[0], ("REPL".into(), repl.into()));
+        assert_eq!(output.len(), 5);
         for (name, description) in [
             ("apply_patch", crate::patch::DESCRIPTION),
             ("grep", crate::grep::DESCRIPTION),
             ("list", crate::list::DESCRIPTION),
         ] {
-            assert!(output.contains(&format!("{name}\n{description}")), "{name}");
+            assert!(
+                output.contains(&(
+                    name.into(),
+                    description.trim_end_matches(['\r', '\n']).into()
+                )),
+                "{name}"
+            );
         }
-        assert!(output.contains("\n\nread_file\nRead a UTF-8 text file"));
-        let definitions = tool_definitions(repl);
-        assert_eq!(definitions[0]["function"]["description"], repl);
+        assert_eq!(output[2].0, "read_file");
+        assert!(output[2].1.starts_with("Read a UTF-8 text file"));
+        for ending in ["", "\n", "\n\n", "\r\n"] {
+            let configured = format!("{repl}{ending}");
+            assert_eq!(tool_descriptions(&configured), output);
+            let definitions = tool_definitions(&configured);
+            assert_eq!(definitions[0]["function"]["description"], configured);
+        }
     }
 
     /// The editor uses the portable function-call shape, with no interpreter argument.
