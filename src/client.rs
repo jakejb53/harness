@@ -90,6 +90,26 @@ fn grep_tool() -> Value {
     })
 }
 
+/// Directory discovery exposes the same path and basename-filter vocabulary as grep.
+fn list_tool() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "list",
+            "description": crate::list::DESCRIPTION,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "default": ".", "description": "Repository-relative directory; omitted means repository root."},
+                    "recursive": {"type": "boolean", "default": false, "description": "Include descendant entries without following symlinks."},
+                    "include": {"type": "string", "default": "", "description": "Case-sensitive basename glob, for example *.rs. Filters output, not directory traversal. Empty means all entries."}
+                },
+                "required": []
+            }
+        }
+    })
+}
+
 pub enum StreamEvent {
     /// One chunk's `delta`, every field as sent. The reply is assembled from these
     /// with `accumulate`.
@@ -124,7 +144,7 @@ pub fn start(
         "model": endpoint.model,
         "stream": true,
         "stream_options": { "include_usage": true },
-        "tools": [repl_tool(tool_description), patch_tool(), read_tool(), grep_tool()],
+        "tools": [repl_tool(tool_description), patch_tool(), read_tool(), grep_tool(), list_tool()],
         "messages": messages,
     });
     // Config validation reserves the fields above; server-specific parameters

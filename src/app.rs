@@ -37,6 +37,7 @@ use crate::failures::FailureLog;
 use crate::grep;
 use crate::injection::{self, PreparedInjection};
 use crate::input::{self, InputAction};
+use crate::list;
 use crate::patch;
 use crate::read;
 use crate::repl::{Repl, ReplEvent, Runtime};
@@ -75,6 +76,10 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
         &std::env::current_dir().context("finding launch directory")?,
         settings.permission != config::Permission::None,
     )?;
+    let list_runtime = list::Runtime::new(
+        &std::env::current_dir().context("finding launch directory")?,
+        settings.permission != config::Permission::None,
+    )?;
     let mut tui = Tui::enter()?;
     let textarea = input::new_textarea(&settings.theme);
     let mut app = App {
@@ -83,6 +88,7 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
         patch_runtime,
         read_runtime,
         grep_runtime,
+        list_runtime,
         failures,
         session,
         http: reqwest::Client::new(),
@@ -120,6 +126,7 @@ struct App {
     patch_runtime: patch::Runtime,
     read_runtime: read::Runtime,
     grep_runtime: grep::Runtime,
+    list_runtime: list::Runtime,
     failures: FailureLog,
     session: Session,
     http: reqwest::Client,
@@ -218,6 +225,11 @@ enum Phase {
     Searching {
         call: ToolCall,
         job: grep::Job,
+    },
+    /// Metadata listings share the ordered file-tool lifecycle without opening file contents.
+    Listing {
+        call: ToolCall,
+        job: list::Job,
     },
     Running {
         call: PendingCall,
@@ -328,6 +340,7 @@ enum TurnEvent {
     Patch(String),
     Read(String),
     Grep(String),
+    List(String),
     Description(anyhow::Result<String>),
 }
 
@@ -416,9 +429,13 @@ impl App {
                         self.record_result(&call, result)?;
                     }
                 }
-                Step::Turn(TurnEvent::Read(result) | TurnEvent::Grep(result)) => {
+                Step::Turn(
+                    TurnEvent::Read(result) | TurnEvent::Grep(result) | TurnEvent::List(result),
+                ) => {
                     if let Some(turn) = self.turn.as_mut()
-                        && let Phase::Reading { call, .. } | Phase::Searching { call, .. } =
+                        && let Phase::Reading { call, .. }
+                        | Phase::Searching { call, .. }
+                        | Phase::Listing { call, .. } =
                             std::mem::replace(&mut turn.phase, Phase::Idle)
                     {
                         self.record_result(&call, result)?;
@@ -596,6 +613,16 @@ impl App {
     /// or the call is placed back in turn state, before anything that can fail, so an
     /// error exit still leaves a result for every call.
     fn begin_call(&mut self, call: ToolCall) -> anyhow::Result<()> {
+        if call.function.name == "list" {
+            return match serde_json::from_str::<list::Arguments>(&call.function.arguments) {
+                Ok(args) => {
+                    let job = self.list_runtime.start(args);
+                    self.set_phase(Phase::Listing { call, job });
+                    Ok(())
+                }
+                Err(error) => self.record_result(&call, format!("Invalid list arguments: {error}")),
+            };
+        }
         if call.function.name == "grep" {
             return match serde_json::from_str::<grep::Arguments>(&call.function.arguments) {
                 Ok(args) => {
@@ -841,6 +868,10 @@ impl App {
                 check(self.record_result(&call, STOPPED.into()));
             }
             Phase::Searching { call, job } => {
+                drop(job);
+                check(self.record_result(&call, STOPPED.into()));
+            }
+            Phase::Listing { call, job } => {
                 drop(job);
                 check(self.record_result(&call, STOPPED.into()));
             }
@@ -1110,6 +1141,8 @@ impl App {
             .set_permission(permission != config::Permission::None);
         self.grep_runtime
             .set_permission(permission != config::Permission::None);
+        self.list_runtime
+            .set_permission(permission != config::Permission::None);
         if let Err(error) = config::save_permission(&self.settings.dir, permission) {
             self.notice = Some(format!("couldn't save permission: {error:#}"));
         }
@@ -1357,6 +1390,7 @@ impl App {
             Some(Phase::Patching { .. }) => Some("applying patch… (esc to stop)"),
             Some(Phase::Reading { .. }) => Some("reading… (esc to stop)"),
             Some(Phase::Searching { .. }) => Some("searching… (esc to stop)"),
+            Some(Phase::Listing { .. }) => Some("listing… (esc to stop)"),
             Some(Phase::Running { prompt: None, .. }) | Some(Phase::Finishing(_)) => {
                 Some("running… (esc to stop)")
             }
@@ -1493,7 +1527,7 @@ fn build_blocks<'a>(
                     let part = |n| Key::Call(call.id.clone(), n);
                     match if call.function.name == "apply_patch" {
                         patch_of(call)
-                    } else if matches!(call.function.name.as_str(), "read_file" | "grep") {
+                    } else if matches!(call.function.name.as_str(), "read_file" | "grep" | "list") {
                         Ok(call.function.arguments.clone())
                     } else {
                         code_of(call)
@@ -1890,6 +1924,7 @@ async fn next_turn_event(turn: &mut Option<Turn>) -> TurnEvent {
         Phase::Patching { job, .. } => TurnEvent::Patch(job.result().await),
         Phase::Reading { job, .. } => TurnEvent::Read(job.result().await),
         Phase::Searching { job, .. } => TurnEvent::Grep(job.result().await),
+        Phase::Listing { job, .. } => TurnEvent::List(job.result().await),
         Phase::Idle | Phase::Ready(_) => std::future::pending().await,
     }
 }
@@ -2261,6 +2296,29 @@ mod tests {
         assert_eq!(blocks[0].text.as_ref(), "read_file");
         assert_eq!(blocks[1].text.as_ref(), arguments);
         assert_eq!(blocks[2].text.as_ref(), "3\tline three");
+    }
+
+    /// Listing calls replay their argument object and complete metadata rows without reformatting.
+    #[test]
+    fn list_arguments_replay() {
+        let result = "\"src space/main.rs\"  128  2026-10-03T18:30:00.123456789Z";
+        for parameters in [
+            serde_json::json!({}),
+            serde_json::json!({"path":"src space","recursive":true,"include":"*.rs"}),
+        ] {
+            let arguments = parameters.to_string();
+            let messages: Vec<Message> = serde_json::from_value(serde_json::json!([
+                {"role":"assistant","content":"","tool_calls":[{"id":"list-test","type":"function","function":{"name":"list","arguments":arguments}}]},
+                {"role":"tool","tool_call_id":"list-test","content":format!("{result}\n")}
+            ])).unwrap();
+            let blocks = build_blocks(None, &messages, &[], None, false, &test_theme());
+            let visible: Vec<_> = blocks
+                .iter()
+                .map(|block| block.text.as_ref())
+                .filter(|text| !text.is_empty())
+                .collect();
+            assert_eq!(visible, ["list", arguments.as_str(), result]);
+        }
     }
 
     /// Structured and historical grep calls display their stored arguments without conversion.

@@ -8,6 +8,7 @@ mod host;
 mod hostfs;
 mod injection;
 mod input;
+mod list;
 mod patch;
 mod read;
 mod repl;

@@ -1,6 +1,6 @@
 # harness
 
-A terminal coding agent for OpenAI-compatible chat completions endpoints. The model uses a Python REPL for computation and commands, plus direct `read_file`, `apply_patch`, and `grep` tools for files.
+A terminal coding agent for OpenAI-compatible chat completions endpoints. The model uses a Python REPL for computation and commands, plus direct `read_file`, `apply_patch`, `grep`, and `list` tools for files.
 
 The app runs full screen and draws the conversation exactly as the model sees it, word-wrapped to your terminal's width. Replies stream as they are generated, including the model's reasoning when the server provides it. When you exit, your terminal returns to what it showed before.
 
@@ -166,6 +166,18 @@ The `grep` tool accepts structured search parameters:
 Matching and context lines always use `file:line:text`, with `--` between context groups. Binary files are skipped. Searches require `read-only` or `read-write` permission and stay inside the repository. The existing `output_limit` applies, and Esc cancels the search.
 
 Searches cover regular files; named pipes, sockets, and devices are skipped with brief warnings. Recursive searches include hidden and ignored files and skip symlinks with warnings. Every warning names the skipped repository-relative path in the tool result.
+
+### Listing files
+
+`list` defaults to the repository root, top-level entries only: `path="."`, `recursive=false`, `include=""`. To discover Rust files beneath a directory:
+
+```json
+{"path":"src","recursive":true,"include":"*.rs"}
+```
+
+Output is sorted by repository-relative path, one entry per line: `path  size  mtime`. Paths are quoted and escaped; directories end in `/`, and other nonregular entries use `[symlink]` or `[special]`. Sizes are exact metadata bytes, including a directory's own size rather than its contents. Modification times are UTC with nine fractional-second digits.
+
+Hidden entries are included. The case-sensitive basename filter controls output, not recursion. Symlinks use their own metadata and are never followed during recursive descent. Listing requires `read-only` or `read-write` permission, stays inside the repository, and uses the existing output limit and Esc cancellation.
 
 ### Keys
 

@@ -1,6 +1,6 @@
 # harness
 
-Terminal chat client for an OpenAI-compatible chat completions endpoint, with a sandboxed Monty Python-subset REPL and direct Rust `read_file`, `apply_patch`, and `grep` tools. Read `SPEC-sandbox.md` for the detailed runtime, permissions, host-command, library, failure-log, and approval-description contracts.
+Terminal chat client for an OpenAI-compatible chat completions endpoint, with a sandboxed Monty Python-subset REPL and direct Rust `read_file`, `apply_patch`, `grep`, and `list` tools. Read `SPEC-sandbox.md` for the detailed runtime, permissions, host-command, library, failure-log, and approval-description contracts.
 
 ## Files
 
@@ -54,7 +54,7 @@ All paths are relative to the harness directory, `~/.harness` (home directory fr
 ## Requests
 
 - Optional `[endpoint.parameters]` entries are forwarded as top-level JSON request fields; omitted entries are not sent. Endpoint-specific names and ranges are validated by the endpoint. Harness rejects `model`, `messages`, `tools`, `stream`, `stream_options`, and `n` as reserved keys, and rejects non-finite floats and TOML dates/times at any nesting depth. Strings, integers, finite floats, booleans, arrays, and tables retain their JSON-compatible values.
-- Chat: `POST {base_url}/chat/completions` with `{"model", "stream": true, "stream_options": {"include_usage": true}, "tools": [REPL, apply_patch, read_file, grep], "messages"}`, plus bearer auth when a key is configured. When an effective system prompt is present, `messages` starts with `{"role": "system", "content": <effective prompt>}`.
+- Chat: `POST {base_url}/chat/completions` with `{"model", "stream": true, "stream_options": {"include_usage": true}, "tools": [REPL, apply_patch, read_file, grep, list], "messages"}`, plus bearer auth when a key is configured. When an effective system prompt is present, `messages` starts with `{"role": "system", "content": <effective prompt>}`.
 - SSE `data:` lines: each `delta` is merged into the reply by the OpenAI SDK's `accumulate_delta` rule, whatever its fields: strings appended, numbers added, objects merged recursively, lists of entries with an `index` merged by matching `index` value (a fragment without one is appended), other lists extended; `index` and `type` are replaced; a value of a different type (such as a later `null`) is ignored. `role` is always `assistant`; `index` is removed from saved tool calls. `usage.total_tokens` is the context count and `usage.prompt_tokens` is retained for the next turn's FYI snapshot, an `error` object is an error. `[DONE]` ends the stream. EOF without `[DONE]` is an error unless a `finish_reason` was seen. A non-2xx response is an error showing status and body.
 - Optional approval descriptions use an independent, non-streaming endpoint request containing only the configured prompt with the pending operation substituted. Configuration, request contents, cancellation, and display behavior are specified in `SPEC-sandbox.md`.
 
@@ -78,6 +78,13 @@ All paths are relative to the harness directory, `~/.harness` (home directory fr
 - `read_file` accepts a repository-relative `path` and optional positive integer `start_line` and `end_line`. Bounds are 1-based and inclusive; omitted bounds mean line 1 and EOF. LF separates lines; CRLF endings are recognized, and bare CR/TAB characters are data. Return selected UTF-8 lines prefixed by their original line number and a tab. EOF ends the read normally.
 - Reads run directly in Rust through a `cap-std` repository directory capability. Permit `read-only` and `read-write`; `none` denies access. Reject absolute paths, absolute symlink targets, and escaping resolution. Ordinary filesystem and UTF-8 errors become tool results. The existing result handling and `output_limit` apply.
 - Calls execute in the ordered tool queue; path/range arguments and results are shown and saved. Esc discards the pending result and records `[stopped by user]`; cancellation and permission changes are checked between line reads.
+
+## List tool
+
+- `list` accepts optional string `path="."`, boolean `recursive=false`, and string `include=""`. Path identifies a repository-relative directory; omitted means repository root. The case-sensitive basename glob filters emitted entries, including directories, without pruning recursive traversal. Empty means no filter; invalid globs return errors. Hidden entries are included.
+- Read entry metadata without opening file contents. Sort by underlying repository-relative path and emit one row per entry: `path  size  mtime`. Quote and escape paths, append `/` to directory names, and label symlinks `[symlink]` and other special entries `[special]`. Size is exact metadata bytes, including directories' own sizes rather than recursive totals. Mtime is UTC with nine fractional-second digits.
+- Resolve the starting directory through the repository capability. Recursive descents use opened directory handles and never follow symlinks, including replacement races. Symlink rows use the link's own size and mtime without reading its target. Absolute input paths, absolute symlink resolution, and repository escapes are rejected.
+- Metadata and traversal errors precede successful rows; other entries continue where possible. Permit `read-only` and `read-write`; `none` denies access. Check permission and cancellation between metadata operations and before returning output. Esc discards the pending result and records `[stopped by user]`. Use the ordered tool queue, structured argument display, session persistence, empty-result handling, and existing `output_limit`.
 
 ## Grep tool
 
@@ -192,6 +199,7 @@ Experimental. With `[chat] tool_reasoning` on, each request and the transcript s
 | `src/patch/engine.rs` | Literal patch parsing, exact matching, and byte-preserving text updates |
 | `src/patch/fs.rs` | Independent repository confinement, staging, and file commits |
 | `src/read.rs` | Direct numbered file reads, line ranges, and permission/cancellation checks |
+| `src/list.rs` | Directory metadata, basename filtering, sorted output, confined traversal and cancellation |
 | `src/grep.rs` | Structured search arguments, filename filtering, confined traversal, ripgrep search and formatting, permission/cancellation checks |
 | `src/repl.rs` | Monty pool and per-turn session lifecycle, suspension handling, library loading, recovery |
 | `src/worker.rs` | Monty worker protocol and memory limits |
