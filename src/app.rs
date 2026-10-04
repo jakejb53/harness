@@ -17,7 +17,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::{Context, ensure};
 use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -42,6 +42,7 @@ use crate::patch;
 use crate::read;
 use crate::repl::{Repl, ReplEvent, Runtime};
 use crate::session::{FunctionCall, Message, NOT_RUN, Role, Session, ToolCall, reasoning_text};
+use crate::token_count;
 use crate::tool_call_id;
 use crate::tool_reasoning;
 use crate::transcript::{Block, Key, View};
@@ -80,6 +81,8 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
     )?;
     let mut tui = Tui::enter()?;
     let textarea = input::new_textarea(&settings.theme);
+    let http = reqwest::Client::new();
+    let token_counts = token_count::Counter::new(http.clone(), settings.endpoint.clone());
     let mut app = App {
         settings,
         runtime,
@@ -89,7 +92,8 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
         list_runtime,
         failures,
         session,
-        http: reqwest::Client::new(),
+        http,
+        token_counts,
         textarea,
         view: View::default(),
         notes: Vec::new(),
@@ -106,6 +110,7 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
         loading: None,
         message_scroll: usize::MAX,
         follow_messages: false,
+        messages_collapsed: false,
         overlay_gesture: false,
     };
     let result = app.run(&mut tui).await;
@@ -128,6 +133,7 @@ struct App {
     failures: FailureLog,
     session: Session,
     http: reqwest::Client,
+    token_counts: token_count::Counter,
     textarea: TextArea<'static>,
     view: View,
     /// Display-only lines (failure counts, errors), never saved in the session.
@@ -162,6 +168,8 @@ struct App {
     message_scroll: usize,
     /// Follow appended positions only until the user scrolls during this turn.
     follow_messages: bool,
+    /// Visibility belongs to this app run; turns do not reopen a collapsed overlay.
+    messages_collapsed: bool,
     /// A gesture touching the overlay must not select or copy the transcript underneath it.
     overlay_gesture: bool,
 }
@@ -332,6 +340,7 @@ enum Step {
     Input(Option<io::Result<Event>>),
     Turn(TurnEvent),
     Injected(anyhow::Result<Vec<PreparedInjection>>),
+    Tokens(Option<(String, crate::session::TurnTokenCache)>),
 }
 
 enum TurnEvent {
@@ -371,7 +380,15 @@ impl App {
         loop {
             // Preserve the existing fail-fast check for marked attachment pairs.
             self.session.validate_injections()?;
-            let messages = message_overlay_entries(&self.session.messages, &self.settings.theme)?;
+            let active_user = self.turn.as_ref().and_then(|_| {
+                self.session
+                    .messages
+                    .iter()
+                    .rposition(|message| message.role == Role::User)
+            });
+            self.token_counts.refresh(&mut self.session, active_user)?;
+            let messages =
+                message_overlay_entries(&self.session.messages, self.token_counts.turns())?;
             let footer = self.footer();
             let blocks = build_blocks(
                 self.settings.chat_prompt.as_deref(),
@@ -389,14 +406,19 @@ impl App {
                 &self.settings.theme,
                 MessageOverlay {
                     entries: &messages,
+                    position_count: messages.iter().filter(|entry| !entry.turn_label).count(),
                     scroll: if self.follow_messages {
                         usize::MAX
                     } else {
                         self.message_scroll
                     },
+                    collapsed: self.messages_collapsed,
                 },
             )?;
-            self.message_scroll = tui.message_scroll();
+            // Collapsing changes geometry, not the position to restore when reopened.
+            if !self.messages_collapsed {
+                self.message_scroll = tui.message_scroll();
+            }
             // Capture the last followed position when a turn ends; idle changes keep it.
             if self.turn.is_none() {
                 self.follow_messages = false;
@@ -411,8 +433,14 @@ impl App {
                 event = input.recv() => Step::Input(event),
                 event = next_turn_event(&mut self.turn) => Step::Turn(event),
                 result = next_injection(&mut self.loading) => Step::Injected(result),
+                result = self.token_counts.next() => Step::Tokens(result),
             };
             match step {
+                Step::Tokens(Some((digest, cache))) => {
+                    self.token_counts
+                        .finish(&mut self.session, &digest, cache)?;
+                }
+                Step::Tokens(None) => {}
                 Step::Injected(result) => self.finish_injection(result)?,
                 Step::Signal => {
                     self.signaled = true;
@@ -1057,20 +1085,27 @@ impl App {
         let over = tui.over_messages(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if over => {
-                self.follow_messages = false;
-                self.message_scroll = if mouse.kind == MouseEventKind::ScrollUp {
-                    tui.message_scroll().saturating_sub(1)
-                } else {
-                    tui.message_scroll()
-                        .saturating_add(1)
-                        .min(tui.message_max_scroll())
-                };
+                if !self.messages_collapsed {
+                    self.follow_messages = false;
+                    self.message_scroll = if mouse.kind == MouseEventKind::ScrollUp {
+                        tui.message_scroll().saturating_sub(1)
+                    } else {
+                        tui.message_scroll()
+                            .saturating_add(1)
+                            .min(tui.message_max_scroll())
+                    };
+                }
                 true
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.overlay_gesture = over;
                 if over {
                     self.view.clear_selection();
+                    if tui.message_toggle_at(mouse.column, mouse.row) {
+                        self.messages_collapsed = !self.messages_collapsed;
+                        // Reopening restores the last visible scroll position.
+                        self.follow_messages = false;
+                    }
                 }
                 over
             }
@@ -1312,6 +1347,7 @@ impl App {
         self.input_changed();
         self.view.scroll_to_bottom();
         // A new turn returns the compact session view to its newest positions.
+        self.message_scroll = usize::MAX;
         self.follow_messages = true;
         // FYI/help are the only per-turn cleanup cases. Tracked file injections persist.
         let removed = self
@@ -1395,7 +1431,7 @@ impl App {
 /// Project durable messages into ordered positions; tool results share their call's row.
 fn message_overlay_entries(
     messages: &[Message],
-    theme: &Theme,
+    turns: &[token_count::CountedTurn],
 ) -> anyhow::Result<Vec<MessageEntry>> {
     let called: HashSet<&str> = messages
         .iter()
@@ -1404,86 +1440,91 @@ fn message_overlay_entries(
         .map(|call| call.id.as_str())
         .collect();
     let mut entries = Vec::new();
-    let mut add = |role: &str, payload: String, style: Style, nested: bool| {
-        let position = entries.len();
-        let indent = if nested { "  " } else { "" };
-        let separator = if payload.is_empty() { "" } else { " " };
+    for (turn_index, turn) in turns.iter().enumerate() {
+        let estimate = if turn.cache.estimated { "~" } else { "" };
         entries.push(MessageEntry {
-            label: format!("{position} {indent}{role}{separator}"),
-            payload,
-            payload_style: style,
+            prefix: String::new(),
+            label: format!("Turn {turn_index}"),
+            turn_label: true,
+            tokens: format!("{estimate}{} tokens", thousands(turn.cache.total)),
+            payload: String::new(),
         });
-    };
-    for message in messages {
-        match message.role {
-            Role::User => add("user", compact_preview(&message.content), theme.user, false),
-            Role::Assistant => {
-                let visible_calls: Vec<_> = message
-                    .tool_calls
-                    .iter()
-                    .flatten()
-                    .filter(|call| {
-                        !tool_call_id::decode(&call.id)
-                            .is_some_and(|metadata| metadata.kind == tool_call_id::SYNTHETIC)
-                    })
-                    .collect();
-                // A dedicated synthetic assistant message has no visible group content.
-                if message.content.is_empty()
-                    && message.extra.is_empty()
-                    && message
+        let mut counts = turn.cache.positions.iter().copied();
+        let mut add = |role: &str, payload: String, nested: bool| {
+            let count = counts.next().unwrap_or(0);
+            let indent = if nested { "  " } else { "" };
+            entries.push(MessageEntry {
+                prefix: indent.to_string(),
+                label: role.to_string(),
+                turn_label: false,
+                tokens: format!("{estimate}{}t", thousands(count)),
+                payload,
+            });
+        };
+        for message in &messages[turn.range.clone()] {
+            match message.role {
+                Role::User => add("user", compact_preview(&message.content), false),
+                Role::Assistant => {
+                    let visible_calls: Vec<_> = message
                         .tool_calls
-                        .as_ref()
-                        .is_some_and(|calls| !calls.is_empty() && visible_calls.is_empty())
-                {
-                    continue;
+                        .iter()
+                        .flatten()
+                        .filter(|call| {
+                            tool_call_id::decode(&call.id)
+                                .is_none_or(|metadata| metadata.kind != tool_call_id::SYNTHETIC)
+                        })
+                        .collect();
+                    // A dedicated synthetic assistant message has no visible group content.
+                    if message.content.is_empty()
+                        && message.extra.is_empty()
+                        && message
+                            .tool_calls
+                            .as_ref()
+                            .is_some_and(|calls| !calls.is_empty() && visible_calls.is_empty())
+                    {
+                        continue;
+                    }
+                    // The header remains even when ordinary tool calls are its only content.
+                    add("assistant", compact_preview(&message.content), false);
+                    if let Some(reasoning) = message.reasoning() {
+                        add("reasoning", compact_preview(&reasoning), true);
+                    } else if message
+                        .extra
+                        .get("reasoning_details")
+                        .and_then(Value::as_array)
+                        .is_some_and(|blocks| !blocks.is_empty())
+                    {
+                        // Encrypted reasoning has no text preview, but still has a position.
+                        add("reasoning", "[opaque]".into(), true);
+                    }
+                    for call in visible_calls {
+                        add("tool", tool_preview(call)?, true);
+                    }
                 }
-                // The header remains even when ordinary tool calls are its only content.
-                add(
-                    "assistant",
-                    compact_preview(&message.content),
-                    theme.assistant,
-                    false,
-                );
-                if let Some(reasoning) = message.reasoning() {
-                    add(
-                        "reasoning",
-                        compact_preview(&reasoning),
-                        theme.reasoning,
-                        true,
-                    );
-                } else if message
-                    .extra
-                    .get("reasoning_details")
-                    .and_then(Value::as_array)
-                    .is_some_and(|blocks| !blocks.is_empty())
-                {
-                    // Encrypted reasoning has no text preview, but still has a position.
-                    add("reasoning", "[opaque]".into(), theme.reasoning, true);
-                }
-                for call in visible_calls {
-                    add("tool", tool_preview(call)?, theme.tool_call, true);
-                }
-            }
-            Role::Tool => {
-                // A result without its call is still a saved message; keep it visible.
-                if message
-                    .tool_call_id
-                    .as_deref()
-                    .is_none_or(|id| !called.contains(id))
-                {
-                    add(
-                        "tool result",
-                        message
-                            .tool_call_id
-                            .as_deref()
-                            .unwrap_or("[no call id]")
-                            .into(),
-                        theme.tool_result,
-                        false,
-                    );
+                Role::Tool => {
+                    // A result without its call is still a saved message; keep it visible.
+                    if message
+                        .tool_call_id
+                        .as_deref()
+                        .is_none_or(|id| !called.contains(id))
+                    {
+                        add(
+                            "tool result",
+                            message
+                                .tool_call_id
+                                .as_deref()
+                                .unwrap_or("[no call id]")
+                                .into(),
+                            false,
+                        );
+                    }
                 }
             }
         }
+        ensure!(
+            counts.next().is_none(),
+            "turn token cache has extra position counts"
+        );
     }
     Ok(entries)
 }
@@ -2120,6 +2161,25 @@ fn spawn_input_reader() -> UnboundedReceiver<io::Result<Event>> {
 mod tests {
     use super::*;
 
+    /// Derive deterministic estimates without making tokenizer requests in UI tests.
+    fn counted_turns(messages: &[Message]) -> Vec<token_count::CountedTurn> {
+        let endpoint = config::ResolvedEndpoint {
+            url: "http://example.test/v1/chat/completions".into(),
+            tokenize_url: "http://example.test/tokenize".into(),
+            model: "test".into(),
+            api_key: None,
+            parameters: Map::new(),
+        };
+        token_count::plans(messages, &endpoint)
+            .unwrap()
+            .into_iter()
+            .map(|plan| token_count::CountedTurn {
+                range: plan.range.clone(),
+                cache: token_count::cached_or_estimated(&plan, &[]),
+            })
+            .collect()
+    }
+
     /// Assistant parts keep their own positions while each call absorbs its result.
     #[test]
     fn message_overlay_groups_saved_messages() {
@@ -2148,28 +2208,33 @@ mod tests {
             synthetic_id,
             "hidden synthetic result".into(),
         ));
-        let theme = test_theme();
-        let rows = message_overlay_entries(&messages, &theme).unwrap();
+        let turns = counted_turns(&messages);
+        let rows = message_overlay_entries(&messages, &turns).unwrap();
         let visible: Vec<_> = rows
             .iter()
-            .map(|entry| format!("{}{}", entry.label, entry.payload))
+            .filter(|entry| !entry.turn_label)
+            .map(|entry| {
+                format!(
+                    "{}{}{}{}",
+                    entry.prefix,
+                    entry.label,
+                    if entry.payload.is_empty() { "" } else { " " },
+                    entry.payload
+                )
+            })
             .collect();
         assert_eq!(
             visible,
             [
-                "0 user hello there",
-                "1 assistant answer",
-                "2   reasoning think more",
-                "3   tool list {\"path\":\"src\"}",
-                "4   tool REPL print(1)",
-                "5 assistant",
-                "6   tool REPL FYI()",
+                "user hello there",
+                "assistant answer",
+                "  reasoning think more",
+                "  tool list {\"path\":\"src\"}",
+                "  tool REPL print(1)",
+                "assistant",
+                "  tool REPL FYI()",
             ]
         );
-        assert_eq!(rows[0].payload_style, theme.user);
-        assert_eq!(rows[1].payload_style, theme.assistant);
-        assert_eq!(rows[2].payload_style, theme.reasoning);
-        assert_eq!(rows[3].payload_style, theme.tool_call);
     }
 
     /// A marked user attachment stays visible even though app-generated FYI calls hide.
@@ -2190,11 +2255,16 @@ mod tests {
             },
             Message::tool(id, "file contents".into()),
         ];
-        let rows = message_overlay_entries(&messages, &test_theme()).unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].label, "0 assistant");
-        assert_eq!(rows[1].label, "1   tool ");
-        assert_eq!(rows[1].payload, "REPL @notes.txt");
+        let turns = counted_turns(&messages);
+        let rows = message_overlay_entries(&messages, &turns).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].label, "Turn 0");
+        assert!(rows[0].tokens.starts_with('~'));
+        assert_eq!(rows[1].prefix, "");
+        assert_eq!(rows[1].label, "assistant");
+        assert_eq!(rows[2].prefix, "  ");
+        assert_eq!(rows[2].label, "tool");
+        assert_eq!(rows[2].payload, "REPL @notes.txt");
     }
 
     /// Provider IDs cannot introduce local markers; normalization preserves other call fields.

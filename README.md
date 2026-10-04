@@ -119,7 +119,15 @@ Enter loads attachments locally without starting a turn or requesting the model.
 
 Attachment command lines never enter the prompt or history. After successful loading, an attachment-only draft clears; mixed input keeps its ordinary text unsent, ready for a separate Enter. The next explicit message includes the files in model context. All files must load before changing the draft or history. Missing, unreadable, nonregular, or non-UTF-8 files block loading and preserve both. Loading holds draft editing; Esc cancels and preserves the original full draft and history.
 
-A bordered overlay in the transcript's upper right lists each instance, including duplicate filenames. Its size is capped at half the transcript width and height; long paths shorten and the mouse wheel over the box scrolls the list. It does not change transcript wrapping or input width and is hidden when empty. Between turns, click an instance's `-` to highlight it and confirm its full path with `y`; `n` or Esc cancels. Removal deletes only that instance's synthetic call and result from the saved conversation. It leaves the disk file, prior user messages, and later discussion intact.
+A bordered context overlay in the transcript's upper right includes each injection as an assistant group and coupled tool-call position. See Context display below.
+
+### Context display
+
+The upper-right overlay is a compact view of the durable session message array. User and assistant content, reasoning, and tool calls have separate rows; a call and its result share one row. App-generated synthetic calls are omitted. Each turn header shows the token count for its complete message slice, and each row shows its contribution within that turn. Turn labels use `theme.context_turn`; turn and row counts use `theme.context_tokens`. File-injection call/result pairs are standalone turns.
+
+Counts are cached incrementally. Missing or changed turns are sent as progressive prefixes to the provider's `/tokenize` endpoint, derived by removing a final `/v1` from `[endpoint] base_url`. File-injection requests prepend an empty user message only for tokenization. If any prefix request fails, the complete turn uses `ceil(compact JSON UTF-8 bytes / 3.25)` estimates; `~` marks estimated counts. Unchanged cached turns make no tokenizer requests.
+
+The expanded overlay is capped at three-eighths of the transcript width and height. The mouse wheel scrolls it. Click `[-]` in its border to collapse it to `Messages (N) [+]`; click the tab to reopen it at the retained scroll position. The overlay covers transcript cells without changing transcript wrapping or input width.
 
 ### Approval descriptions
 
@@ -268,7 +276,7 @@ This conversion changes only what's sent and shown; saved reasoning stays unchan
 
 ## Conversation files
 
-The saved conversation is authoritative. The app may transform messages before saving and modify the saved conversation; requests use those saved values, with only the explicit tool-reasoning conversion described above. Session files contain only messages, including tool calls and results. The system message is added separately and isn't saved; each request uses this invocation's `--system-prompt` override or the prompt loaded from `config.toml`, including for resumed conversations:
+The saved `messages` array is authoritative provider-visible conversation state. The app may transform messages before saving and modify the saved conversation; requests use those saved values, with only the explicit tool-reasoning conversion described above. The optional top-level `_harness_local` object contains derived local metadata and is never sent to providers. The system message is added separately and isn't saved; each request uses this invocation's `--system-prompt` override or the prompt loaded from `config.toml`, including for resumed conversations:
 
 ```json
 { "messages": [
@@ -276,9 +284,13 @@ The saved conversation is authoritative. The app may transform messages before s
   { "role": "assistant", "content": "", "reasoning": "...", "tool_calls": [ ... ] },
   { "role": "tool", "tool_call_id": "...", "content": "..." },
   { "role": "assistant", "content": "...", "reasoning": "..." }
-] }
+], "_harness_local": {
+  "turn_token_cache": [ ... ]
+} }
 ```
 
-The file list is derived from encoded call IDs and filenames in the saved Python code; there is no separate tracking field or sidecar. File contents live only in the matching tool result. New call IDs use one 32-character Base64url format; provider IDs are replaced before saving, and results use the saved IDs. Existing IDs and code are not migrated. Old IDs are not recognized as tracked attachments; an obsolete top-level `injections` field is ignored on load and omitted on the next ordinary save.
+File injections are derived from encoded call IDs and filenames in saved Python code; there is no separate tracking field or sidecar. File contents live only in the matching tool result. New call IDs use one 32-character Base64url format; provider IDs are replaced before saving, and results use the saved IDs. Existing IDs and code are not migrated. Old IDs are not recognized as tracked attachments.
+
+Session and `_harness_local` objects reject unknown fields. New local-only metadata must be explicitly added beneath `_harness_local`; obsolete fields receive no compatibility handling. A session containing an unknown or obsolete field fails to resume with a parse error.
 
 Replies preserve other endpoint fields, such as reasoning under whatever name it uses (`reasoning`, `reasoning_content`, `reasoning_details`, …); outgoing reasoning changes only when tool reasoning is enabled. A reply you stop partway through is kept as far as it got. Tool results include their errors; display-only notices and failure-count notes are not saved in the conversation.

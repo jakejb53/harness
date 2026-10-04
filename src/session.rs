@@ -30,7 +30,7 @@ pub enum Role {
     Tool,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct Message {
     pub role: Role,
     pub content: String,
@@ -140,20 +140,55 @@ pub struct FunctionCall {
     pub extra: Map<String, Value>,
 }
 
+/// Cached derived data is local to Harness and never enters provider requests.
+#[derive(Serialize, Deserialize, Default, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct LocalMetadata {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turn_token_cache: Vec<TurnTokenCache>,
+}
+
+impl LocalMetadata {
+    /// Empty metadata is omitted so ordinary session files retain their minimal shape.
+    fn is_empty(&self) -> bool {
+        self.turn_token_cache.is_empty()
+    }
+}
+
+/// One complete tokenization result, keyed by every input that affects it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TurnTokenCache {
+    pub digest: String,
+    pub total: u64,
+    pub positions: Vec<u64>,
+    pub estimated: bool,
+}
+
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SessionFile {
     messages: Vec<Message>,
+    #[serde(default, rename = "_harness_local")]
+    local: LocalMetadata,
 }
 
 /// Serialization twin of `SessionFile` that borrows the messages.
 #[derive(Serialize)]
 struct SessionFileRef<'a> {
     messages: &'a [Message],
+    #[serde(
+        rename = "_harness_local",
+        skip_serializing_if = "LocalMetadata::is_empty"
+    )]
+    local: &'a LocalMetadata,
 }
 
 pub struct Session {
     pub path: PathBuf,
     pub messages: Vec<Message>,
+    pub local: LocalMetadata,
+    revision: u64,
 }
 
 /// Session file name for `name`. Names must stay inside the sessions directory and
@@ -203,6 +238,8 @@ impl Session {
         Session {
             path: harness_dir.join(SESSIONS_DIR).join(format!("{name}.json")),
             messages: Vec::new(),
+            local: LocalMetadata::default(),
+            revision: 0,
         }
     }
 
@@ -218,9 +255,12 @@ impl Session {
         let mut session = Session {
             path,
             messages: file.messages,
+            local: file.local,
+            revision: 0,
         };
         let repaired = session.answer_unanswered_calls();
         if repaired > 0 {
+            session.revision = session.revision.wrapping_add(1);
             session.save()?;
         }
         Ok((session, repaired))
@@ -261,6 +301,7 @@ impl Session {
     /// Append a model/tool message and immediately persist the conversation.
     pub fn push(&mut self, message: Message) -> anyhow::Result<()> {
         self.messages.push(message);
+        self.revision = self.revision.wrapping_add(1);
         self.save()
     }
 
@@ -271,6 +312,7 @@ impl Session {
             self.messages.pop();
             return Err(error);
         }
+        self.revision = self.revision.wrapping_add(1);
         Ok(())
     }
 
@@ -294,6 +336,7 @@ impl Session {
             self.messages.truncate(message_count);
             return Err(error);
         }
+        self.revision = self.revision.wrapping_add(1);
         Ok(())
     }
 
@@ -304,8 +347,8 @@ impl Session {
                 continue;
             };
             for call in calls {
-                if !crate::tool_call_id::decode(&call.id)
-                    .is_some_and(|metadata| metadata.kind == crate::tool_call_id::INJECTED_FILE)
+                if crate::tool_call_id::decode(&call.id)
+                    .is_none_or(|metadata| metadata.kind != crate::tool_call_id::INJECTED_FILE)
                 {
                     continue;
                 }
@@ -418,8 +461,20 @@ impl Session {
             index += 1;
             keep
         });
+        self.revision = self.revision.wrapping_add(1);
         self.save()?;
         Ok(removed)
+    }
+
+    /// Monotonic in-memory marker for changes to provider-visible conversation state.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Replace derived token data without changing the provider-visible revision.
+    pub fn save_token_cache(&mut self, cache: Vec<TurnTokenCache>) -> anyhow::Result<()> {
+        self.local.turn_token_cache = cache;
+        self.save()
     }
 
     /// Write via a synced temp file and rename so a crash or power loss never leaves a
@@ -432,6 +487,7 @@ impl Session {
         }
         let json = serde_json::to_string_pretty(&SessionFileRef {
             messages: &self.messages,
+            local: &self.local,
         })?;
         let tmp = self.path.with_extension("json.tmp");
         let mut file =
@@ -545,28 +601,41 @@ mod injection_tests {
         assert_eq!(json!(&session.messages[..4]), saved["messages"]);
     }
 
-    /// Legacy metadata is ignored, and call IDs remain unchanged on resume.
+    /// Unknown top-level and local metadata fail at the persistence boundary.
     #[test]
-    fn legacy_metadata_is_ignored_and_call_ids_are_preserved() {
+    fn unknown_session_metadata_is_rejected() {
         let fixture = Fixture::new();
         let mut session = fixture.session();
-        let mut old = prepared("old contents");
-        old.call.id = "legacy-id".into();
-        let mut normal = prepared("normal contents");
-        normal.call.id = crate::tool_call_id::generate(crate::tool_call_id::NORMAL, &[]).unwrap();
-        session.inject(vec![old, normal]).unwrap();
+        session.submit("message".into()).unwrap();
         let messages = json!(session.messages);
-        let legacy = json!({"messages": messages, "injections": "ignored even if malformed"});
-        let text = legacy.to_string();
-        std::fs::write(&session.path, &text).unwrap();
-        let (mut resumed, repaired) = fixture.resume().unwrap();
-        assert_eq!(repaired, 0);
-        assert_eq!(std::fs::read_to_string(&session.path).unwrap(), text);
-        resumed.submit("next".into()).unwrap();
+        for invalid in [
+            json!({"messages": messages, "injections": []}),
+            json!({"messages": messages, "_harness_local": {"unknown": true}}),
+        ] {
+            std::fs::write(&session.path, invalid.to_string()).unwrap();
+            assert!(fixture.resume().is_err());
+        }
+    }
+
+    /// Local cache persists beside messages and remains outside provider-visible state.
+    #[test]
+    fn token_cache_round_trips_under_local_namespace() {
+        let fixture = Fixture::new();
+        let mut session = fixture.session();
+        session.submit("message".into()).unwrap();
+        let cache = TurnTokenCache {
+            digest: "sha256:test".into(),
+            total: 42,
+            positions: vec![42],
+            estimated: false,
+        };
+        session.save_token_cache(vec![cache.clone()]).unwrap();
         let saved: Value =
             serde_json::from_str(&std::fs::read_to_string(&session.path).unwrap()).unwrap();
-        assert!(saved.get("injections").is_none());
-        assert_eq!(json!(&resumed.messages[..4]), messages);
+        assert_eq!(saved["_harness_local"]["turn_token_cache"][0]["total"], 42);
+        let resumed = fixture.resume().unwrap().0;
+        assert_eq!(resumed.local.turn_token_cache, [cache]);
+        assert_eq!(json!(resumed.messages), saved["messages"]);
     }
 
     /// Even a broad automatic cleanup preserves instances carrying the injection marker.

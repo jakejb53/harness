@@ -223,6 +223,37 @@ pub async fn describe_approval(
     description_text(&body)
 }
 
+/// Count one valid chat slice without adding a following assistant generation prompt.
+pub async fn tokenize(
+    http: &reqwest::Client,
+    endpoint: &ResolvedEndpoint,
+    messages: &[Value],
+) -> anyhow::Result<u64> {
+    let body = json!({
+        "model": endpoint.model,
+        "messages": messages,
+        "add_generation_prompt": false,
+    });
+    let request = http.post(&endpoint.tokenize_url).json(&body);
+    let request = match &endpoint.api_key {
+        Some(key) => request.bearer_auth(key),
+        None => request,
+    };
+    let response = request.send().await.context("requesting token count")?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .context("reading tokenizer response")?;
+    if !status.is_success() {
+        bail!("tokenizer endpoint HTTP {status}: {text}");
+    }
+    let body: Value = serde_json::from_str(&text).context("parsing tokenizer response")?;
+    body.get("count")
+        .and_then(Value::as_u64)
+        .context("tokenizer endpoint returned no count")
+}
+
 /// Substitute the operation once; placeholder-like text in arguments stays literal.
 fn description_body(settings: &ApprovalDescriptionSettings, operation: &str) -> Value {
     let mut body = json!({
@@ -452,6 +483,7 @@ mod tests {
         let settings = ApprovalDescriptionSettings {
             endpoint: ResolvedEndpoint {
                 url: "http://description.test/v1/chat/completions".into(),
+                tokenize_url: "http://description.test/tokenize".into(),
                 model: "describer".into(),
                 api_key: None,
                 parameters: json!({"temperature": 0.1}).as_object().unwrap().clone(),

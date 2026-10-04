@@ -32,7 +32,7 @@ Decided against:
 ## Next
 
 1. **AGENTS.md.** Optional `[chat] agents_file` (absolute path). A synthetic `REPL` call using the shared encoded call-ID format reads the file and prints it as a JSON object; it lives in the first turn's synthetic assistant message, ahead of `FYI()`. Every turn, before cleanup: run it; insert it after the first user message if missing; replace code and result if changed; remove it if the setting is removed. Result truncated at `output_limit` like any call.
-2. **Context management.** Proactive pruning so compaction is never needed; replaces the interim `output_limit`.
+2. **Context management.** First iteration: compact collapsible session overlay with turn and position token counts, incrementally cached under strict local-only session metadata; provider `/tokenize` counts with explicit heuristic fallback. Next: offload and restore positions, then proactive pruning so compaction is never needed; replaces the interim `output_limit`.
 3. **`replib/` functions.** File helpers (`read`/`write`/`edit`), subagents (as host functions), knowledge-base search.
 4. **Final-turn tool reasoning** (to revisit): convert the turn in progress's reasoning too. Design: `SPEC-final-turn-tool-reasoning.md`.
 5. **Harness as teacher.** Turn the failure log (`SPEC-sandbox.md`) into proposed edits to the persistent guidance, for user approval.

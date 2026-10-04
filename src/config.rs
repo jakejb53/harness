@@ -45,6 +45,10 @@ pub struct Theme {
     #[serde(deserialize_with = "theme_style")]
     pub status: ratatui::style::Style,
     #[serde(deserialize_with = "theme_style")]
+    pub context_turn: ratatui::style::Style,
+    #[serde(deserialize_with = "theme_style")]
+    pub context_tokens: ratatui::style::Style,
+    #[serde(deserialize_with = "theme_style")]
     pub input: ratatui::style::Style,
 }
 
@@ -160,6 +164,7 @@ impl Permission {
 #[derive(Clone)]
 pub struct ResolvedEndpoint {
     pub url: String,
+    pub tokenize_url: String,
     pub model: String,
     pub api_key: Option<String>,
     /// JSON-compatible request fields, validated against protocol-owned keys.
@@ -283,11 +288,11 @@ fn resolve_endpoint(
         },
         None => None,
     };
+    let base_url = endpoint.base_url.trim_end_matches('/');
+    let tokenizer_root = base_url.strip_suffix("/v1").unwrap_or(base_url);
     Ok(ResolvedEndpoint {
-        url: format!(
-            "{}/chat/completions",
-            endpoint.base_url.trim_end_matches('/')
-        ),
+        url: format!("{base_url}/chat/completions"),
+        tokenize_url: format!("{tokenizer_root}/tokenize"),
         model: endpoint.model,
         api_key,
         parameters,
@@ -540,6 +545,10 @@ mod tests {
         assert_eq!(
             resolved.endpoint.url,
             "http://description.test/v1/chat/completions"
+        );
+        assert_eq!(
+            resolved.endpoint.tokenize_url,
+            "http://description.test/tokenize"
         );
         assert_eq!(resolved.endpoint.model, "describer");
         assert_eq!(resolved.endpoint.parameters["temperature"], 0.1);

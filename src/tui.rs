@@ -23,7 +23,6 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::{Block as Border, Borders, Clear, Widget};
 use ratatui_textarea::{CursorMove, TextArea};
@@ -55,20 +54,25 @@ pub struct Tui {
 /// Rows are a compact projection of the saved session, not request-time messages.
 pub struct MessageOverlay<'a> {
     pub entries: &'a [MessageEntry],
+    pub position_count: usize,
     pub scroll: usize,
+    pub collapsed: bool,
 }
 
-/// Labels are UI chrome; previews use the saved message's role color.
+/// Context rows carry semantic segments so labels and counts can be styled independently.
 pub struct MessageEntry {
+    pub prefix: String,
     pub label: String,
+    pub turn_label: bool,
+    pub tokens: String,
     pub payload: String,
-    pub payload_style: Style,
 }
 
 /// Mouse routing and scroll bounds belong to the displayed frame.
 #[derive(Default)]
 struct MessageGeometry {
     area: Rect,
+    toggle: Rect,
     scroll: usize,
     max_scroll: usize,
 }
@@ -77,6 +81,11 @@ impl MessageGeometry {
     /// Borders absorb mouse events too, preventing selection of covered transcript text.
     fn contains(&self, x: u16, y: u16) -> bool {
         self.area.contains((x, y).into())
+    }
+
+    /// Only the displayed border control or collapsed tab changes visibility.
+    fn toggle_at(&self, x: u16, y: u16) -> bool {
+        self.toggle.contains((x, y).into())
     }
 }
 
@@ -152,6 +161,11 @@ impl Tui {
     /// Route all mouse events inside the displayed overlay away from the transcript.
     pub fn over_messages(&self, x: u16, y: u16) -> bool {
         self.messages.contains(x, y)
+    }
+
+    /// Resolve the collapse control from the last frame, not a newly sized overlay.
+    pub fn message_toggle_at(&self, x: u16, y: u16) -> bool {
+        self.messages.toggle_at(x, y)
     }
 
     /// Use the frame's effective scroll after clamping to the available rows.
@@ -238,18 +252,42 @@ fn render_messages(
     overlay: &MessageOverlay<'_>,
     theme: &Theme,
 ) -> MessageGeometry {
-    let max_width = transcript.width / 2;
-    let max_height = transcript.height / 2;
-    // Keep a border and one text row even before the session has messages.
-    if max_width < 5 || max_height < 3 {
+    let max_width = (u32::from(transcript.width) * 3 / 8) as u16;
+    let max_height = (u32::from(transcript.height) * 3 / 8) as u16;
+    let min_height = if overlay.collapsed { 1 } else { 3 };
+    if max_width < 5 || max_height < min_height {
         return MessageGeometry::default();
     }
+    if overlay.collapsed {
+        // The whole tab is the reopen target, including when its count is clipped.
+        let text = format!("Messages ({}) [+]", overlay.position_count);
+        let width = Line::raw(text.as_str()).width().min(usize::from(max_width)) as u16;
+        let area = Rect::new(transcript.right() - width, transcript.y, width, 1);
+        Clear.render(area, buf);
+        buf.set_string(
+            area.x,
+            area.y,
+            clip_line(&text, usize::from(width)),
+            theme.status,
+        );
+        return MessageGeometry {
+            area,
+            toggle: area,
+            scroll: overlay.scroll,
+            max_scroll: 0,
+        };
+    }
+    // Keep a border and one text row even before the session has messages.
     let content_width = overlay
         .entries
         .iter()
         .map(|entry| {
-            Line::raw(entry.label.as_str())
+            Line::raw(entry.prefix.as_str())
                 .width()
+                .saturating_add(Line::raw(entry.label.as_str()).width())
+                .saturating_add(3)
+                .saturating_add(Line::raw(entry.tokens.as_str()).width())
+                .saturating_add(usize::from(!entry.payload.is_empty()))
                 .saturating_add(Line::raw(entry.payload.as_str()).width())
         })
         .max()
@@ -270,6 +308,8 @@ fn render_messages(
         .borders(Borders::ALL)
         .border_style(theme.status)
         .render(area, buf);
+    let toggle = Rect::new(area.right() - 4, area.y, 3, 1);
+    buf.set_string(toggle.x, toggle.y, "[-]", theme.status);
     let entries = &overlay.entries[scroll..overlay.entries.len().min(scroll + rows)];
     for row in 0..rows {
         let y = area.y + 1 + row as u16;
@@ -280,21 +320,37 @@ fn render_messages(
             buf.set_string(x, y, "(empty)", theme.status);
             continue;
         };
-        let label = clip_line(&entry.label, available);
-        let label_width = Line::raw(label.as_str()).width();
-        buf.set_string(x, y, &label, theme.status);
-        // A clipped label owns the whole row; payload starts only after a full label.
-        if label == entry.label && label_width < available {
-            buf.set_string(
-                x + label_width as u16,
-                y,
-                clip_line(&entry.payload, available - label_width),
-                entry.payload_style,
-            );
+        let mut used = 0;
+        let label_style = if entry.turn_label {
+            theme.context_turn
+        } else {
+            theme.assistant
+        };
+        for (text, style) in [
+            (entry.prefix.as_str(), theme.status),
+            (entry.label.as_str(), label_style),
+            (" · ", theme.status),
+            (entry.tokens.as_str(), theme.context_tokens),
+            (
+                if entry.payload.is_empty() { "" } else { " " },
+                theme.status,
+            ),
+            (entry.payload.as_str(), theme.status),
+        ] {
+            if text.is_empty() || used >= available {
+                continue;
+            }
+            let clipped = clip_line(text, available - used);
+            buf.set_string(x + used as u16, y, &clipped, style);
+            used += Line::raw(clipped.as_str()).width();
+            if clipped != text {
+                break;
+            }
         }
     }
     MessageGeometry {
         area,
+        toggle,
         scroll,
         max_scroll,
     }
@@ -380,33 +436,70 @@ mod tests {
     #[test]
     fn overlay_scrolls_and_clips_to_existing_limits() {
         let theme = theme();
-        let area = Rect::new(0, 0, 20, 10);
+        let area = Rect::new(0, 0, 40, 16);
         let mut buffer = Buffer::empty(area);
-        buffer.set_string(10, 1, "abcdefghij", theme.status);
+        buffer.set_string(25, 1, "abcdefghijklmno", theme.status);
         let entries: Vec<_> = (0..8)
-            .map(|index| MessageEntry {
-                label: format!("{index} "),
+            .map(|_| MessageEntry {
+                prefix: String::new(),
+                label: "user".into(),
+                turn_label: false,
+                tokens: "12t".into(),
                 payload: "long preview".into(),
-                payload_style: theme.user,
             })
             .collect();
         let mut overlay = MessageOverlay {
             entries: &entries,
+            position_count: entries.len(),
             scroll: usize::MAX,
+            collapsed: false,
         };
         let geometry = render_messages(&mut buffer, area, &overlay, &theme);
-        assert_eq!(geometry.area, Rect::new(10, 0, 10, 5));
-        assert_eq!(geometry.scroll, 5);
-        assert_eq!(geometry.max_scroll, 5);
-        assert_eq!(buffer[(11, 1)].symbol(), "5");
-        assert_eq!(buffer[(11, 1)].fg, theme.status.fg.unwrap());
-        assert_eq!(buffer[(13, 1)].fg, theme.user.fg.unwrap());
-        assert_eq!(buffer[(18, 1)].symbol(), "…");
-        assert_eq!(buffer[(19, 1)].symbol(), "│");
+        assert_eq!(geometry.area, Rect::new(25, 0, 15, 6));
+        assert_eq!(geometry.scroll, 4);
+        assert_eq!(geometry.max_scroll, 4);
+        assert!(geometry.toggle_at(36, 0));
+        assert!(!geometry.toggle_at(35, 0));
+        assert_eq!(buffer[(26, 1)].symbol(), "u");
+        assert_eq!(buffer[(26, 1)].fg, theme.assistant.fg.unwrap());
+        assert_eq!(buffer[(33, 1)].symbol(), "1");
+        assert_eq!(buffer[(33, 1)].fg, theme.context_tokens.fg.unwrap());
+        assert_eq!(buffer[(38, 1)].symbol(), "…");
+        assert_eq!(buffer[(38, 1)].fg, theme.status.fg.unwrap());
+        assert_eq!(buffer[(39, 1)].symbol(), "│");
         overlay.scroll = 1;
         let geometry = render_messages(&mut buffer, area, &overlay, &theme);
         assert_eq!(geometry.scroll, 1);
-        assert_eq!(buffer[(11, 1)].symbol(), "1");
+        assert_eq!(buffer[(26, 1)].symbol(), "u");
+    }
+
+    /// Turn labels and token values use their dedicated configured colors.
+    #[test]
+    fn context_header_colors() {
+        let theme = theme();
+        let entries = [MessageEntry {
+            prefix: String::new(),
+            label: "Turn 2".into(),
+            turn_label: true,
+            tokens: "~123 tokens".into(),
+            payload: String::new(),
+        }];
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        let geometry = render_messages(
+            &mut buffer,
+            area,
+            &MessageOverlay {
+                entries: &entries,
+                position_count: 0,
+                scroll: 0,
+                collapsed: false,
+            },
+            &theme,
+        );
+        let x = geometry.area.x + 1;
+        assert_eq!(buffer[(x, 1)].fg, theme.context_turn.fg.unwrap());
+        assert_eq!(buffer[(x + 9, 1)].fg, theme.context_tokens.fg.unwrap());
     }
 
     /// The permanent box shows an empty state when space permits and yields on tiny screens.
@@ -415,7 +508,9 @@ mod tests {
         let theme = theme();
         let overlay = MessageOverlay {
             entries: &[],
+            position_count: 0,
             scroll: 0,
+            collapsed: false,
         };
         let area = Rect::new(0, 0, 80, 24);
         let mut buffer = Buffer::empty(area);
@@ -430,6 +525,37 @@ mod tests {
             let mut buffer = Buffer::empty(area);
             assert!(!render_messages(&mut buffer, area, &overlay, &theme).contains(0, 0));
         }
+    }
+
+    /// The collapsed tab keeps a count and one visible click target without resetting scroll.
+    #[test]
+    fn collapsed_overlay_is_clickable_tab() {
+        let theme = theme();
+        let entries: Vec<_> = (0..8)
+            .map(|_| MessageEntry {
+                prefix: String::new(),
+                label: "user".into(),
+                turn_label: false,
+                tokens: "12t".into(),
+                payload: "preview".into(),
+            })
+            .collect();
+        let overlay = MessageOverlay {
+            entries: &entries,
+            position_count: entries.len(),
+            scroll: 2,
+            collapsed: true,
+        };
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        let geometry = render_messages(&mut buffer, area, &overlay, &theme);
+        assert_eq!(geometry.area, Rect::new(64, 0, 16, 1));
+        assert_eq!(geometry.scroll, 2);
+        assert!(geometry.toggle_at(64, 0));
+        assert!(geometry.toggle_at(79, 0));
+        assert!(!geometry.contains(64, 1));
+        assert_eq!(buffer[(64, 0)].symbol(), "M");
+        assert_eq!(buffer[(79, 0)].symbol(), "]");
     }
 
     /// Cell clipping preserves graphemes and never emits terminal controls.

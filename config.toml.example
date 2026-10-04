@@ -45,6 +45,8 @@ approval = "#99CCFF"
 warning = "#FFCC00"
 error = "#FF6666"
 status = "#999999"
+context_turn = "#99CCFF"
+context_tokens = "#99FF99"
 input = "#FFFFFF"
 
 # System prompt

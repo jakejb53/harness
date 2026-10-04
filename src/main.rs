@@ -13,6 +13,7 @@ mod patch;
 mod read;
 mod repl;
 mod session;
+mod token_count;
 mod tool_call_id;
 mod tool_reasoning;
 mod transcript;
