@@ -179,6 +179,7 @@ Experimental. With `[chat] tool_reasoning` on, each request and the transcript s
 - A command is its name or alias, then optionally whitespace and an argument (trimmed). Only commands that take an argument match input with one. Enter on a highlighted command that takes an argument completes it followed by a space instead of running it.
 - `/rename <name>`: rename the session file to `sessions/<name>.json` (before the first save, only the name it will be created under). An invalid or existing name shows the notice `couldn't rename: <error>` and keeps the input; the current name is a no-op.
 - `/tool-reasoning`: switch tool reasoning on or off and save it to `config.toml`. The transcript and the next request change at once.
+- `/tools`: show each advertised tool's name and full description, including the configured REPL description, using the same definitions as chat requests. Output is scrollable and copyable in the conversation display, without a model request or session save; it lasts until exit. No arguments.
 - `/exit`, `/quit`: exit.
 - Unknown command: notice `unknown command: <input>`; the input is kept.
 - During a turn, the input stays editable and commands run. Enter on a message shows the notice `turn in progress (esc to stop)` and keeps the draft.

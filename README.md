@@ -204,6 +204,7 @@ When you scroll up, the view stays put while the model writes; scroll back to th
 |---|---|
 | `/rename <name>` | Rename this session (its file in `~/.harness/sessions/`); refused if the name is taken |
 | `/tool-reasoning` | Turn tool reasoning on or off (saved to `config.toml`) |
+| `/tools` | Show every tool's name and full description in the conversation display; output is not saved or sent to the model |
 | `/exit`, `/quit` | Exit |
 
 Typing `/` opens a list of matching commands below the input: Up/Down to choose, Tab to complete, Enter to run (for `/rename`, to complete it so you can type the name), Esc to close.

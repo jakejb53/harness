@@ -5,6 +5,7 @@
 pub enum Action {
     Exit,
     ToggleToolReasoning,
+    ShowTools,
     Rename,
 }
 
@@ -33,6 +34,13 @@ const COMMANDS: &[Command] = &[
         aliases: &[],
         description: "Turn tool reasoning on or off",
         action: Action::ToggleToolReasoning,
+        takes_argument: false,
+    },
+    Command {
+        name: "/tools",
+        aliases: &[],
+        description: "Show tool descriptions",
+        action: Action::ShowTools,
         takes_argument: false,
     },
     Command {

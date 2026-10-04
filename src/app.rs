@@ -310,7 +310,7 @@ struct Reply {
     fields: Map<String, Value>,
 }
 
-/// A line shown in the transcript but never sent to the model.
+/// Display-only transcript output, never saved or sent to the model.
 struct Note {
     anchor: Anchor,
     text: String,
@@ -321,7 +321,7 @@ struct Note {
 enum Anchor {
     /// Under the call's code, above its result (failure occurrence notes).
     Call(String),
-    /// After the first `n` messages (errors). Adjusted when earlier
+    /// After the first `n` messages (errors and local command output). Adjusted when earlier
     /// messages are removed.
     After(usize),
 }
@@ -1166,6 +1166,16 @@ impl App {
         match action {
             Action::Exit => return Ok(Flow::Exit),
             Action::ToggleToolReasoning => self.toggle_tool_reasoning(),
+            Action::ShowTools => {
+                let text = client::tool_descriptions(&self.settings.repl_tool_description);
+                // Local command output belongs to the display, never the saved conversation or model context.
+                self.note(
+                    Anchor::After(self.session.messages.len()),
+                    text,
+                    self.settings.theme.status,
+                );
+                self.view.scroll_to_bottom();
+            }
             Action::Rename => {
                 if let Err(error) = self.session.rename(argument) {
                     self.notice = Some(format!("couldn't rename: {error:#}"));
@@ -2261,6 +2271,28 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
         assert_eq!(rendered, text);
+    }
+
+    /// Tool descriptions render before the first message and the slash command takes no arguments.
+    #[test]
+    fn tools_output_before_first_message() {
+        assert!(matches!(
+            commands::find("/tools"),
+            Some((Action::ShowTools, ""))
+        ));
+        assert!(commands::find("/tools extra").is_none());
+        let completions = commands::completions("/tools");
+        assert_eq!(completions.len(), 1);
+        assert!(matches!(completions[0].command.action, Action::ShowTools));
+        let theme = test_theme();
+        let text = client::tool_descriptions("Configured REPL description");
+        let notes = [Note {
+            anchor: Anchor::After(0),
+            text: text.clone(),
+            style: theme.status,
+        }];
+        let blocks = build_blocks(None, &[], &notes, None, false, &theme);
+        assert_eq!(blocks[0].text.as_ref(), text);
     }
 
     /// Read the explicit example palette instead of maintaining hidden test defaults.

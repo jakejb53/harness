@@ -110,6 +110,35 @@ fn list_tool() -> Value {
     })
 }
 
+/// Keep requests and local inspection on the same authoritative set of tool definitions.
+fn tool_definitions(tool_description: &str) -> Vec<Value> {
+    vec![
+        repl_tool(tool_description),
+        patch_tool(),
+        read_tool(),
+        grep_tool(),
+        list_tool(),
+    ]
+}
+
+/// Show full description strings, including the configured REPL text, without JSON escaping or truncation.
+pub fn tool_descriptions(tool_description: &str) -> String {
+    tool_definitions(tool_description)
+        .iter()
+        .map(|tool| {
+            let function = &tool["function"];
+            let name = function["name"]
+                .as_str()
+                .expect("tool definition has a name");
+            let description = function["description"]
+                .as_str()
+                .expect("tool definition has a description");
+            format!("{name}\n{description}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 pub enum StreamEvent {
     /// One chunk's `delta`, every field as sent. The reply is assembled from these
     /// with `accumulate`.
@@ -144,7 +173,7 @@ pub fn start(
         "model": endpoint.model,
         "stream": true,
         "stream_options": { "include_usage": true },
-        "tools": [repl_tool(tool_description), patch_tool(), read_tool(), grep_tool(), list_tool()],
+        "tools": tool_definitions(tool_description),
         "messages": messages,
     });
     // Config validation reserves the fields above; server-specific parameters
@@ -373,6 +402,24 @@ fn post(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Local descriptions retain operator-supplied text and every advertised native tool's full prose.
+    #[test]
+    fn tools_descriptions_are_complete() {
+        let repl = "Custom REPL description\n\nKeep \\paths and \"quotes\" verbatim.  ";
+        let output = tool_descriptions(repl);
+        assert!(output.starts_with(&format!("REPL\n{repl}\n\napply_patch\n")));
+        for (name, description) in [
+            ("apply_patch", crate::patch::DESCRIPTION),
+            ("grep", crate::grep::DESCRIPTION),
+            ("list", crate::list::DESCRIPTION),
+        ] {
+            assert!(output.contains(&format!("{name}\n{description}")), "{name}");
+        }
+        assert!(output.contains("\n\nread_file\nRead a UTF-8 text file"));
+        let definitions = tool_definitions(repl);
+        assert_eq!(definitions[0]["function"]["description"], repl);
+    }
 
     /// The editor uses the portable function-call shape, with no interpreter argument.
     #[test]
