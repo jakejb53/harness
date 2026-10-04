@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::{Permission, Settings};
 use crate::repl::ReplEvent;
+use crate::token_count::TokenTotal;
 
 /// Signatures shown by help(); dispatch validates host arguments at runtime.
 pub const STUBS: &str = r#"
@@ -73,7 +74,7 @@ pub struct HostContext {
     pub permissions: watch::Receiver<Permission>,
     pub events: mpsc::UnboundedSender<ReplEvent>,
     pub library: BTreeMap<String, LibraryFunction>,
-    pub prompt_tokens: Option<u64>,
+    pub prompt_tokens: Option<TokenTotal>,
     /// The actual fed snippet, including library source when loading fails.
     pub code: String,
 }
@@ -182,11 +183,17 @@ fn fyi(args: &CallArgs, host: &HostContext) -> Result<MontyObject, MontyExceptio
         chrono::Local::now().format("%a %b %d %H:%M:%S %:z %Y")
     );
     if let Some(tokens) = host.prompt_tokens {
-        text.push_str(&format!("Prompt tokens: {tokens}\n"));
+        text.push_str(&prompt_tokens_line(tokens));
     }
     text.push_str(&format!("Model: {}\n", host.config.model));
     host.output(text);
     Ok(MontyObject::none())
+}
+
+/// Preserve the overlay's estimate marker in the snapshot shown to the model.
+fn prompt_tokens_line(tokens: TokenTotal) -> String {
+    let estimate = if tokens.estimated { "~" } else { "" };
+    format!("Prompt tokens: {estimate}{}\n", tokens.count)
 }
 
 /// Describe loaded capabilities from their authoritative stubs and source metadata.
@@ -487,4 +494,28 @@ pub fn io_error(operation: &str, path: &Path, error: std::io::Error) -> MontyExc
         _ => ExcType::OSError,
     };
     exception(kind, format!("{operation} {}: {error}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FYI exposes whether its overlay-derived fallback is heuristic.
+    #[test]
+    fn prompt_token_line_marks_estimates() {
+        assert_eq!(
+            prompt_tokens_line(TokenTotal {
+                count: 123,
+                estimated: false,
+            }),
+            "Prompt tokens: 123\n"
+        );
+        assert_eq!(
+            prompt_tokens_line(TokenTotal {
+                count: 123,
+                estimated: true,
+            }),
+            "Prompt tokens: ~123\n"
+        );
+    }
 }

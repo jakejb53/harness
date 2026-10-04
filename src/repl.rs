@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 use crate::config::{Permission, Settings};
 use crate::host::{self, HostConfig, HostContext};
 use crate::hostfs::{self, FsAction};
+use crate::token_count::TokenTotal;
 
 pub enum ReplEvent {
     /// Code output in execution order. The app applies its existing result truncation.
@@ -143,7 +144,7 @@ impl Runtime {
 enum DriverCommand {
     Call {
         code: String,
-        prompt_tokens: Option<u64>,
+        prompt_tokens: TokenTotal,
     },
     Finish,
 }
@@ -157,7 +158,7 @@ pub struct Repl {
 
 impl Repl {
     /// Queue code without waiting on execution, library loading, or an approval.
-    pub async fn send(&mut self, code: &str, prompt_tokens: Option<u64>) -> anyhow::Result<()> {
+    pub async fn send(&mut self, code: &str, prompt_tokens: TokenTotal) -> anyhow::Result<()> {
         self.commands
             .send(DriverCommand::Call {
                 code: code.to_owned(),
@@ -222,7 +223,7 @@ impl Driver {
                     code,
                     prompt_tokens,
                 } => {
-                    self.host.prompt_tokens = prompt_tokens;
+                    self.host.prompt_tokens = Some(prompt_tokens);
                     let ready = self.initialize().await;
                     self.host.code = code.clone();
                     let result = match ready {

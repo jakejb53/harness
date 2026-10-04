@@ -745,6 +745,7 @@ impl App {
 
     /// Lazily start the turn's driver and enqueue code without awaiting execution.
     async fn run_call(&mut self, call: PendingCall) -> anyhow::Result<()> {
+        let prompt_tokens = self.prompt_token_total();
         let Some(turn) = self.turn.as_mut() else {
             return Ok(());
         };
@@ -754,7 +755,7 @@ impl App {
         let repl = turn.repl.as_mut().expect("started above");
         // Sending only queues a message; library loading and prompts happen on the
         // driver task after this call is restored to turn state.
-        if let Err(error) = repl.send(&call.code, self.prompt_tokens).await {
+        if let Err(error) = repl.send(&call.code, prompt_tokens).await {
             // Dropping the REPL kills it; the next call starts a fresh one.
             turn.repl = None;
             return self.record_result(&call.call, format!(
@@ -1383,12 +1384,21 @@ impl App {
         }
     }
 
+    /// Prefer reported prompt usage, falling back to the context overlay's aggregate.
+    fn prompt_token_total(&self) -> token_count::TokenTotal {
+        preferred_token_total(self.prompt_tokens, self.token_counts.total())
+    }
+
+    /// Prefer reported context usage, falling back to the context overlay's aggregate.
+    fn context_token_total(&self) -> token_count::TokenTotal {
+        preferred_token_total(self.context_tokens, self.token_counts.total())
+    }
+
     /// Show the current permission and the exact host operation awaiting approval.
     fn status_line(&self) -> Line<'static> {
         let mut info = self.settings.endpoint.model.clone();
-        if let Some(tokens) = self.context_tokens {
-            info.push_str(&format!(" | {} tokens", thousands(tokens)));
-        }
+        let tokens = self.context_token_total();
+        info.push_str(&format!(" | {} tokens", status_token_count(tokens)));
         info.push_str(&format!(" | {}", self.settings.permission.as_str()));
         if self.settings.tool_reasoning {
             info.push_str(" | tool reasoning");
@@ -2042,6 +2052,25 @@ fn thousands(n: u64) -> String {
     out
 }
 
+/// Endpoint usage is authoritative; overlay-derived totals fill only its absence.
+fn preferred_token_total(
+    reported: Option<u64>,
+    fallback: token_count::TokenTotal,
+) -> token_count::TokenTotal {
+    reported
+        .map(|count| token_count::TokenTotal {
+            count,
+            estimated: false,
+        })
+        .unwrap_or(fallback)
+}
+
+/// Format the status value with grouping and the overlay's estimate marker.
+fn status_token_count(tokens: token_count::TokenTotal) -> String {
+    let estimate = if tokens.estimated { "~" } else { "" };
+    format!("{estimate}{}", thousands(tokens.count))
+}
+
 /// Await the active phase without consuming state when terminal input wins the select.
 async fn next_turn_event(turn: &mut Option<Turn>) -> TurnEvent {
     let Some(turn) = turn else {
@@ -2159,6 +2188,42 @@ fn spawn_input_reader() -> UnboundedReceiver<io::Result<Event>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reported usage remains exact and takes precedence over an estimated overlay total.
+    #[test]
+    fn reported_token_usage_precedes_fallback() {
+        let fallback = token_count::TokenTotal {
+            count: 900,
+            estimated: true,
+        };
+        assert_eq!(
+            preferred_token_total(Some(123), fallback),
+            token_count::TokenTotal {
+                count: 123,
+                estimated: false,
+            }
+        );
+        assert_eq!(preferred_token_total(None, fallback), fallback);
+    }
+
+    /// The main status keeps digit grouping and exposes heuristic totals with `~`.
+    #[test]
+    fn status_token_count_marks_estimates() {
+        assert_eq!(
+            status_token_count(token_count::TokenTotal {
+                count: 12_345,
+                estimated: false,
+            }),
+            "12,345"
+        );
+        assert_eq!(
+            status_token_count(token_count::TokenTotal {
+                count: 12_345,
+                estimated: true,
+            }),
+            "~12,345"
+        );
+    }
 
     /// Derive deterministic estimates without making tokenizer requests in UI tests.
     fn counted_turns(messages: &[Message]) -> Vec<token_count::CountedTurn> {

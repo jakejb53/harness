@@ -36,6 +36,13 @@ pub struct CountedTurn {
     pub cache: TurnTokenCache,
 }
 
+/// A session-wide total retains whether any contributing turn is heuristic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TokenTotal {
+    pub count: u64,
+    pub estimated: bool,
+}
+
 /// Incremental background tokenizer queue and the immediately available display values.
 pub struct Counter {
     http: reqwest::Client,
@@ -114,6 +121,14 @@ impl Counter {
     /// Current ranges and counts used to build the compact overlay.
     pub fn turns(&self) -> &[CountedTurn] {
         &self.turns
+    }
+
+    /// Sum the same per-turn values shown in the context overlay.
+    pub fn total(&self) -> TokenTotal {
+        TokenTotal {
+            count: self.turns.iter().map(|turn| turn.cache.total).sum(),
+            estimated: self.turns.iter().any(|turn| turn.cache.estimated),
+        }
     }
 
     /// Wait for the next sequential provider result, or forever when no work exists.
@@ -518,6 +533,46 @@ mod tests {
         assert_ne!(
             cached_or_estimated(&changed, &[estimate]).digest,
             plan.digest
+        );
+    }
+
+    /// Session totals sum every overlay turn and inherit any heuristic input.
+    #[test]
+    fn total_combines_turn_counts_and_estimate_state() {
+        let mut counter = Counter::new(reqwest::Client::new(), endpoint());
+        assert_eq!(
+            counter.total(),
+            TokenTotal {
+                count: 0,
+                estimated: false,
+            }
+        );
+        counter.turns = vec![
+            CountedTurn {
+                range: 0..1,
+                cache: TurnTokenCache {
+                    digest: "first".into(),
+                    total: 40,
+                    positions: vec![],
+                    estimated: false,
+                },
+            },
+            CountedTurn {
+                range: 1..2,
+                cache: TurnTokenCache {
+                    digest: "second".into(),
+                    total: 2,
+                    positions: vec![],
+                    estimated: true,
+                },
+            },
+        ];
+        assert_eq!(
+            counter.total(),
+            TokenTotal {
+                count: 42,
+                estimated: true,
+            }
         );
     }
 
