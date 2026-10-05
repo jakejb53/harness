@@ -2,7 +2,7 @@
 
 A terminal coding agent for OpenAI-compatible chat completions endpoints. The model uses a Python REPL for computation and commands, plus direct `read_file`, `apply_patch`, `grep`, and `list` tools for files.
 
-The app runs full screen and draws the conversation exactly as the model sees it, word-wrapped to your terminal's width. Replies stream as they are generated, including the model's reasoning when the server provides it. When you exit, your terminal returns to what it showed before.
+The app runs full screen and draws the complete saved conversation, word-wrapped to your terminal's width. The context editor controls which turns the model sees. Replies stream as they are generated, including the model's reasoning when the server provides it. When you exit, your terminal returns to what it showed before.
 
 The REPL uses Monty, a sandboxed Python-subset interpreter. Repository filesystem access follows the permission level below. **Commands launched with `run()` are host processes running as you, outside the REPL sandbox.**
 
@@ -123,9 +123,11 @@ A bordered context overlay in the transcript's upper right includes each injecti
 
 ### Context display
 
-The upper-right overlay is a compact view of the durable session message array. User and assistant content, reasoning, and tool calls have separate rows; a call and its result share one row. App-generated synthetic calls are omitted. Each turn header shows the token count for its complete message slice, and each row shows its contribution within that turn. Turn labels use `theme.context_turn`; turn counts use `theme.context_tokens`; role labels use `theme.context_role`; row counts use `theme.context_message_tokens`; previews use `theme.status`. File-injection call/result pairs are standalone turns.
+The upper-right overlay is a compact context editor. User and assistant content, reasoning, and tool calls have separate rows; a call and its result share one row. App-generated synthetic calls are omitted. Each turn header shows the token count for its complete message slice, and each row shows its contribution within that turn. Turn labels use `theme.context_turn`; turn counts use `theme.context_tokens`; role labels use `theme.context_role`; row counts use `theme.context_message_tokens`; previews use `theme.status`. File-injection call/result pairs are standalone turns.
 
-Counts are cached incrementally. Missing or changed turns are sent as progressive prefixes to the provider's `/tokenize` endpoint, derived by removing a final `/v1` from `[endpoint] base_url`. File-injection requests prepend an empty user message only for tokenization. If any prefix request fails, the complete turn uses `ceil(compact JSON UTF-8 bytes / 3.25)` estimates; `~` marks estimated counts. Unchanged cached turns make no tokenizer requests.
+Click any row to hide or restore its completed turn in model requests. Hidden turns remain in the main transcript and context editor, but every part of their context-editor display is rendered at half brightness. The active turn cannot be hidden until it ends. Hidden state is saved with the session.
+
+Counts are cached incrementally. Missing or changed turns are sent as progressive prefixes to the provider's `/tokenize` endpoint, derived by removing a final `/v1` from `[endpoint] base_url`. File-injection requests prepend an empty user message only for tokenization. If any prefix request fails, the complete turn uses `ceil(compact JSON UTF-8 bytes / 3.25)` estimates; `~` marks estimated counts. Unchanged cached turns make no tokenizer requests. Hidden turns keep their individual displayed counts but are excluded from aggregate context totals.
 
 The expanded overlay is capped at nine-sixteenths of the transcript width and height. Its top border centers a bright `Context` header and the mouse wheel scrolls its rows. Click `[-]` to collapse the overlay to that one-row header; click `[+]` to reopen it at the retained width and scroll position. The overlay covers transcript cells without changing transcript wrapping or input width.
 
@@ -276,14 +278,15 @@ This conversion changes only what's sent and shown; saved reasoning stays unchan
 
 ## Conversation files
 
-The saved `messages` array is authoritative provider-visible conversation state. The app may transform messages before saving and modify the saved conversation; requests use those saved values, with only the explicit tool-reasoning conversion described above. The optional top-level `_harness_local` object contains derived local metadata and is never sent to providers. The system message is added separately and isn't saved; each request uses this invocation's `--system-prompt` override or the prompt loaded from `config.toml`, including for resumed conversations:
+The saved `messages` array is authoritative session state. It interleaves provider messages with a local marker after each hidden turn; unmarked turns are model-visible. Requests omit markers and hidden turns, then apply the explicit tool-reasoning conversion described above. The optional top-level `_harness_local` object contains derived local metadata and is also never sent to providers. The system message is added separately and isn't saved; each request uses this invocation's `--system-prompt` override or the prompt loaded from `config.toml`, including for resumed conversations:
 
 ```json
 { "messages": [
   { "role": "user", "content": "..." },
   { "role": "assistant", "content": "", "reasoning": "...", "tool_calls": [ ... ] },
   { "role": "tool", "tool_call_id": "...", "content": "..." },
-  { "role": "assistant", "content": "...", "reasoning": "..." }
+  { "role": "assistant", "content": "...", "reasoning": "..." },
+  { "_harness_local": { "hidden": true } }
 ], "_harness_local": {
   "turn_token_cache": [ ... ]
 } }

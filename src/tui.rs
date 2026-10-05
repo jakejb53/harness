@@ -23,6 +23,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block as Border, Borders, Clear, Widget};
 use ratatui_textarea::{CursorMove, TextArea};
@@ -60,6 +61,8 @@ pub struct MessageOverlay<'a> {
 
 /// Context rows carry semantic segments so labels and counts can be styled independently.
 pub struct MessageEntry {
+    pub turn_index: usize,
+    pub hidden: bool,
     pub prefix: String,
     pub label: String,
     pub turn_label: bool,
@@ -72,6 +75,7 @@ pub struct MessageEntry {
 struct MessageGeometry {
     area: Rect,
     toggle: Rect,
+    turn_rows: Vec<(u16, usize)>,
     scroll: usize,
     max_scroll: usize,
 }
@@ -85,6 +89,24 @@ impl MessageGeometry {
     /// Only the displayed border control or collapsed tab changes visibility.
     fn toggle_at(&self, x: u16, y: u16) -> bool {
         self.toggle.contains((x, y).into())
+    }
+
+    /// Every interior cell on a rendered entry row controls that entry's turn.
+    fn turn_at(&self, x: u16, y: u16) -> Option<usize> {
+        let interior = Rect::new(
+            self.area.x.saturating_add(1),
+            self.area.y.saturating_add(1),
+            self.area.width.saturating_sub(2),
+            self.area.height.saturating_sub(2),
+        );
+        interior
+            .contains((x, y).into())
+            .then(|| {
+                self.turn_rows
+                    .iter()
+                    .find_map(|(row, turn)| (*row == y).then_some(*turn))
+            })
+            .flatten()
     }
 }
 
@@ -165,6 +187,11 @@ impl Tui {
     /// Resolve the collapse control from the last frame, not a newly sized overlay.
     pub fn message_toggle_at(&self, x: u16, y: u16) -> bool {
         self.messages.toggle_at(x, y)
+    }
+
+    /// Resolve an editor row to its owning turn using the last rendered frame.
+    pub fn message_turn_at(&self, x: u16, y: u16) -> Option<usize> {
+        self.messages.turn_at(x, y)
     }
 
     /// Use the frame's effective scroll after clamping to the available rows.
@@ -286,6 +313,7 @@ fn render_messages(
         return MessageGeometry {
             area,
             toggle,
+            turn_rows: Vec::new(),
             scroll: overlay.scroll,
             max_scroll: 0,
         };
@@ -308,36 +336,45 @@ fn render_messages(
         .render(area, buf);
     let toggle = render_context_header(buf, area, false, theme);
     let entries = &overlay.entries[scroll..overlay.entries.len().min(scroll + rows)];
+    let mut turn_rows = Vec::with_capacity(entries.len());
     for row in 0..rows {
         let y = area.y + 1 + row as u16;
         let x = area.x + 1;
         let available = (width - 2) as usize;
-        buf.set_style(Rect::new(x, y, width - 2, 1), theme.status);
         let Some(entry) = entries.get(row) else {
+            buf.set_style(Rect::new(x, y, width - 2, 1), theme.status);
             buf.set_string(x, y, "(empty)", theme.status);
             continue;
         };
+        turn_rows.push((y, entry.turn_index));
+        let row_style = if entry.hidden {
+            half_brightness(theme.status)
+        } else {
+            theme.status
+        };
+        buf.set_style(Rect::new(x, y, width - 2, 1), row_style);
         let mut used = 0;
-        let label_style = if entry.turn_label {
+        let mut label_style = if entry.turn_label {
             theme.context_turn
         } else {
             theme.context_role
         };
-        let token_style = if entry.turn_label {
+        let mut token_style = if entry.turn_label {
             theme.context_tokens
         } else {
             theme.context_message_tokens
         };
+        if entry.hidden {
+            label_style = half_brightness(label_style);
+            token_style = half_brightness(token_style);
+        }
         for (text, style) in [
-            (entry.prefix.as_str(), theme.status),
+            (entry.prefix.as_str(), row_style),
             (entry.label.as_str(), label_style),
-            (" · ", theme.status),
+            (" · ", row_style),
             (entry.tokens.as_str(), token_style),
-            (
-                if entry.payload.is_empty() { "" } else { " " },
-                theme.status,
-            ),
-            (entry.payload.as_str(), theme.status),
+            (if entry.payload.is_empty() { "" } else { " " }, row_style),
+            (entry.payload.as_str(), row_style),
         ] {
             if text.is_empty() || used >= available {
                 continue;
@@ -353,9 +390,18 @@ fn render_messages(
     MessageGeometry {
         area,
         toggle,
+        turn_rows,
         scroll,
         max_scroll,
     }
+}
+
+/// Reduce configured RGB foreground brightness exactly, independent of terminal dim support.
+fn half_brightness(mut style: Style) -> Style {
+    if let Some(Color::Rgb(red, green, blue)) = style.fg {
+        style.fg = Some(Color::Rgb(red / 2, green / 2, blue / 2));
+    }
+    style
 }
 
 /// Draw the centered persistent title and the visibility control over the top border.
@@ -455,7 +501,9 @@ mod tests {
         let mut buffer = Buffer::empty(area);
         buffer.set_string(25, 1, "abcdefghijklmno", theme.status);
         let entries: Vec<_> = (0..8)
-            .map(|_| MessageEntry {
+            .map(|turn_index| MessageEntry {
+                turn_index,
+                hidden: false,
                 prefix: String::new(),
                 label: "user".into(),
                 turn_label: false,
@@ -474,6 +522,8 @@ mod tests {
         assert_eq!(geometry.max_scroll, 1);
         assert!(geometry.toggle_at(36, 0));
         assert!(!geometry.toggle_at(35, 0));
+        assert_eq!(geometry.turn_at(19, 1), Some(1));
+        assert_eq!(geometry.turn_at(38, 7), Some(7));
         assert_eq!(buffer[(19, 1)].symbol(), "u");
         assert_eq!(buffer[(19, 1)].fg, theme.context_role.fg.unwrap());
         assert_eq!(buffer[(26, 1)].symbol(), "1");
@@ -484,6 +534,7 @@ mod tests {
         overlay.scroll = 0;
         let geometry = render_messages(&mut buffer, area, &overlay, &theme);
         assert_eq!(geometry.scroll, 0);
+        assert_eq!(geometry.turn_at(19, 1), Some(0));
         assert_eq!(buffer[(19, 1)].symbol(), "u");
     }
 
@@ -492,6 +543,8 @@ mod tests {
     fn context_header_colors() {
         let theme = theme();
         let entries = [MessageEntry {
+            turn_index: 2,
+            hidden: false,
             prefix: String::new(),
             label: "Turn 2".into(),
             turn_label: true,
@@ -516,6 +569,64 @@ mod tests {
         let title_x = geometry.area.x + 1 + (geometry.toggle.x - geometry.area.x - 10) / 2;
         assert_eq!(buffer[(title_x, 0)].symbol(), "[");
         assert_eq!(buffer[(title_x, 0)].fg, theme.assistant.fg.unwrap());
+    }
+
+    /// Hidden rows halve every configured text color and every row resolves to its turn.
+    #[test]
+    fn hidden_turn_rows_are_dimmed_and_clickable() {
+        let theme = theme();
+        let entries = [
+            MessageEntry {
+                turn_index: 4,
+                hidden: true,
+                prefix: String::new(),
+                label: "Turn 4".into(),
+                turn_label: true,
+                tokens: "20 tokens".into(),
+                payload: String::new(),
+            },
+            MessageEntry {
+                turn_index: 4,
+                hidden: true,
+                prefix: String::new(),
+                label: "user".into(),
+                turn_label: false,
+                tokens: "12t".into(),
+                payload: "preview".into(),
+            },
+        ];
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        let geometry = render_messages(
+            &mut buffer,
+            area,
+            &MessageOverlay {
+                entries: &entries,
+                scroll: 0,
+                collapsed: false,
+            },
+            &theme,
+        );
+        let x = geometry.area.x + 1;
+        assert_eq!(
+            buffer[(x, 1)].fg,
+            half_brightness(theme.context_turn).fg.unwrap()
+        );
+        assert_eq!(
+            buffer[(x, 2)].fg,
+            half_brightness(theme.context_role).fg.unwrap()
+        );
+        assert_eq!(
+            buffer[(x + 7, 2)].fg,
+            half_brightness(theme.context_message_tokens).fg.unwrap()
+        );
+        assert_eq!(
+            buffer[(x + 11, 2)].fg,
+            half_brightness(theme.status).fg.unwrap()
+        );
+        assert_eq!(geometry.turn_at(x, 1), Some(4));
+        assert_eq!(geometry.turn_at(geometry.area.right() - 2, 2), Some(4));
+        assert_eq!(geometry.turn_at(x, 0), None);
     }
 
     /// The permanent box shows an empty state when space permits and yields on tiny screens.
@@ -547,7 +658,9 @@ mod tests {
     fn collapsed_overlay_is_clickable_tab() {
         let theme = theme();
         let entries: Vec<_> = (0..8)
-            .map(|_| MessageEntry {
+            .map(|turn_index| MessageEntry {
+                turn_index,
+                hidden: false,
                 prefix: String::new(),
                 label: "user".into(),
                 turn_label: false,

@@ -29,6 +29,26 @@ pub fn turn_start(messages: &[Message]) -> usize {
         .unwrap_or(0)
 }
 
+/// Reference form used by transcript rendering without cloning the durable history.
+pub fn turn_start_refs(messages: &[&Message]) -> usize {
+    messages
+        .iter()
+        .rposition(|message| message.role == Role::User)
+        .unwrap_or(0)
+}
+
+/// Decide conversion from a message and its flat visible position.
+pub fn converted_message(
+    message: &Message,
+    index: usize,
+    turn_start: usize,
+) -> Option<Cow<'_, str>> {
+    if index >= turn_start || message.role != Role::Assistant {
+        return None;
+    }
+    message.reasoning()
+}
+
 /// The reasoning text converted for message `index`, if it is converted. Messages
 /// with no reasoning text (only encrypted `reasoning_details`) keep their native
 /// fields.
@@ -37,11 +57,7 @@ pub fn converted<'a>(
     index: usize,
     turn_start: usize,
 ) -> Option<Cow<'a, str>> {
-    let message = &messages[index];
-    if index >= turn_start || message.role != Role::Assistant {
-        return None;
-    }
-    message.reasoning()
+    converted_message(&messages[index], index, turn_start)
 }
 
 /// Derive a stable encoded ID from the message position and exact reasoning text.

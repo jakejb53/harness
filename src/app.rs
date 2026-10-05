@@ -41,7 +41,9 @@ use crate::list;
 use crate::patch;
 use crate::read;
 use crate::repl::{Repl, ReplEvent, Runtime};
-use crate::session::{FunctionCall, Message, NOT_RUN, Role, Session, ToolCall, reasoning_text};
+use crate::session::{
+    FunctionCall, Message, NOT_RUN, Role, Session, ToolCall, Turn as SessionTurn, reasoning_text,
+};
 use crate::token_count;
 use crate::tool_call_id;
 use crate::tool_reasoning;
@@ -52,6 +54,9 @@ const STOPPED: &str = "[stopped by user]";
 
 /// Most rows either completion list shows at once.
 const COMPLETION_ROWS: usize = 8;
+
+/// Bound one input batch so continuous wheel traffic cannot starve drawing or signals.
+const MAX_WHEEL_BATCH: usize = 64;
 
 /// Shared list entry; a missing command identifies a literal `@filename` completion.
 struct Completion {
@@ -343,6 +348,20 @@ enum Step {
     Tokens(Option<(String, crate::session::TurnTokenCache)>),
 }
 
+/// Wheel events batch only while they continue acting on the same independently scrolling view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WheelTarget {
+    Transcript,
+    Context,
+}
+
+/// Classified wheel input, independent of terminal geometry after classification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WheelInput {
+    target: WheelTarget,
+    delta: isize,
+}
+
 enum TurnEvent {
     Stream(StreamEvent),
     Finished(anyhow::Result<()>),
@@ -359,6 +378,61 @@ enum Flow {
     Exit,
 }
 
+/// Classify one wheel event against the geometry from the frame currently on screen.
+fn wheel_input(event: &Event, over_context: impl FnOnce(u16, u16) -> bool) -> Option<WheelInput> {
+    let Event::Mouse(mouse) = event else {
+        return None;
+    };
+    let delta = match mouse.kind {
+        MouseEventKind::ScrollUp => -1,
+        MouseEventKind::ScrollDown => 1,
+        _ => return None,
+    };
+    Some(WheelInput {
+        target: if over_context(mouse.column, mouse.row) {
+            WheelTarget::Context
+        } else {
+            WheelTarget::Transcript
+        },
+        delta,
+    })
+}
+
+/// Drain only immediately queued wheel input for the same target. The first different
+/// event is returned intact for the next frame, preserving input order.
+fn coalesce_wheel<F>(
+    first: WheelInput,
+    input: &mut UnboundedReceiver<io::Result<Event>>,
+    classify: F,
+) -> (WheelInput, Option<io::Result<Event>>)
+where
+    F: Fn(&Event) -> Option<WheelInput>,
+{
+    let mut combined = first;
+    for _ in 1..MAX_WHEEL_BATCH {
+        let next = match input.try_recv() {
+            Ok(next) => next,
+            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                break;
+            }
+        };
+        if let Ok(event) = &next
+            && let Some(wheel) = classify(event)
+            && wheel.target == combined.target
+        {
+            combined.delta += wheel.delta;
+            continue;
+        }
+        return (combined, Some(next));
+    }
+    (combined, None)
+}
+
+/// Apply a signed row delta without leaving the current scrollable range.
+fn bounded_scroll(position: usize, delta: isize, maximum: usize) -> usize {
+    position.saturating_add_signed(delta).min(maximum)
+}
+
 impl App {
     async fn run(&mut self, tui: &mut Tui) -> anyhow::Result<()> {
         let result = self.run_loop(tui).await;
@@ -370,6 +444,7 @@ impl App {
 
     async fn run_loop(&mut self, tui: &mut Tui) -> anyhow::Result<()> {
         let mut input = spawn_input_reader();
+        let mut pending_input = None;
         // Closing the terminal (SIGHUP) or a kill would otherwise skip cleanup,
         // orphaning the REPL and leaving tool calls without results. In raw mode
         // Ctrl+C is a key press, so SIGINT only arrives from outside.
@@ -380,19 +455,17 @@ impl App {
         loop {
             // Preserve the existing fail-fast check for marked attachment pairs.
             self.session.validate_injections()?;
-            let active_user = self.turn.as_ref().and_then(|_| {
-                self.session
-                    .messages
-                    .iter()
-                    .rposition(|message| message.role == Role::User)
-            });
+            let active_user = self
+                .turn
+                .as_ref()
+                .and_then(|_| self.session.turns.len().checked_sub(1));
             self.token_counts.refresh(&mut self.session, active_user)?;
-            let messages =
-                message_overlay_entries(&self.session.messages, self.token_counts.turns())?;
+            let messages = message_overlay_entries(&self.session.turns, self.token_counts.turns())?;
+            let transcript_messages: Vec<_> = self.session.messages().collect();
             let footer = self.footer();
             let blocks = build_blocks(
                 self.settings.chat_prompt.as_deref(),
-                &self.session.messages,
+                &transcript_messages,
                 &self.notes,
                 self.turn.as_ref(),
                 self.settings.tool_reasoning,
@@ -424,15 +497,19 @@ impl App {
             }
             // Biased toward input so keys (Esc above all) are handled before more
             // output from a fast stream.
-            let step = tokio::select! {
-                biased;
-                _ = hangup.recv() => Step::Signal,
-                _ = terminate.recv() => Step::Signal,
-                _ = interrupt.recv() => Step::Signal,
-                event = input.recv() => Step::Input(event),
-                event = next_turn_event(&mut self.turn) => Step::Turn(event),
-                result = next_injection(&mut self.loading) => Step::Injected(result),
-                result = self.token_counts.next() => Step::Tokens(result),
+            let step = if let Some(event) = pending_input.take() {
+                Step::Input(Some(event))
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = hangup.recv() => Step::Signal,
+                    _ = terminate.recv() => Step::Signal,
+                    _ = interrupt.recv() => Step::Signal,
+                    event = input.recv() => Step::Input(event),
+                    event = next_turn_event(&mut self.turn) => Step::Turn(event),
+                    result = next_injection(&mut self.loading) => Step::Injected(result),
+                    result = self.token_counts.next() => Step::Tokens(result),
+                }
             };
             match step {
                 Step::Tokens(Some((digest, cache))) => {
@@ -447,7 +524,15 @@ impl App {
                 }
                 Step::Input(None) => return Ok(()),
                 Step::Input(Some(event)) => {
-                    if let Flow::Exit = self.on_input(tui, event?)? {
+                    let event = event?;
+                    let wheel = wheel_input(&event, |x, y| tui.over_messages(x, y));
+                    if let Some(wheel) = wheel {
+                        let (wheel, pending) = coalesce_wheel(wheel, &mut input, |event| {
+                            wheel_input(event, |x, y| tui.over_messages(x, y))
+                        });
+                        pending_input = pending;
+                        self.scroll_wheel(tui, wheel);
+                    } else if let Flow::Exit = self.on_input(tui, event)? {
                         return Ok(());
                     }
                 }
@@ -522,12 +607,13 @@ impl App {
 
     /// Build each request from current settings and the authoritative session messages.
     fn start_request(&mut self) {
+        let messages = self.session.visible_messages();
         let (task, events) = client::start(
             &self.http,
             &self.settings.endpoint,
             self.settings.chat_prompt.as_deref(),
             &self.settings.repl_tool_description,
-            tool_reasoning::request_messages(&self.session.messages, self.settings.tool_reasoning),
+            tool_reasoning::request_messages(&messages, self.settings.tool_reasoning),
         );
         if let Some(turn) = self.turn.as_mut() {
             turn.phase = Phase::Streaming(Reply {
@@ -942,7 +1028,7 @@ impl App {
         drop(turn); // Kills the REPL, if any.
 
         if let Some(error) = error {
-            let end = Anchor::After(self.session.messages.len());
+            let end = Anchor::After(self.session.message_count());
             self.note(end, format!("error: {error}"), self.settings.theme.error);
         }
         match first_error {
@@ -1057,8 +1143,17 @@ impl App {
                 }
             }
             Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => self.view.scroll(-1),
-                MouseEventKind::ScrollDown => self.view.scroll(1),
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => self.scroll_wheel(
+                    tui,
+                    WheelInput {
+                        target: WheelTarget::Transcript,
+                        delta: if mouse.kind == MouseEventKind::ScrollUp {
+                            -1
+                        } else {
+                            1
+                        },
+                    },
+                ),
                 MouseEventKind::Down(MouseButton::Left) => self.view.press(mouse.column, mouse.row),
                 MouseEventKind::Drag(MouseButton::Left) => self.view.drag(mouse.column, mouse.row),
                 MouseEventKind::Up(MouseButton::Left) => {
@@ -1080,21 +1175,36 @@ impl App {
         Ok(Flow::Continue)
     }
 
+    /// Apply one already-coalesced wheel delta to its independently bounded target.
+    fn scroll_wheel(&mut self, tui: &Tui, wheel: WheelInput) {
+        match wheel.target {
+            WheelTarget::Transcript => self.view.scroll(wheel.delta),
+            WheelTarget::Context if !self.messages_collapsed => {
+                self.follow_messages = false;
+                self.message_scroll =
+                    bounded_scroll(tui.message_scroll(), wheel.delta, tui.message_max_scroll());
+            }
+            WheelTarget::Context => {}
+        }
+    }
+
     /// Consume overlay gestures before transcript selection, even when a drag leaves the box.
     fn message_mouse(&mut self, tui: &Tui, mouse: MouseEvent) -> bool {
         let over = tui.over_messages(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if over => {
-                if !self.messages_collapsed {
-                    self.follow_messages = false;
-                    self.message_scroll = if mouse.kind == MouseEventKind::ScrollUp {
-                        tui.message_scroll().saturating_sub(1)
-                    } else {
-                        tui.message_scroll()
-                            .saturating_add(1)
-                            .min(tui.message_max_scroll())
-                    };
-                }
+                let delta = if mouse.kind == MouseEventKind::ScrollUp {
+                    -1
+                } else {
+                    1
+                };
+                self.scroll_wheel(
+                    tui,
+                    WheelInput {
+                        target: WheelTarget::Context,
+                        delta,
+                    },
+                );
                 true
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -1105,6 +1215,25 @@ impl App {
                         self.messages_collapsed = !self.messages_collapsed;
                         // Reopening restores the last visible scroll position.
                         self.follow_messages = false;
+                    } else if let Some(turn_index) = tui.message_turn_at(mouse.column, mouse.row)
+                        && can_toggle_turn(
+                            self.turn.is_some(),
+                            turn_index,
+                            self.session.turns.len(),
+                        )
+                    {
+                        match self.session.toggle_hidden(turn_index) {
+                            Ok(()) => {
+                                invalidate_reported_usage(
+                                    &mut self.context_tokens,
+                                    &mut self.prompt_tokens,
+                                );
+                            }
+                            Err(error) => {
+                                self.notice =
+                                    Some(format!("couldn't change turn visibility: {error:#}"));
+                            }
+                        }
                     }
                 }
                 over
@@ -1173,7 +1302,7 @@ impl App {
                     client::tool_descriptions(&self.settings.repl_tool_description)
                 {
                     self.notes.push(Note {
-                        anchor: Anchor::After(self.session.messages.len()),
+                        anchor: Anchor::After(self.session.message_count()),
                         heading: Some(name),
                         text: description,
                         style: self.settings.theme.status,
@@ -1439,19 +1568,28 @@ impl App {
 
 /// Project durable messages into ordered positions; tool results share their call's row.
 fn message_overlay_entries(
-    messages: &[Message],
-    turns: &[token_count::CountedTurn],
+    session_turns: &[SessionTurn],
+    counted_turns: &[token_count::CountedTurn],
 ) -> anyhow::Result<Vec<MessageEntry>> {
-    let called: HashSet<&str> = messages
+    let called: HashSet<&str> = session_turns
         .iter()
+        .flat_map(|turn| &turn.messages)
         .filter_map(|message| message.tool_calls.as_ref())
         .flatten()
         .map(|call| call.id.as_str())
         .collect();
     let mut entries = Vec::new();
-    for (turn_index, turn) in turns.iter().enumerate() {
+    for turn in counted_turns {
+        let turn_index = turn.turn_index;
+        let session_turn = &session_turns[turn_index];
+        ensure!(
+            turn.hidden == session_turn.hidden,
+            "counted turn visibility is stale"
+        );
         let estimate = if turn.cache.estimated { "~" } else { "" };
         entries.push(MessageEntry {
+            turn_index,
+            hidden: turn.hidden,
             prefix: String::new(),
             label: format!("Turn {turn_index}"),
             turn_label: true,
@@ -1463,6 +1601,8 @@ fn message_overlay_entries(
             let count = counts.next().unwrap_or(0);
             let indent = if nested { "  " } else { "" };
             entries.push(MessageEntry {
+                turn_index,
+                hidden: turn.hidden,
                 prefix: indent.to_string(),
                 label: role.to_string(),
                 turn_label: false,
@@ -1470,7 +1610,7 @@ fn message_overlay_entries(
                 payload,
             });
         };
-        for message in &messages[turn.range.clone()] {
+        for message in &session_turn.messages {
             match message.role {
                 Role::User => add("user", compact_preview(&message.content), false),
                 Role::Assistant => {
@@ -1563,23 +1703,23 @@ fn tool_preview(call: &ToolCall) -> anyhow::Result<String> {
     ))
 }
 
-/// The transcript as drawn, so it always matches what the model sees: the system
-/// message, the messages (each tool result under its call, matched by id, rather
-/// than in file order), and the turn in progress. Notes appear where anchored.
+/// Draw the complete durable transcript, including turns excluded from model requests.
+/// Each tool result stays under its call, matched by ID rather than file order, and
+/// the turn in progress and display-only notes appear at their owned positions.
 ///
 /// Each block gets a `Key` naming what it shows, so the view's scroll position and
 /// selection stay on the same text when blocks are inserted before it. A call's
 /// result reuses the key of its live output, which it replaces.
 fn build_blocks<'a>(
     system: Option<&'a str>,
-    messages: &'a [Message],
+    messages: &[&'a Message],
     notes: &'a [Note],
     turn: Option<&'a Turn>,
     tool_reasoning_enabled: bool,
     theme: &Theme,
 ) -> Vec<Block<'a>> {
     let blank = |key| Block::new(key, "", theme.assistant);
-    let turn_start = tool_reasoning::turn_start(messages);
+    let turn_start = tool_reasoning::turn_start_refs(messages);
     let mut blocks = Vec::new();
     if let Some(system) = system {
         blocks.push(Block::new(Key::System(0), "system", theme.system));
@@ -1641,7 +1781,7 @@ fn build_blocks<'a>(
                 // of the message. Drawn inline rather than as extra messages, so message
                 // indices (keys, note anchors) match the session.
                 let converted = tool_reasoning_enabled
-                    .then(|| tool_reasoning::converted(messages, i, turn_start))
+                    .then(|| tool_reasoning::converted_message(message, i, turn_start))
                     .flatten();
                 if let Some(text) = &converted {
                     let part = |n| Key::Call(tool_reasoning::call_id(i, text), n);
@@ -2065,6 +2205,17 @@ fn preferred_token_total(
         .unwrap_or(fallback)
 }
 
+/// The final displayed turn is immutable only while it is the active execution turn.
+fn can_toggle_turn(active: bool, turn_index: usize, turn_count: usize) -> bool {
+    !active || turn_index != turn_count.saturating_sub(1)
+}
+
+/// Provider usage describes the old selection and cannot override its new local total.
+fn invalidate_reported_usage(context: &mut Option<u64>, prompt: &mut Option<u64>) {
+    *context = None;
+    *prompt = None;
+}
+
 /// Format the status value with grouping and the overlay's estimate marker.
 fn status_token_count(tokens: token_count::TokenTotal) -> String {
     let estimate = if tokens.estimated { "~" } else { "" };
@@ -2225,8 +2376,102 @@ mod tests {
         );
     }
 
+    /// Build one wheel event at an x-coordinate that selects the test target.
+    fn wheel(kind: MouseEventKind, column: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        })
+    }
+
+    /// Test geometry treats the first ten columns as the context editor.
+    fn classify_wheel(event: &Event) -> Option<WheelInput> {
+        wheel_input(event, |column, _| column < 10)
+    }
+
+    /// Same-target wheel events combine exactly; a target change stays pending in order.
+    #[test]
+    fn wheel_batches_preserve_distance_direction_and_target_order() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        sender
+            .send(Ok(wheel(MouseEventKind::ScrollDown, 20)))
+            .unwrap();
+        sender
+            .send(Ok(wheel(MouseEventKind::ScrollUp, 20)))
+            .unwrap();
+        sender
+            .send(Ok(wheel(MouseEventKind::ScrollDown, 5)))
+            .unwrap();
+        sender.send(Ok(Event::Resize(80, 24))).unwrap();
+
+        let first = classify_wheel(&wheel(MouseEventKind::ScrollDown, 20)).unwrap();
+        let (combined, pending) = coalesce_wheel(first, &mut receiver, classify_wheel);
+        assert_eq!(
+            combined,
+            WheelInput {
+                target: WheelTarget::Transcript,
+                delta: 1,
+            }
+        );
+        assert_eq!(
+            classify_wheel(pending.as_ref().unwrap().as_ref().unwrap()),
+            Some(WheelInput {
+                target: WheelTarget::Context,
+                delta: 1,
+            })
+        );
+        assert!(matches!(
+            receiver.try_recv().unwrap().unwrap(),
+            Event::Resize(80, 24)
+        ));
+    }
+
+    /// Non-wheel input ends a batch, bounds saturate, and the batch cap leaves work queued.
+    #[test]
+    fn wheel_batches_preserve_nonwheel_input_and_redraw_fairness() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        sender.send(Ok(Event::Resize(80, 24))).unwrap();
+        let first = classify_wheel(&wheel(MouseEventKind::ScrollUp, 5)).unwrap();
+        let (combined, pending) = coalesce_wheel(first, &mut receiver, classify_wheel);
+        assert_eq!(combined.delta, -1);
+        assert!(matches!(pending.unwrap().unwrap(), Event::Resize(80, 24)));
+        assert_eq!(bounded_scroll(2, -5, 10), 0);
+        assert_eq!(bounded_scroll(9, 5, 10), 10);
+
+        for _ in 1..=MAX_WHEEL_BATCH + 5 {
+            sender
+                .send(Ok(wheel(MouseEventKind::ScrollDown, 20)))
+                .unwrap();
+        }
+        let first = classify_wheel(&wheel(MouseEventKind::ScrollDown, 20)).unwrap();
+        let (combined, pending) = coalesce_wheel(first, &mut receiver, classify_wheel);
+        assert_eq!(combined.delta, MAX_WHEEL_BATCH as isize);
+        assert!(pending.is_none());
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    /// Context clicks cannot hide the active final turn but retain every completed target.
+    #[test]
+    fn active_turn_is_not_toggleable() {
+        assert!(!can_toggle_turn(true, 2, 3));
+        assert!(can_toggle_turn(true, 1, 3));
+        assert!(can_toggle_turn(false, 2, 3));
+    }
+
+    /// Changing visibility invalidates both exact totals from the previous request.
+    #[test]
+    fn visibility_change_invalidates_reported_usage() {
+        let mut context = Some(200);
+        let mut prompt = Some(150);
+        invalidate_reported_usage(&mut context, &mut prompt);
+        assert_eq!(context, None);
+        assert_eq!(prompt, None);
+    }
+
     /// Derive deterministic estimates without making tokenizer requests in UI tests.
-    fn counted_turns(messages: &[Message]) -> Vec<token_count::CountedTurn> {
+    fn counted_turns(turns: &[SessionTurn]) -> Vec<token_count::CountedTurn> {
         let endpoint = config::ResolvedEndpoint {
             url: "http://example.test/v1/chat/completions".into(),
             tokenize_url: "http://example.test/tokenize".into(),
@@ -2234,14 +2479,28 @@ mod tests {
             api_key: None,
             parameters: Map::new(),
         };
-        token_count::plans(messages, &endpoint)
+        token_count::plans(turns, &endpoint)
             .unwrap()
             .into_iter()
             .map(|plan| token_count::CountedTurn {
-                range: plan.range.clone(),
+                turn_index: plan.turn_index,
+                hidden: turns[plan.turn_index].hidden,
                 cache: token_count::cached_or_estimated(&plan, &[]),
             })
             .collect()
+    }
+
+    /// Most UI fixtures contain one ordinary turn.
+    fn one_turn(messages: Vec<Message>) -> Vec<SessionTurn> {
+        vec![SessionTurn {
+            messages,
+            hidden: false,
+        }]
+    }
+
+    /// Adapt owned message fixtures to the transcript's zero-copy reference view.
+    fn message_refs(messages: &[Message]) -> Vec<&Message> {
+        messages.iter().collect()
     }
 
     /// Assistant parts keep their own positions while each call absorbs its result.
@@ -2272,8 +2531,9 @@ mod tests {
             synthetic_id,
             "hidden synthetic result".into(),
         ));
-        let turns = counted_turns(&messages);
-        let rows = message_overlay_entries(&messages, &turns).unwrap();
+        let session_turns = one_turn(messages);
+        let turns = counted_turns(&session_turns);
+        let rows = message_overlay_entries(&session_turns, &turns).unwrap();
         let visible: Vec<_> = rows
             .iter()
             .filter(|entry| !entry.turn_label)
@@ -2319,8 +2579,9 @@ mod tests {
             },
             Message::tool(id, "file contents".into()),
         ];
-        let turns = counted_turns(&messages);
-        let rows = message_overlay_entries(&messages, &turns).unwrap();
+        let session_turns = one_turn(messages);
+        let turns = counted_turns(&session_turns);
+        let rows = message_overlay_entries(&session_turns, &turns).unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].label, "Turn 0");
         assert!(rows[0].tokens.starts_with('~'));
@@ -2611,7 +2872,14 @@ mod tests {
             },
             Message::tool("read-test".into(), "3\tline three\n".into()),
         ];
-        let blocks = build_blocks(None, &messages, &[], None, false, &test_theme());
+        let blocks = build_blocks(
+            None,
+            &message_refs(&messages),
+            &[],
+            None,
+            false,
+            &test_theme(),
+        );
         assert_eq!(blocks[0].text.as_ref(), "read_file");
         assert_eq!(blocks[1].text.as_ref(), arguments);
         assert_eq!(blocks[2].text.as_ref(), "3\tline three");
@@ -2630,7 +2898,14 @@ mod tests {
                 {"role":"assistant","content":"","tool_calls":[{"id":"list-test","type":"function","function":{"name":"list","arguments":arguments}}]},
                 {"role":"tool","tool_call_id":"list-test","content":format!("{result}\n")}
             ])).unwrap();
-            let blocks = build_blocks(None, &messages, &[], None, false, &test_theme());
+            let blocks = build_blocks(
+                None,
+                &message_refs(&messages),
+                &[],
+                None,
+                false,
+                &test_theme(),
+            );
             let visible: Vec<_> = blocks
                 .iter()
                 .map(|block| block.text.as_ref())
@@ -2663,7 +2938,14 @@ mod tests {
             ];
             let saved = serde_json::to_string(&messages).unwrap();
             let restored: Vec<Message> = serde_json::from_str(&saved).unwrap();
-            let blocks = build_blocks(None, &restored, &[], None, false, &test_theme());
+            let blocks = build_blocks(
+                None,
+                &message_refs(&restored),
+                &[],
+                None,
+                false,
+                &test_theme(),
+            );
             assert_eq!(blocks[0].text.as_ref(), "grep");
             assert_eq!(blocks[1].text.as_ref(), arguments);
             assert_eq!(blocks[2].text.as_ref(), "src café/f:2:this");
@@ -2697,7 +2979,14 @@ mod tests {
             tool_calls: Some(vec![call.clone()]),
             ..Default::default()
         }];
-        let blocks = build_blocks(None, &messages, &[], None, false, &test_theme());
+        let blocks = build_blocks(
+            None,
+            &message_refs(&messages),
+            &[],
+            None,
+            false,
+            &test_theme(),
+        );
         assert_eq!(blocks[0].text.as_ref(), "apply_patch");
         assert_eq!(blocks[1].text.as_ref(), patch);
         for invalid in [r#"{"patch":1}"#, r#"{"patch":"unfinished"#] {
@@ -2813,7 +3102,14 @@ mod tests {
             tool_calls: Some(calls),
             ..Message::default()
         }];
-        let completed = build_blocks(None, &messages, &[], None, false, &test_theme());
+        let completed = build_blocks(
+            None,
+            &message_refs(&messages),
+            &[],
+            None,
+            false,
+            &test_theme(),
+        );
         assert!(
             streamed
                 .iter()
@@ -2875,7 +3171,32 @@ mod tests {
             {"role":"tool","tool_call_id":"call","content":"1"},
             {"role":"user","content":"next"}
         ])).unwrap();
-        let blocks = build_blocks(Some("instructions"), &messages, &[], None, false, &theme);
+        let blocks = build_blocks(
+            Some("instructions"),
+            &message_refs(&messages),
+            &[],
+            None,
+            false,
+            &theme,
+        );
+        let hidden_turn = SessionTurn {
+            messages: messages.clone(),
+            hidden: true,
+        };
+        let hidden_blocks = build_blocks(
+            Some("instructions"),
+            &message_refs(&hidden_turn.messages),
+            &[],
+            None,
+            false,
+            &theme,
+        );
+        assert!(
+            blocks
+                .iter()
+                .map(|block| (&block.text, block.style))
+                .eq(hidden_blocks.iter().map(|block| (&block.text, block.style)))
+        );
         for (text, style) in [
             ("instructions", theme.system),
             ("> question", theme.user),
@@ -2893,7 +3214,7 @@ mod tests {
                     .contains(ratatui::style::Modifier::DIM)
             );
         }
-        let converted = build_blocks(None, &messages, &[], None, true, &theme);
+        let converted = build_blocks(None, &message_refs(&messages), &[], None, true, &theme);
         assert_eq!(
             converted
                 .iter()
@@ -2988,7 +3309,14 @@ mod tests {
                 queue: VecDeque::new(),
                 repl: None,
             };
-            let blocks = build_blocks(None, &messages, &[], Some(&turn), false, &test_theme());
+            let blocks = build_blocks(
+                None,
+                &message_refs(&messages),
+                &[],
+                Some(&turn),
+                false,
+                &test_theme(),
+            );
             assert!(
                 blocks
                     .iter()
@@ -3000,7 +3328,14 @@ mod tests {
             if let Phase::Running { prompt, .. } = &mut turn.phase {
                 prompt.take();
             }
-            let blocks = build_blocks(None, &messages, &[], Some(&turn), false, &test_theme());
+            let blocks = build_blocks(
+                None,
+                &message_refs(&messages),
+                &[],
+                Some(&turn),
+                false,
+                &test_theme(),
+            );
             assert!(
                 !blocks
                     .iter()

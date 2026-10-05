@@ -1,7 +1,6 @@
 //! Per-turn and per-position token counts derived from the durable message array.
 
 use std::collections::{HashSet, VecDeque};
-use std::ops::Range;
 
 use anyhow::{Context, ensure};
 use serde_json::{Value, json};
@@ -9,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 use crate::client;
 use crate::config::ResolvedEndpoint;
-use crate::session::{Message, Role, TurnTokenCache};
+use crate::session::{Message, Role, Turn, TurnTokenCache};
 use crate::tool_call_id;
 
 const DIGEST_DOMAIN: &[u8] = b"harness/turn-token-cache/v1\0";
@@ -18,7 +17,7 @@ const REASONING_FIELDS: [&str; 3] = ["reasoning", "reasoning_content", "reasonin
 /// Everything needed to count one durable turn without retaining the whole session.
 #[derive(Clone)]
 pub struct Plan {
-    pub range: Range<usize>,
+    pub turn_index: usize,
     pub digest: String,
     prefixes: Vec<Prefix>,
 }
@@ -32,7 +31,8 @@ struct Prefix {
 /// A cached result and the message range it describes in the current session.
 #[derive(Clone)]
 pub struct CountedTurn {
-    pub range: Range<usize>,
+    pub turn_index: usize,
+    pub hidden: bool,
     pub cache: TurnTokenCache,
 }
 
@@ -81,7 +81,7 @@ impl Counter {
         {
             return Ok(());
         }
-        self.plans = plans(&session.messages, &self.endpoint)?;
+        self.plans = plans(&session.turns, &self.endpoint)?;
         let valid: HashSet<_> = self.plans.iter().map(|plan| plan.digest.as_str()).collect();
         let retained: Vec<_> = session
             .local
@@ -105,10 +105,11 @@ impl Counter {
                 .cloned()
                 .unwrap_or_else(|| cached_or_estimated(plan, &[]));
             self.turns.push(CountedTurn {
-                range: plan.range.clone(),
+                turn_index: plan.turn_index,
+                hidden: session.turns[plan.turn_index].hidden,
                 cache,
             });
-            let incomplete = active_user.is_some_and(|index| plan.range.contains(&index));
+            let incomplete = active_user == Some(plan.turn_index);
             if cached.is_none() && !incomplete && running != Some(plan.digest.as_str()) {
                 self.pending.push_back(plan.clone());
             }
@@ -126,8 +127,17 @@ impl Counter {
     /// Sum the same per-turn values shown in the context overlay.
     pub fn total(&self) -> TokenTotal {
         TokenTotal {
-            count: self.turns.iter().map(|turn| turn.cache.total).sum(),
-            estimated: self.turns.iter().any(|turn| turn.cache.estimated),
+            count: self
+                .turns
+                .iter()
+                .filter(|turn| !turn.hidden)
+                .map(|turn| turn.cache.total)
+                .sum(),
+            estimated: self
+                .turns
+                .iter()
+                .filter(|turn| !turn.hidden)
+                .any(|turn| turn.cache.estimated),
         }
     }
 
@@ -184,37 +194,12 @@ impl Drop for Counter {
     }
 }
 
-/// Split durable messages into user turns and standalone marked file injections.
-pub fn plans(messages: &[Message], endpoint: &ResolvedEndpoint) -> anyhow::Result<Vec<Plan>> {
-    let mut ranges = Vec::new();
-    let mut start = None;
-    let mut index = 0;
-    while index < messages.len() {
-        if is_injection_start(messages, index) {
-            if let Some(first) = start.take() {
-                ranges.push((first..index, false));
-            }
-            ranges.push((index..index + 2, true));
-            index += 2;
-            continue;
-        }
-        if messages[index].role == Role::User {
-            if let Some(first) = start.replace(index) {
-                ranges.push((first..index, false));
-            }
-        } else if start.is_none() {
-            start = Some(index);
-        }
-        index += 1;
-    }
-    if let Some(first) = start {
-        ranges.push((first..messages.len(), false));
-    }
-
-    ranges
-        .into_iter()
-        .filter(|(range, _)| !range.is_empty())
-        .map(|(range, injection)| build_plan(messages, range, injection, endpoint))
+/// Build one count plan for each authoritative session turn.
+pub fn plans(turns: &[Turn], endpoint: &ResolvedEndpoint) -> anyhow::Result<Vec<Plan>> {
+    turns
+        .iter()
+        .enumerate()
+        .map(|(turn_index, turn)| build_plan(turn, turn_index, endpoint))
         .collect()
 }
 
@@ -253,34 +238,10 @@ impl Plan {
     }
 }
 
-/// A marked injection is one dedicated assistant call followed by its result.
-fn is_injection_start(messages: &[Message], index: usize) -> bool {
-    let Some(message) = messages.get(index) else {
-        return false;
-    };
-    let Some(call) = message.tool_calls.as_ref().and_then(|calls| calls.first()) else {
-        return false;
-    };
-    message.role == Role::Assistant
-        && message
-            .tool_calls
-            .as_ref()
-            .is_some_and(|calls| calls.len() == 1)
-        && tool_call_id::decode(&call.id)
-            .is_some_and(|metadata| metadata.kind == tool_call_id::INJECTED_FILE)
-        && messages.get(index + 1).is_some_and(|result| {
-            result.role == Role::Tool && result.tool_call_id.as_deref() == Some(call.id.as_str())
-        })
-}
-
 /// Build progressive valid chat slices in the same order as compact display positions.
-fn build_plan(
-    messages: &[Message],
-    range: Range<usize>,
-    injection: bool,
-    endpoint: &ResolvedEndpoint,
-) -> anyhow::Result<Plan> {
-    let slice = &messages[range.clone()];
+fn build_plan(turn: &Turn, turn_index: usize, endpoint: &ResolvedEndpoint) -> anyhow::Result<Plan> {
+    let slice = turn.messages.as_slice();
+    let injection = turn.is_injection();
     let mut current = Vec::new();
     if injection {
         current.push(json!({"role": "user", "content": ""}));
@@ -382,7 +343,7 @@ fn build_plan(
     }
     let digest = digest(endpoint, slice)?;
     Ok(Plan {
-        range,
+        turn_index,
         digest,
         prefixes,
     })
@@ -484,6 +445,14 @@ mod tests {
         }
     }
 
+    /// Construct one visible authoritative turn for count-plan tests.
+    fn turn(messages: Vec<Message>) -> Turn {
+        Turn {
+            messages,
+            hidden: false,
+        }
+    }
+
     /// User turns and marked file pairs get independent ranges and matching positions.
     #[test]
     fn turn_and_position_boundaries() {
@@ -499,11 +468,12 @@ mod tests {
             {"role":"tool","tool_call_id":synthetic_id,"content":"FYI"},
             {"role":"assistant","content":"answer","reasoning":"thought"}
         ])).unwrap();
-        let plans = plans(&messages, &endpoint()).unwrap();
+        let turns = vec![turn(messages[..2].to_vec()), turn(messages[2..].to_vec())];
+        let plans = plans(&turns, &endpoint()).unwrap();
         assert_eq!(plans.len(), 2);
-        assert_eq!(plans[0].range, 0..2);
+        assert_eq!(plans[0].turn_index, 0);
         assert_eq!(plans[0].position_count(), 2);
-        assert_eq!(plans[1].range, 2..6);
+        assert_eq!(plans[1].turn_index, 1);
         assert_eq!(plans[1].position_count(), 3);
         let counted = from_prefix_counts(&plans[1], vec![10, 20, 30, 40], false);
         assert_eq!(counted.positions, [10, 10, 10]);
@@ -517,16 +487,16 @@ mod tests {
     /// Digest identity changes with durable content and tokenizer identity.
     #[test]
     fn cache_identity_and_reuse() {
-        let messages = vec![Message::user("hello".into())];
+        let turns = vec![turn(vec![Message::user("hello".into())])];
         let endpoint = endpoint();
-        let plan = plans(&messages, &endpoint).unwrap().remove(0);
+        let plan = plans(&turns, &endpoint).unwrap().remove(0);
         let estimate = estimated(&plan);
         assert_eq!(
             cached_or_estimated(&plan, std::slice::from_ref(&estimate)),
             estimate
         );
 
-        let changed = plans(&[Message::user("changed".into())], &endpoint)
+        let changed = plans(&[turn(vec![Message::user("changed".into())])], &endpoint)
             .unwrap()
             .remove(0);
         assert_ne!(changed.digest, plan.digest);
@@ -536,7 +506,7 @@ mod tests {
         );
     }
 
-    /// Session totals sum every overlay turn and inherit any heuristic input.
+    /// Session totals exclude hidden turns and their heuristic state.
     #[test]
     fn total_combines_turn_counts_and_estimate_state() {
         let mut counter = Counter::new(reqwest::Client::new(), endpoint());
@@ -549,7 +519,8 @@ mod tests {
         );
         counter.turns = vec![
             CountedTurn {
-                range: 0..1,
+                turn_index: 0,
+                hidden: false,
                 cache: TurnTokenCache {
                     digest: "first".into(),
                     total: 40,
@@ -558,7 +529,8 @@ mod tests {
                 },
             },
             CountedTurn {
-                range: 1..2,
+                turn_index: 1,
+                hidden: true,
                 cache: TurnTokenCache {
                     digest: "second".into(),
                     total: 2,
@@ -567,6 +539,14 @@ mod tests {
                 },
             },
         ];
+        assert_eq!(
+            counter.total(),
+            TokenTotal {
+                count: 40,
+                estimated: false,
+            }
+        );
+        counter.turns[1].hidden = false;
         assert_eq!(
             counter.total(),
             TokenTotal {
@@ -580,14 +560,14 @@ mod tests {
     #[test]
     fn active_turn_transition_queues_completed_plan() {
         let mut session = crate::session::Session::new(std::path::Path::new("/unused"));
-        session.messages = vec![
+        session.turns = vec![turn(vec![
             Message::user("question".into()),
             Message {
                 role: Role::Assistant,
                 content: "answer".into(),
                 ..Default::default()
             },
-        ];
+        ])];
         let endpoint = endpoint();
         let mut counter = Counter::new(reqwest::Client::new(), endpoint);
         counter.refresh(&mut session, Some(0)).unwrap();

@@ -24,6 +24,11 @@ Working log. Behavior contract: `SPEC.md`.
 18. **Command completion.** Typing `/` lists matching commands (name, description) below the input in place of the status line; Up/Down, Tab, Enter, Esc. One command table (`src/commands.rs`) drives both completion and running.
 19. **Harness directory.** `config.toml`, `.env`, `sessions/`, and `replib/` live in `~/.harness`, so the app runs in any repo. Sessions are flat and named by file name: `/rename <name>` (first command with an argument), `--resume` lists names, `--resume <NAME>` resumes.
 20. **Sandbox.** Monty replaces CPython and the classifier, with repository permissions, brokered commands, library functions, failure logging, and worker recovery. Static type checking is disabled. Essential checks and the user-reported smoke test passed; skipped checks are recorded in `PLAN-sandbox.md`. Library-authoring features remain deferred. Contract: `SPEC-sandbox.md`.
+21. **Endpoint parameters.** Optional `[endpoint.parameters]` values are forwarded as top-level request fields after rejecting reserved keys, non-finite numbers, and TOML dates and times.
+22. **Approval descriptions.** Optional independent chat-completions requests describe pending host operations without exposing the primary conversation; generation remains cancelable and display-only.
+23. **Direct file tools.** Rust implementations of `read_file`, `apply_patch`, `grep`, and `list` enforce repository confinement and current filesystem permissions in the ordered tool queue.
+24. **File injection.** Literal column-one `@path` lines load UTF-8 files under attachment authority as persistent synthetic call/result pairs, with filename completion and atomic draft/history behavior.
+25. **Context display and token counts.** A collapsible session overlay shows per-turn and per-position counts, caches provider `/tokenize` results under `_harness_local`, and visibly marks deterministic heuristic fallbacks.
 
 Decided against:
 - Audit-hook gating as the first permission layer (classifier chosen instead).
@@ -32,7 +37,7 @@ Decided against:
 ## Next
 
 1. **AGENTS.md.** Optional `[chat] agents_file` (absolute path). A synthetic `REPL` call using the shared encoded call-ID format reads the file and prints it as a JSON object; it lives in the first turn's synthetic assistant message, ahead of `FYI()`. Every turn, before cleanup: run it; insert it after the first user message if missing; replace code and result if changed; remove it if the setting is removed. Result truncated at `output_limit` like any call.
-2. **Context management.** First iteration: compact collapsible session overlay with turn and position token counts, incrementally cached under strict local-only session metadata; provider `/tokenize` counts with explicit heuristic fallback. Next: offload and restore positions, then proactive pruning so compaction is never needed; replaces the interim `output_limit`.
+2. **Context management.** Offload and restore positions, then add proactive pruning so compaction is never needed; replaces the interim `output_limit`.
 3. **`replib/` functions.** File helpers (`read`/`write`/`edit`), subagents (as host functions), knowledge-base search.
 4. **Final-turn tool reasoning** (to revisit): convert the turn in progress's reasoning too. Design: `SPEC-final-turn-tool-reasoning.md`.
 5. **Harness as teacher.** Turn the failure log (`SPEC-sandbox.md`) into proposed edits to the persistent guidance, for user approval.
