@@ -19,9 +19,10 @@ use fs::{Existing, Repository, Staged, Target};
 pub const DESCRIPTION: &str = r#"Edit files directly with literal patch text. Text updates require UTF-8; deletion and rename-only operations do not read the contents. Requires read-write permission. Paths must be repository-relative; absolute paths and escaping path resolution are rejected. Text updates follow relative symlinks within the repository. Rename and deletion operate on named entries. Add and Move destinations must not exist.
 Use *** Begin Patch and *** End Patch around operations:
 *** Add File: path (each content line prefixed +)
+*** Replace File: path (each content line prefixed +; replaces the whole text of an existing file without restating the old text, keeping its line endings, final-newline state, and permissions)
 *** Delete File: path
 *** Update File: path (optionally followed by *** Move to: new-path)
-Start a hunk with @@ alone. An optional anchor goes on that SAME line after "@@ ": for example, "@@ fn example() {" searches after the exact source line "fn example() {". The anchor is not part of the replacement. Omit it when the hunk's context/removal lines already identify one exact match.
+Start a hunk with @@ alone. An optional anchor goes on that SAME line after "@@ ": for example, "@@ fn example() {" searches after the exact source line "fn example() {". The anchor is not part of the replacement. Omit it when the hunk's context/removal lines already identify one exact match. When the anchor text repeats, number it: "@@ line 63: fn example() {" requires line 63 of the file's current contents to be exactly that text and searches after it; a different line 63 is an error. Line numbers refer to the file before this update's hunks apply.
 Prefix unchanged context with one space, removed lines with -, and added lines with +. After removing these prefixes, context/removal lines form the old text and context/addition lines form the new text, each in the order written. Put additions where they belong relative to unchanged context. For example:
 *** Begin Patch
 *** Update File: example.rs
@@ -171,7 +172,8 @@ fn prepare(repo: &Repository, operation: Operation, control: &Control) -> Result
     let path = match &operation {
         Operation::Add { path, .. }
         | Operation::Delete { path }
-        | Operation::Update { path, .. } => path,
+        | Operation::Update { path, .. }
+        | Operation::Replace { path, .. } => path,
     };
     let path = path.clone();
     let result = (|| -> Result<Change, String> {
@@ -197,6 +199,22 @@ fn prepare(repo: &Repository, operation: Operation, control: &Control) -> Result
                     label: format!("deleted {path}"),
                     view: String::new(),
                     prepared: Prepared::Delete(file),
+                })
+            }
+            Operation::Replace { lines, .. } => {
+                // A text update without matching: the target must exist and be
+                // UTF-8 like any update, and it keeps its identity, mode, and endings.
+                let file = repo
+                    .existing(Path::new(&path), true)
+                    .map_err(|e| e.to_string())?;
+                let original = std::str::from_utf8(&file.bytes)
+                    .map_err(|e| format!("file is not UTF-8: {e}"))?;
+                let update = engine::replace(original, &lines);
+                let view = numbered(&path, &update.contents, &update.regions);
+                Ok(Change {
+                    label: format!("replaced {path}"),
+                    view,
+                    prepared: Prepared::Update(file, update.contents),
                 })
             }
             Operation::Update {
@@ -361,6 +379,7 @@ fn operation_label(operation: &Operation) -> String {
             ..
         } => format!("move {path} -> {destination}"),
         Operation::Update { path, .. } => format!("update {path}"),
+        Operation::Replace { path, .. } => format!("replace {path}"),
     }
 }
 
@@ -786,6 +805,65 @@ mod tests {
         assert!(result.contains("updated target; moved link -> nested/link"));
         assert!(result.contains("\n\ntarget:\n1\tnew"));
         assert!(!result.contains("\n\nnested/link:\n"));
+    }
+
+    /// Replace edits through a relative link like Update, keeping the link, mode, and CRLF endings.
+    #[test]
+    #[cfg(unix)]
+    fn replace_follows_links_and_keeps_mode() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = Fixture::new();
+        std::fs::write(dir.0.join("target"), "old\r\nlines\r\n").unwrap();
+        std::fs::set_permissions(dir.0.join("target"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        symlink("target", dir.0.join("link")).unwrap();
+        let (repo, control) = dir.context();
+        let result = execute(
+            &repo,
+            "*** Begin Patch\n*** Replace File: link\n+fresh\n+text\n*** End Patch",
+            &control,
+        );
+        assert!(result.starts_with("Patch applied"), "{result}");
+        assert!(result.contains("- replaced link"), "{result}");
+        assert!(
+            result.contains("\n\nlink:\n1\tfresh\n2\ttext\n"),
+            "{result}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.0.join("target")).unwrap(),
+            "fresh\r\ntext\r\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(dir.0.join("link"))
+                .unwrap()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::metadata(dir.0.join("target"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+    }
+
+    /// Replace never creates files: a missing target stops the patch before any commit.
+    #[test]
+    fn replace_requires_existing_file() {
+        let dir = Fixture::new();
+        let (repo, control) = dir.context();
+        let result = execute(
+            &repo,
+            "*** Begin Patch\n*** Replace File: missing\n+text\n*** Add File: after\n+a\n*** End Patch",
+            &control,
+        );
+        assert!(result.starts_with("Patch stopped: missing:"), "{result}");
+        assert!(
+            result.contains("Not completed:\n- replace missing\n- add after"),
+            "{result}"
+        );
+        assert_eq!(std::fs::read_dir(&dir.0).unwrap().count(), 0);
     }
 
     /// Completion and cancellation both join the owned writer before returning a result.

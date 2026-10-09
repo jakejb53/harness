@@ -16,13 +16,28 @@ pub enum Operation {
         move_to: Option<String>,
         chunks: Vec<Chunk>,
     },
+    // Whole-file text replacement: lines are unterminated so the target's
+    // line ending and final-newline state can be applied at replace time.
+    Replace {
+        path: String,
+        lines: Vec<String>,
+    },
 }
 
 #[derive(Debug)]
 pub struct Chunk {
-    anchor: Option<String>,
+    anchor: Option<Anchor>,
     lines: Vec<(char, String)>,
     eof: bool,
+}
+
+// A hunk anchor names an exact source line the hunk must follow. With `line`
+// set, that 1-based input line must hold `text`, which disambiguates repeated
+// anchor text while still failing fast when the model's view is stale.
+#[derive(Debug)]
+pub struct Anchor {
+    line: Option<usize>,
+    text: String,
 }
 
 pub struct Update {
@@ -36,6 +51,57 @@ fn path(value: &str, line: usize) -> Result<String, String> {
         Err(format!("patch line {line}: missing file path"))
     } else {
         Ok(value.to_owned())
+    }
+}
+
+// Consume the `+` body of Add/Replace up to the next operation header, leaving
+// `i` on that header. Lines are returned without terminators.
+fn content_lines(lines: &[&str], i: &mut usize) -> Result<Vec<String>, String> {
+    let mut contents = Vec::new();
+    while *i < lines.len() - 1 && !lines[*i].starts_with("*** ") {
+        let text = lines[*i].strip_prefix('+').ok_or_else(|| {
+            format!(
+                "patch line {}: file content lines must start with +",
+                *i + 1
+            )
+        })?;
+        contents.push(text.to_owned());
+        *i += 1;
+    }
+    Ok(contents)
+}
+
+// `line <digits>: <text>` is reserved for line-numbered anchors; any other header
+// text is a plain anchor. Both parts are required so a stale view fails loudly
+// instead of applying at a line the model never checked.
+fn anchor(header: &str, line: usize) -> Result<Anchor, String> {
+    let Some(rest) = header.strip_prefix("line ") else {
+        return Ok(Anchor {
+            line: None,
+            text: header.to_owned(),
+        });
+    };
+    let digits = rest.split(':').next().unwrap_or("");
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Ok(Anchor {
+            line: None,
+            text: header.to_owned(),
+        });
+    }
+    let number: usize = digits
+        .parse()
+        .map_err(|_| format!("patch line {line}: anchor line number {digits} is out of range"))?;
+    if number == 0 {
+        return Err(format!("patch line {line}: anchor line numbers start at 1"));
+    }
+    match rest[digits.len()..].strip_prefix(": ") {
+        Some(text) if !text.is_empty() => Ok(Anchor {
+            line: Some(number),
+            text: text.to_owned(),
+        }),
+        _ => Err(format!(
+            "patch line {line}: a line anchor needs the line's text after \"line {number}: \""
+        )),
     }
 }
 
@@ -56,18 +122,25 @@ pub fn parse(patch: &str) -> Result<Vec<Operation>, String> {
         if let Some(name) = header.strip_prefix("*** Add File: ") {
             let name = path(name, i + 1)?;
             i += 1;
-            let mut contents = String::new();
-            while i < lines.len() - 1 && !lines[i].starts_with("*** ") {
-                let text = lines[i].strip_prefix('+').ok_or_else(|| {
-                    format!("patch line {}: added file lines must start with +", i + 1)
-                })?;
-                contents.push_str(text);
-                contents.push('\n');
-                i += 1;
-            }
+            // New files have no existing ending to inherit, so every line takes LF.
+            let contents = content_lines(&lines, &mut i)?.into_iter().fold(
+                String::new(),
+                |mut contents, text| {
+                    contents.push_str(&text);
+                    contents.push('\n');
+                    contents
+                },
+            );
             operations.push(Operation::Add {
                 path: name,
                 contents,
+            });
+        } else if let Some(name) = header.strip_prefix("*** Replace File: ") {
+            let name = path(name, i + 1)?;
+            i += 1;
+            operations.push(Operation::Replace {
+                path: name,
+                lines: content_lines(&lines, &mut i)?,
             });
         } else if let Some(name) = header.strip_prefix("*** Delete File: ") {
             operations.push(Operation::Delete {
@@ -89,9 +162,9 @@ pub fn parse(patch: &str) -> Result<Vec<Operation>, String> {
                 let anchor = if lines[i] == "@@" {
                     i += 1;
                     None
-                } else if let Some(anchor) = lines[i].strip_prefix("@@ ") {
+                } else if let Some(header) = lines[i].strip_prefix("@@ ") {
                     i += 1;
-                    Some(anchor.to_owned())
+                    Some(anchor(header, i)?)
                 } else if chunks.is_empty() {
                     None
                 } else {
@@ -217,18 +290,44 @@ fn locate(lines: &[&str], chunk: &Chunk, number: usize) -> Result<usize, String>
         let matches: Vec<usize> = lines
             .iter()
             .enumerate()
-            .filter_map(|(i, line)| (line_text(line) == anchor).then_some(i))
+            .filter_map(|(i, line)| (line_text(line) == anchor.text).then_some(i))
             .collect();
-        if matches.is_empty() || (expected.is_empty() && !chunk.eof && matches.len() > 1) {
-            return Err(format!(
-                "hunk {number}: anchor {} yields {} insertion/search locations; candidates: {}{}",
-                excerpt(anchor),
-                matches.len(),
-                locations(&matches),
-                candidate_context(lines, &matches)
-            ));
+        if let Some(line) = anchor.line {
+            // The number selects the occurrence; the text proves the model's view is current.
+            let index = line - 1;
+            let found = if matches.is_empty() {
+                "; the anchor text occurs nowhere in the file".to_owned()
+            } else {
+                format!("; the anchor text occurs at lines {}", locations(&matches))
+            };
+            if index >= lines.len() {
+                return Err(format!(
+                    "hunk {number}: anchor line {line} is beyond the file's {} lines{found}{}",
+                    lines.len(),
+                    candidate_context(lines, &matches)
+                ));
+            }
+            if line_text(lines[index]) != anchor.text {
+                return Err(format!(
+                    "hunk {number}: anchor line {line} is {}, not {}{found}{}",
+                    excerpt(line_text(lines[index])),
+                    excerpt(&anchor.text),
+                    candidate_context(lines, &[index]),
+                ));
+            }
+            line
+        } else {
+            if matches.is_empty() || (expected.is_empty() && !chunk.eof && matches.len() > 1) {
+                return Err(format!(
+                    "hunk {number}: anchor {} yields {} insertion/search locations; candidates: {}{}",
+                    excerpt(&anchor.text),
+                    matches.len(),
+                    locations(&matches),
+                    candidate_context(lines, &matches)
+                ));
+            }
+            matches[0] + 1
         }
-        matches[0] + 1
     } else {
         0
     };
@@ -335,14 +434,41 @@ fn edits(lines: &[&str], chunks: &[Chunk]) -> Result<Vec<Edit>, String> {
     Ok(edits)
 }
 
-// Apply literal replacements while preserving untouched line bytes and the final-newline contract.
-pub fn apply(original: &str, chunks: &[Chunk]) -> Result<Update, String> {
-    let lines = source_lines(original);
-    let ending = lines
+// New text inherits the file's first terminator; a file without any takes LF.
+fn source_ending(lines: &[&str]) -> &'static str {
+    lines
         .iter()
         .map(|line| line_ending(line))
         .find(|ending| !ending.is_empty())
-        .unwrap_or("\n");
+        .unwrap_or("\n")
+}
+
+// Final-newline state is preserved: the model's numbered view never shows it,
+// so no text operation may change it. An empty original counts as terminated.
+fn preserve_final_newline(original: &str, output: &mut [String]) {
+    if !original.is_empty()
+        && line_ending(original).is_empty()
+        && let Some(last) = output.last_mut()
+    {
+        last.truncate(last.len() - line_ending(last).len());
+    }
+}
+
+// Replace the whole text with `lines`, keeping only the file's ending and final-newline state.
+pub fn replace(original: &str, lines: &[String]) -> Update {
+    let ending = source_ending(&source_lines(original));
+    let mut output: Vec<String> = lines.iter().map(|line| format!("{line}{ending}")).collect();
+    preserve_final_newline(original, &mut output);
+    Update {
+        contents: output.concat(),
+        regions: vec![(1, lines.len().max(1))],
+    }
+}
+
+// Apply literal replacements while preserving untouched line bytes and the final-newline contract.
+pub fn apply(original: &str, chunks: &[Chunk]) -> Result<Update, String> {
+    let lines = source_lines(original);
+    let ending = source_ending(&lines);
     let changes = edits(&lines, chunks)?;
     let mut output: Vec<String> = Vec::new();
     let mut cursor = 0;
@@ -366,12 +492,7 @@ pub fn apply(original: &str, chunks: &[Chunk]) -> Result<Update, String> {
             line.push_str(ending);
         }
     }
-    if !original.is_empty()
-        && line_ending(original).is_empty()
-        && let Some(last) = output.last_mut()
-    {
-        last.truncate(last.len() - line_ending(last).len());
-    }
+    preserve_final_newline(original, &mut output);
     for (start, end) in &mut regions {
         *start = (*start).min(count.max(1));
         *end = (*end).min(count.max(1));
@@ -647,6 +768,111 @@ mod tests {
             "section\nfirst\nsection\nchanged\n"
         );
         assert!(update("section\nx\nsection\nx\n", "@@ section\n-x\n+y").is_err());
+    }
+
+    // A numbered anchor selects one occurrence of repeated text, for edits and insertions alike.
+    #[test]
+    fn line_anchor_selects_occurrence() {
+        let original = "section\nx\nsection\nx\n";
+        assert_eq!(
+            update(original, "@@ line 3: section\n-x\n+y")
+                .unwrap()
+                .contents,
+            "section\nx\nsection\ny\n"
+        );
+        assert_eq!(
+            update(original, "@@ line 1: section\n+inserted")
+                .unwrap()
+                .contents,
+            "section\ninserted\nx\nsection\nx\n"
+        );
+        assert_eq!(
+            update(original, "@@ line 3: section\n+inserted")
+                .unwrap()
+                .contents,
+            "section\nx\nsection\ninserted\nx\n"
+        );
+    }
+
+    // A numbered anchor whose line holds other text is rejected with both texts and the real locations.
+    #[test]
+    fn line_anchor_rejects_stale_views() {
+        let original = "section\nx\nsection\nx\n";
+        let message = update(original, "@@ line 2: section\n-x\n+y")
+            .err()
+            .unwrap();
+        assert!(
+            message.contains("line 2 is \"x\", not \"section\""),
+            "{message}"
+        );
+        assert!(message.contains("occurs at lines 1, 3"), "{message}");
+        let message = update(original, "@@ line 9: section\n-x\n+y")
+            .err()
+            .unwrap();
+        assert!(
+            message.contains("line 9 is beyond the file's 4 lines"),
+            "{message}"
+        );
+        let message = update(original, "@@ line 2: absent\n-x\n+y").err().unwrap();
+        assert!(message.contains("occurs nowhere"), "{message}");
+    }
+
+    // Only the exact `line <digits>: text` form is numbered; the number and text are both required.
+    #[test]
+    fn line_anchor_syntax() {
+        assert!(
+            update("line 63: note\nx\n", "@@ line 63: note\n-x\n+y")
+                .err()
+                .unwrap()
+                .contains("beyond the file's 2 lines")
+        );
+        assert_eq!(
+            update("line six: note\nx\n", "@@ line six: note\n-x\n+y")
+                .unwrap()
+                .contents,
+            "line six: note\ny\n"
+        );
+        for body in [
+            "@@ line 0: x\n-x\n+y",
+            "@@ line 2:\n-x\n+y",
+            "@@ line 2: \n-x\n+y",
+            "@@ line 2\n-x\n+y",
+        ] {
+            let error = update("a\nx\n", body).err().unwrap();
+            assert!(error.starts_with("patch line 3:"), "{body:?}: {error}");
+        }
+    }
+
+    // Replacement text takes the file's ending and final-newline state; nothing else survives.
+    #[test]
+    fn replace_preserves_ending_and_final_newline() {
+        let lines = ["new".to_owned(), "text".to_owned()];
+        assert_eq!(replace("a\nb\n", &lines).contents, "new\ntext\n");
+        assert_eq!(replace("a\r\nb\n", &lines).contents, "new\r\ntext\r\n");
+        assert_eq!(replace("a\nb", &lines).contents, "new\ntext");
+        assert_eq!(replace("", &lines).contents, "new\ntext\n");
+        assert_eq!(replace("a\n", &[]).contents, "");
+        assert_eq!(replace("a\nb\n", &lines).regions, vec![(1, 2)]);
+        assert_eq!(replace("a\n", &[]).regions, vec![(1, 1)]);
+    }
+
+    // Replace parses like Add but keeps lines unterminated for the engine to finish.
+    #[test]
+    fn parse_replace_operation() {
+        let result = parse(
+            "*** Begin Patch\n*** Replace File: f\n+one\n+\n+three\n*** Delete File: g\n*** End Patch",
+        )
+        .unwrap();
+        assert!(
+            matches!(&result[0], Operation::Replace { path, lines } if path == "f" && lines == &["one", "", "three"])
+        );
+        assert!(matches!(&result[1], Operation::Delete { .. }));
+        assert!(
+            parse("*** Begin Patch\n*** Replace File: f\nbare\n*** End Patch")
+                .err()
+                .unwrap()
+                .contains("must start with +")
+        );
     }
 
     // Harmless envelope whitespace and empty context spelling do not alter literal authored bytes.
