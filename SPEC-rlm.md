@@ -1,19 +1,19 @@
 # Recursive language model agents
 
-Contract for the root agent, branch agents, the library, and the store. Base contract: `SPEC.md`. Working log: `PLAN.md`.
+Contract for the root agent, branch agents, the library, and the store. Base contract: `SPEC.md`. Implementation plan: `PLAN-rlm.md`.
 
 ## Agents
 
-- One kind of agent. The root is depth 0. A branch spawned by an agent at depth `d` is at depth `d + 1`. Tools, prompts, and host functions are configured per depth.
-- The root is a pure delegator. Its only tool is `rlm`. It has no REPL, no repository access, no store access, and no turn-start synthetic call. Each `rlm` result carries FYI metadata: the date, the prompt-token count of the latest request, and the model.
-- A branch is one-shot: it receives a task, runs until a response has no tool calls, and ends. That response's content is the `rlm` result. No agent resumes a branch.
-- Every branch is told its own ID, its parent's ID, and its siblings' IDs.
-- The `rlm` calls in one response start at once and run concurrently. Other calls in that response run in the ordered tool queue. Results are saved as tool messages in completion order.
+- One kind of agent. The root is depth 0. A branch spawned by an agent at depth `d` is at depth `d + 1`. Tools, mounts, and host functions are fixed by depth. Every agent receives the `[chat] prompt` system message.
+- The root is a pure delegator. Its tools are `rlm` and `FYI`. It has no REPL, no repository access, and no store access. `FYI` takes no arguments and returns the date, the prompt-token count of the latest request, and the model. Each root turn opens with a synthetic `FYI` call.
+- `rlm` takes one required string, `task`, which becomes the branch's user message verbatim.
+- A branch is one-shot: it receives a task, runs until a response has no tool calls, and ends. That response's content is the `rlm` result, subject to the parent's `output_limit` like any tool result. No agent resumes a branch.
+- The `rlm` calls in one response run one at a time, in call order, in the ordered tool queue with the response's other calls. Results are saved as tool messages in call order.
 - Anything a branch returns is opaque text to its parent, including references into the store.
 
 ## Bounds
 
-- Maximum depth and maximum fan-out per response are configured and enforced by the harness. A call beyond either limit receives an error result and does not run.
+- Maximum depth and maximum fan-out per response are configured and enforced by the harness. `rlm` is not offered to agents at the maximum depth. In one response, `rlm` calls beyond the fan-out limit, in call order, receive an error result and do not run.
 
 ## Files
 
@@ -24,15 +24,14 @@ Contract for the root agent, branch agents, the library, and the store. Base con
 ## Library
 
 - The library is this tree's depth 0 and 1 transcripts, `sessions/<name>/library/`.
-- It is a read-only mount into the REPL sessions of agents at depth 2 and deeper. Agents at depth 0 and 1 have no mount of any session file. `deep/` is never mounted. Sessions never read each other's files.
+- It is a read-only mount into the REPL sessions of agents at depth 2 and deeper, at the virtual path `/library`, and the direct tools' `root = "library"`. Agents at depth 0 and 1 have no mount of any session file. `deep/` is never mounted. Sessions never read each other's files.
 
 ## Store
 
-- The store is a SilverBullet space reached over its HTTP API. Its base URL and optional credential variable are configured like an endpoint.
-- Agents at depth 1 and deeper have host functions for reading, writing, and listing pages. The root has none.
-- A reference is a page name in text. Pass by reference is naming a page in a task or an answer.
-- For agents at depth 1 and deeper, when a tool result is truncated at `output_limit`, the full result is written to a store page and the truncation notice names it. The root's `rlm` results truncate with the plain notice. A branch's returned content is subject to its parent's `output_limit` like any tool result.
-- Writes are last-write-wins. The harness holds no locks.
+- The store is a configured directory, `[rlm.store] path`.
+- It is a read-write mount into agents at depth 1 and deeper, at the REPL virtual path `/store` and the direct tools' `root = "store"`, independent of the repository permission level. The root has no store access.
+- A reference is a store path in text. Pass by reference is naming a path in a task or an answer.
+- Writes are ordinary filesystem writes. The harness holds no locks and mediates nothing.
 
 ## Data kinds
 
@@ -47,14 +46,10 @@ Contract for the root agent, branch agents, the library, and the store. Base con
 - Esc stops the whole tree.
 - The filesystem permission level applies to every branch.
 - Every branch file is inspectable as a session.
+- The transcript, context overlay, and status line follow the deepest active agent and return to its parent when it ends. The status line names the agent on screen.
 
 ## Deferred
 
-- The `rlm` invocation form and argument set.
-- Configuration shape for per-depth tools, prompts, bounds, and the store endpoint.
+- Concurrent branch execution.
 - Messaging between agents through the store.
-- Live display of running branches.
 - Opening a branch file with `--resume`.
-- Expiring write locks on store pages, if clobbering appears.
-- Virtual mount path of the library.
-- Exact store host-function set beyond read, write, and list.
