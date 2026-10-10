@@ -1,3 +1,4 @@
+mod agent;
 mod app;
 mod client;
 mod commands;
@@ -6,12 +7,12 @@ mod failures;
 mod grep;
 mod host;
 mod hostfs;
-mod injection;
 mod input;
 mod list;
 mod patch;
 mod read;
 mod repl;
+mod root;
 mod session;
 mod token_count;
 mod tool_call_id;
@@ -83,12 +84,12 @@ async fn run_app(args: Args) -> anyhow::Result<()> {
             if repaired > 0 {
                 println!(
                     "{}: added {NOT_RUN} for {repaired} tool calls without results",
-                    session.path.display()
+                    session.path().display()
                 );
             }
             session
         }
-        _ => Session::new(&dir),
+        _ => Session::new(&dir)?,
     };
     app::run(settings, session).await
 }

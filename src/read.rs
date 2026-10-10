@@ -1,4 +1,4 @@
-//! Direct text reads through a repository capability, independent of the interpreter.
+//! Direct text reads through a root's directory capability, independent of the interpreter.
 
 use cap_std::fs::Dir;
 use serde::Deserialize;
@@ -11,6 +11,8 @@ use std::sync::{
 };
 use tokio::task::JoinHandle;
 
+use crate::root::Access;
+
 #[derive(Deserialize)]
 pub struct Arguments {
     pub path: String,
@@ -19,28 +21,37 @@ pub struct Arguments {
 }
 
 pub struct Runtime {
-    root: Arc<Dir>,
+    /// The launch directory; reads follow `readable`.
+    repository: Arc<Dir>,
+    /// The store, readable at every permission level.
+    store: Arc<Dir>,
+    /// Whether the permission level allows repository reads.
     readable: Arc<AtomicBool>,
 }
 
 impl Runtime {
-    /// Establish the launch-directory boundary once; all model paths are resolved inside it.
-    pub fn new(root: &Path, readable: bool) -> io::Result<Self> {
+    /// Establish the repository and store boundaries once; all model paths are resolved
+    /// inside the root a call names.
+    pub fn new(repository: &Path, store: &Path, readable: bool) -> io::Result<Self> {
         Ok(Self {
-            root: Arc::new(Dir::open_ambient_dir(root, cap_std::ambient_authority())?),
+            repository: Arc::new(Dir::open_ambient_dir(
+                repository,
+                cap_std::ambient_authority(),
+            )?),
+            store: Arc::new(Dir::open_ambient_dir(store, cap_std::ambient_authority())?),
             readable: Arc::new(AtomicBool::new(readable)),
         })
     }
 
-    /// Publish permission changes to active reads as well as future calls.
+    /// Publish permission changes to active repository reads as well as future calls.
     pub fn set_permission(&self, readable: bool) {
         self.readable.store(readable, Ordering::SeqCst);
     }
 
-    /// Read off the event loop; stopping a call prevents its result from entering the session.
-    pub fn start(&self, args: Arguments) -> Job {
-        let root = self.root.clone();
-        let readable = self.readable.clone();
+    /// Read off the event loop under the root `access` names; stopping a call prevents
+    /// its result from entering the session.
+    pub fn start(&self, args: Arguments, access: Access) -> Job {
+        let (root, readable) = access.readable(&self.repository, &self.store, &self.readable);
         let canceled = Arc::new(AtomicBool::new(false));
         let signal = canceled.clone();
         let task = tokio::task::spawn_blocking(move || read(&root, &args, &readable, &signal));
@@ -162,7 +173,7 @@ mod tests {
     async fn ranges_and_literal_contents() {
         let dir = Fixture::new();
         std::fs::write(dir.0.join("f"), "one\r\n\\two\n三").unwrap();
-        let runtime = Runtime::new(&dir.0, true).unwrap();
+        let runtime = Runtime::new(&dir.0, &dir.0, true).unwrap();
         for (start, end, expected) in [
             (None, None, "1\tone\n2\t\\two\n3\t三\n"),
             (Some(2), Some(2), "2\t\\two\n"),
@@ -171,11 +182,14 @@ mod tests {
             (Some(3), Some(99), "3\t三\n"),
             (Some(99), None, ""),
         ] {
-            let mut job = runtime.start(Arguments {
-                path: "f".into(),
-                start_line: start.and_then(NonZeroUsize::new),
-                end_line: end.and_then(NonZeroUsize::new),
-            });
+            let mut job = runtime.start(
+                Arguments {
+                    path: "f".into(),
+                    start_line: start.and_then(NonZeroUsize::new),
+                    end_line: end.and_then(NonZeroUsize::new),
+                },
+                Access::Repository,
+            );
             assert_eq!(job.result().await, expected);
         }
     }
@@ -184,26 +198,32 @@ mod tests {
     #[tokio::test]
     async fn line_ranges_preserve_embedded_controls() {
         let dir = Fixture::new();
-        let runtime = Runtime::new(&dir.0, true).unwrap();
+        let runtime = Runtime::new(&dir.0, &dir.0, true).unwrap();
         for ending in ["\n", "\r\n"] {
             std::fs::write(
                 dir.0.join("f"),
                 format!("header{ending}    '\r' '\t'{ending}tail\r"),
             )
             .unwrap();
-            let mut job = runtime.start(Arguments {
-                path: "f".into(),
-                start_line: NonZeroUsize::new(2),
-                end_line: NonZeroUsize::new(3),
-            });
+            let mut job = runtime.start(
+                Arguments {
+                    path: "f".into(),
+                    start_line: NonZeroUsize::new(2),
+                    end_line: NonZeroUsize::new(3),
+                },
+                Access::Repository,
+            );
             assert_eq!(job.result().await, "2\t    '\r' '\t'\n3\ttail\r\n");
         }
         std::fs::write(dir.0.join("f"), "a\rb\rc\r").unwrap();
-        let mut job = runtime.start(Arguments {
-            path: "f".into(),
-            start_line: None,
-            end_line: None,
-        });
+        let mut job = runtime.start(
+            Arguments {
+                path: "f".into(),
+                start_line: None,
+                end_line: None,
+            },
+            Access::Repository,
+        );
         assert_eq!(job.result().await, "1\ta\rb\rc\r\n");
     }
 
@@ -216,7 +236,7 @@ mod tests {
         symlink("f", dir.0.join("link")).unwrap();
         symlink(dir.0.join("f"), dir.0.join("absolute-link")).unwrap();
         symlink("../outside", dir.0.join("escape")).unwrap();
-        let runtime = Runtime::new(&dir.0, false).unwrap();
+        let runtime = Runtime::new(&dir.0, &dir.0, false).unwrap();
         let args = |path: String| Arguments {
             path,
             start_line: None,
@@ -224,14 +244,17 @@ mod tests {
         };
         assert!(
             runtime
-                .start(args("f".into()))
+                .start(args("f".into()), Access::Repository)
                 .result()
                 .await
                 .contains("permission level is none")
         );
         runtime.set_permission(true);
         assert_eq!(
-            runtime.start(args("link".into())).result().await,
+            runtime
+                .start(args("link".into()), Access::Repository)
+                .result()
+                .await,
             "1\tcontent\n"
         );
         for path in [
@@ -243,7 +266,7 @@ mod tests {
         ] {
             assert!(
                 runtime
-                    .start(args(path))
+                    .start(args(path), Access::Repository)
                     .result()
                     .await
                     .starts_with("read_file:")
@@ -252,13 +275,19 @@ mod tests {
         std::fs::write(dir.0.join("invalid"), [0xff]).unwrap();
         assert!(
             runtime
-                .start(args("invalid".into()))
+                .start(args("invalid".into()), Access::Repository)
                 .result()
                 .await
                 .starts_with("read_file:")
         );
         std::fs::write(dir.0.join("empty"), "").unwrap();
-        assert_eq!(runtime.start(args("empty".into())).result().await, "");
+        assert_eq!(
+            runtime
+                .start(args("empty".into()), Access::Repository)
+                .result()
+                .await,
+            ""
+        );
     }
 
     /// Cancellation and revocation stop further reads, without requiring filesystem mutations.

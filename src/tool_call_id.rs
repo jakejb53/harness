@@ -7,13 +7,12 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 
 pub const NORMAL: u8 = 0;
-pub const INJECTED_FILE: u8 = 1;
-/// App-generated calls in the saved session that the compact overlay omits.
+/// App-generated calls in the saved session that the compact overlay omits. Kind `1`
+/// was the removed injected-file kind.
 pub const SYNTHETIC: u8 = 2;
 const VERSION: u8 = 1;
 const MAX_DATA: usize = 17;
 const MASK_DOMAIN: &[u8] = b"harness/tool-call-id/mask/v1\0";
-const ENTROPY_DOMAIN: &[u8] = b"harness/tool-call-id/deterministic/v1\0";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Metadata {
@@ -52,17 +51,6 @@ pub fn decode(id: &str) -> Option<Metadata> {
     })
 }
 
-/// Derive repeatable normal-call IDs for synthetic reasoning from a stable seed.
-pub fn deterministic(seed: &[u8]) -> String {
-    let mut hash = Sha256::new();
-    hash.update(ENTROPY_DOMAIN);
-    hash.update(seed);
-    let entropy = hash.finalize();
-    let mut bytes = [0u8; 24];
-    bytes.copy_from_slice(&entropy[..24]);
-    encode(bytes, NORMAL, &[])
-}
-
 /// The caller bounds payload length; remaining entropy bytes provide body padding.
 fn encode(mut bytes: [u8; 24], kind: u8, data: &[u8]) -> String {
     bytes[4] = VERSION;
@@ -93,7 +81,7 @@ mod tests {
     fn binary_roundtrip_and_format() {
         for length in 0..=MAX_DATA {
             let data: Vec<_> = (0..length).map(|index| (index * 83) as u8).collect();
-            for kind in [NORMAL, INJECTED_FILE, SYNTHETIC, 255] {
+            for kind in [NORMAL, SYNTHETIC, 255] {
                 let id = generate(kind, &data).unwrap();
                 assert_eq!(id.len(), 32);
                 assert!(
@@ -129,7 +117,7 @@ mod tests {
         ] {
             assert!(decode(id).is_none());
         }
-        let valid = deterministic(b"malformed cases");
+        let valid = generate(NORMAL, &[]).unwrap();
         assert!(decode(&format!("{valid}=")).is_none());
         assert!(decode(&valid[..31]).is_none());
         for (offset, value) in [(4, VERSION + 1), (6, 18)] {
@@ -139,21 +127,5 @@ mod tests {
             mask_body(&mut bytes);
             assert!(decode(&URL_SAFE_NO_PAD.encode(bytes)).is_none());
         }
-    }
-
-    /// Stable seeds preserve the encoded ID and carry empty normal-call metadata.
-    #[test]
-    fn deterministic_seed_stability() {
-        let id = deterministic(b"known vector");
-        assert_eq!(id, "rMVwnh3HR2ewTwOC2oIWAC-doTeGrYb4");
-        assert_eq!(id, deterministic(b"known vector"));
-        assert_ne!(id, deterministic(b"different vector"));
-        assert_eq!(
-            decode(&id),
-            Some(Metadata {
-                kind: NORMAL,
-                data: vec![]
-            })
-        );
     }
 }

@@ -8,7 +8,7 @@ The REPL uses Monty, a sandboxed Python-subset interpreter. Repository filesyste
 
 ## Setup
 
-Requires a Rust toolchain. The Monty interpreter is built into the app.
+Requires a Rust toolchain. Install with `./install.sh`, which installs the `harness` binary into `~/.cargo/bin` and copies the shipped `replib/*.py` into `~/.harness/replib/`. The Monty interpreter is built into the app.
 
 The app keeps its files in `~/.harness`: `config.toml`, `.env`, `sessions/`, `replib/`, optional `repl-notes.md`, and `failures.jsonl`. They are shared by every repository you run it in.
 
@@ -68,7 +68,7 @@ A variable already set in your shell takes precedence over `.env`. The app reads
 
 ## Running
 
-Build with `cargo build`, then run `harness` (in `target/debug/`) from the directory the agent should work in, normally the root of a repository.
+Run `harness` from the directory the agent should work in, normally the root of a repository.
 
 Each run starts a new conversation, saved to `~/.harness/sessions/YYYYMMDD-HHMMSS.json` when you send the first message or attach a file. The file name without `.json` is the session's name; `/rename <name>` changes it. To list saved sessions, oldest first, or continue one:
 
@@ -257,10 +257,10 @@ def word_count(path: str) -> int:
 
 **Mistakes.** Load errors appear in the turn's first call (the app's `FYI()`); other files still load. Failed files are omitted from `help()`. Library code follows the same permissions as other REPL code.
 
-This repo ships `replib/reasoning.py`, `replib/glob.py`, and `replib/search.py`. Copy them into `~/.harness/replib/`:
+This repo ships `replib/reasoning.py`, `replib/glob.py`, and `replib/search.py`. `install.sh` copies them into `~/.harness/replib/` and overwrites them on every install; your own files there are unaffected.
 
 - `reasoning(text)` does nothing and returns `None`. It gives the model a way to record its reasoning as part of the conversation, and the model is encouraged to call it: a call that is only `reasoning("...")` on a plain string never needs approval, and the app answers it with `(no output)` without running it.
-- That answer, and tool reasoning (below), depend on it staying a no-op that prints nothing. Edit its docstring freely (it's what `help()` shows the model), but not its behavior.
+- That answer, and tool reasoning (below), depend on it staying a no-op that prints nothing.
 - `glob(pattern, path=None, exclude=(".git", "target", "node_modules"))` returns sorted relative paths.
 - `search(pattern, path=None, glob=None, exclude=(".git", "target", "node_modules"))` finds regex matches and returns `path`, 1-based `line`, and `text` records.
 

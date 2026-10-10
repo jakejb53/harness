@@ -6,10 +6,15 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::root::Root;
+
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
+/// One root's write capability (the repository or the store).
 pub struct Repository {
     root: Dir,
+    /// Which root `root` is, named by errors about patch paths.
+    name: Root,
 }
 
 pub struct Target {
@@ -36,16 +41,18 @@ pub struct CommitReceipt {
 }
 
 impl Repository {
-    /// Ambient authority is used only to establish the repository capability.
-    pub fn open(path: &Path) -> io::Result<Self> {
+    /// Ambient authority is used only to establish the directory capability of root
+    /// `name` (repository or store).
+    pub fn open(path: &Path, name: Root) -> io::Result<Self> {
         Ok(Self {
             root: Dir::open_ambient_dir(path, cap_std::ambient_authority())?,
+            name,
         })
     }
 
     /// Updates resolve and read their target; entry-only operations inspect metadata only.
     pub fn existing(&self, path: &Path, follow_final: bool) -> io::Result<Existing> {
-        validate_path(path)?;
+        validate_path(path, self.name)?;
         let canonical = if follow_final {
             self.root.canonicalize(path)?
         } else {
@@ -80,7 +87,7 @@ impl Repository {
 
     /// Reject existing destinations during validation, including dangling symlinks.
     pub fn vacant(&self, path: &Path) -> io::Result<Target> {
-        validate_path(path)?;
+        validate_path(path, self.name)?;
         let target = self.target(self.entry_path(path)?)?;
         match target.parent.symlink_metadata(&target.name) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(target),
@@ -263,8 +270,9 @@ impl Drop for Staged {
     }
 }
 
-/// Explicitly reject absolute input before cap-std resolves relative traversal.
-fn validate_path(path: &Path) -> io::Result<()> {
+/// Explicitly reject absolute input before cap-std resolves relative traversal. The error
+/// names root `name` ("store-relative", "repository-relative").
+fn validate_path(path: &Path, name: Root) -> io::Result<()> {
     if path.as_os_str().is_empty()
         || path
             .components()
@@ -272,7 +280,11 @@ fn validate_path(path: &Path) -> io::Result<()> {
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("patch path must be repository-relative: {}", path.display()),
+            format!(
+                "patch path must be {}-relative: {}",
+                name.as_str(),
+                path.display()
+            ),
         ));
     }
     Ok(())
@@ -312,7 +324,7 @@ mod tests {
 
         /// Open the same capability used by production operations.
         fn repo(&self) -> Repository {
-            Repository::open(&self.0).unwrap()
+            Repository::open(&self.0, Root::Repository).unwrap()
         }
     }
 

@@ -16,6 +16,8 @@ use tokio::sync::oneshot;
 use engine::Operation;
 use fs::{Existing, Repository, Staged, Target};
 
+use crate::root::{Access, Root};
+
 pub const DESCRIPTION: &str = r#"Edit files directly with literal patch text. Text updates require UTF-8; deletion and rename-only operations do not read the contents. Requires read-write permission. Paths must be repository-relative; absolute paths and escaping path resolution are rejected. Text updates follow relative symlinks within the repository. Rename and deletion operate on named entries. Add and Move destinations must not exist.
 Use *** Begin Patch and *** End Patch around operations:
 *** Add File: path (each content line prefixed +)
@@ -40,34 +42,55 @@ the JSON string representing that single added patch line is:
 "+    out.push_str(\"\\\\r\");"
 Read files before editing. Existing line endings and final-newline state are preserved; new files use LF. The complete patch is parsed first, then operations are validated and applied in order against the current filesystem. A later failure leaves earlier changes applied; inspect the receipt before retrying."#;
 
+/// Holds a write capability for each writable root only: the library is read-only, so
+/// no capability for it exists here.
 pub struct Runtime {
-    repo: Arc<Repository>,
+    /// The launch directory; writes follow `writable`.
+    repository: Arc<Repository>,
+    /// The store, writable at every permission level.
+    store: Arc<Repository>,
+    /// Whether the permission level allows repository writes.
     writable: Arc<AtomicBool>,
 }
 
 impl Runtime {
     /// Establish filesystem authority once, independently of the Monty worker lifecycle.
-    pub fn new(root: &Path, writable: bool) -> io::Result<Self> {
+    pub fn new(repository: &Path, store: &Path, writable: bool) -> io::Result<Self> {
         Ok(Self {
-            repo: Arc::new(Repository::open(root)?),
+            repository: Arc::new(Repository::open(repository, Root::Repository)?),
+            store: Arc::new(Repository::open(store, Root::Store)?),
             writable: Arc::new(AtomicBool::new(writable)),
         })
     }
 
-    /// Permission changes are observed before the next patch filesystem operation.
+    /// Permission changes are observed before the next repository patch filesystem
+    /// operation.
     pub fn set_permission(&self, writable: bool) {
         self.writable.store(writable, Ordering::SeqCst);
     }
 
-    /// Keep file I/O off the UI thread while retaining a joinable, cooperatively stopped writer.
-    pub fn start(&self, patch: String) -> io::Result<Job> {
+    /// Keep file I/O off the UI thread while retaining a joinable, cooperatively stopped
+    /// writer confined to the root `access` names. The library is refused before any
+    /// file operation.
+    pub fn start(&self, patch: String, access: Access) -> io::Result<Job> {
+        let (repo, writable) = match access {
+            Access::Repository => (self.repository.clone(), self.writable.clone()),
+            // The store is writable at every permission level, so its flag is a fresh
+            // constant `true`.
+            Access::Store => (self.store.clone(), Arc::new(AtomicBool::new(true))),
+            Access::Library(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("root {:?} is read-only", Root::Library.as_str()),
+                ));
+            }
+        };
         let control = Control {
             canceled: Arc::new(AtomicBool::new(false)),
-            writable: self.writable.clone(),
+            writable,
         };
         control.check().map_err(io::Error::other)?;
         let worker_control = control.clone();
-        let repo = self.repo.clone();
         let (finished, completion) = oneshot::channel();
         let worker = thread::Builder::new()
             .name("harness-patch".into())
@@ -531,7 +554,7 @@ mod tests {
         /// Give each case its own directory capability and writable permission signal.
         fn context(&self) -> (Repository, Control) {
             (
-                Repository::open(&self.0).unwrap(),
+                Repository::open(&self.0, Root::Repository).unwrap(),
                 Control {
                     canceled: Arc::new(AtomicBool::new(false)),
                     writable: Arc::new(AtomicBool::new(true)),
@@ -870,15 +893,18 @@ mod tests {
     #[tokio::test]
     async fn runtime_joins_and_denies_read_only() {
         let dir = Fixture::new();
-        let runtime = Runtime::new(&dir.0, false).unwrap();
+        let runtime = Runtime::new(&dir.0, &dir.0, false).unwrap();
         let patch = "*** Begin Patch\n*** Add File: a\n+A\n*** End Patch";
-        assert!(runtime.start(patch.into()).is_err());
+        assert!(runtime.start(patch.into(), Access::Repository).is_err());
         runtime.set_permission(true);
-        let mut job = runtime.start(patch.into()).unwrap();
+        let mut job = runtime.start(patch.into(), Access::Repository).unwrap();
         assert!(job.result().await.starts_with("Patch applied"));
         assert!(job.worker.is_none());
         let mut job = runtime
-            .start("*** Begin Patch\n*** Add File: b\n+B\n*** End Patch".into())
+            .start(
+                "*** Begin Patch\n*** Add File: b\n+B\n*** End Patch".into(),
+                Access::Repository,
+            )
             .unwrap();
         let result = job.stop();
         assert!(job.worker.is_none());

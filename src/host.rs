@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::{Permission, Settings};
 use crate::repl::ReplEvent;
+use crate::root::Root;
 use crate::token_count::TokenTotal;
 
 /// Signatures shown by help(); dispatch validates host arguments at runtime.
@@ -68,8 +69,47 @@ pub struct LibraryFunction {
     pub docstring: String,
 }
 
+/// The mounts beside the repository that this agent's feeds carry, fixed by its depth
+/// for the whole turn. Authorization (`hostfs`) and `help()` both read it, so neither
+/// can describe or allow a mount the feeds lack; the agent's direct-tool roots and
+/// their definitions follow the same value (`has`, `roots`).
+#[derive(Clone, Copy)]
+pub struct Mounts {
+    /// `/store`, read-write regardless of the permission level (depth 1 and deeper).
+    pub store: bool,
+    /// `/library`, read-only (depth 2 and deeper, when the App supplied it).
+    pub library: bool,
+}
+
+impl Mounts {
+    /// The mounts of an agent at `depth`: `/store` from depth 1, and `/library` when
+    /// the App supplied the tree's library, which it does at depth 2 and deeper.
+    pub fn at(depth: u32, library: bool) -> Self {
+        Self {
+            store: depth >= 1,
+            library,
+        }
+    }
+
+    /// Whether the agent reaches `root`; every agent reaches the repository.
+    pub fn has(self, root: Root) -> bool {
+        match root {
+            Root::Repository => true,
+            Root::Store => self.store,
+            Root::Library => self.library,
+        }
+    }
+
+    /// The roots the agent reaches, in `Root::ALL` order, the repository first.
+    pub fn roots(self) -> impl Iterator<Item = Root> {
+        Root::ALL.into_iter().filter(move |root| self.has(*root))
+    }
+}
+
 pub struct HostContext {
+    /// Canonical repository path, which is also its mount's virtual path.
     pub repo: PathBuf,
+    pub mounts: Mounts,
     pub config: Arc<HostConfig>,
     pub permissions: watch::Receiver<Permission>,
     pub events: mpsc::UnboundedSender<ReplEvent>,
@@ -178,16 +218,25 @@ fn argument<'a>(args: &'a CallArgs, index: usize, name: &str) -> Option<ObjectRe
 /// Keep synthetic and explicit snapshots on the same implementation.
 fn fyi(args: &CallArgs, host: &HostContext) -> Result<MontyObject, MontyException> {
     arguments(args, &[])?;
+    host.output(format!(
+        "FYI()\n{}",
+        fyi_lines(host.prompt_tokens, &host.config.model)
+    ));
+    Ok(MontyObject::none())
+}
+
+/// The `Date`, `Prompt tokens` (when known), and `Model` lines, shared by the REPL's
+/// `FYI()` host function and the root's `FYI` tool so the two report alike.
+pub fn fyi_lines(prompt_tokens: Option<TokenTotal>, model: &str) -> String {
     let mut text = format!(
-        "FYI()\nDate: {}\n",
+        "Date: {}\n",
         chrono::Local::now().format("%a %b %d %H:%M:%S %:z %Y")
     );
-    if let Some(tokens) = host.prompt_tokens {
+    if let Some(tokens) = prompt_tokens {
         text.push_str(&prompt_tokens_line(tokens));
     }
-    text.push_str(&format!("Model: {}\n", host.config.model));
-    host.output(text);
-    Ok(MontyObject::none())
+    text.push_str(&format!("Model: {model}\n"));
+    text
 }
 
 /// Preserve the overlay's estimate marker in the snapshot shown to the model.
@@ -211,6 +260,18 @@ fn help(args: &CallArgs, host: &HostContext) -> Result<MontyObject, MontyExcepti
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(io_error("read", &notes_path, error)),
+    }
+    // Only the mounts this agent's feeds carry are listed. The text names neither the
+    // agent's depth nor the tree; the permission is read live, like every operation.
+    text.push_str(&format!(
+        "\nFiles:\nRepository (permission currently {}): REPL relative paths resolve here; read_file, grep, list, and apply_patch use it by default (root = \"repository\").\n",
+        host.permission().as_str()
+    ));
+    if host.mounts.store {
+        text.push_str("/store (read-write): a shared knowledge base that persists across sessions. Check it for earlier findings, save findings worth reusing, and pass large data by writing it here and naming the path instead of copying the data. REPL: pathlib.Path paths under /store; read_file, grep, list, and apply_patch: root = \"store\".\n");
+    }
+    if host.mounts.library {
+        text.push_str("/library (read-only): session transcripts available to inspect, one JSON file per session. REPL: pathlib.Path paths under /library; read_file, grep, and list: root = \"library\".\n");
     }
     text.push_str("\nHost functions:\n");
     text.push_str(STUBS.trim());

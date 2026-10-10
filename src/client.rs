@@ -7,6 +7,8 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 use crate::config::{ApprovalDescriptionSettings, ResolvedEndpoint};
+use crate::host::Mounts;
+use crate::root::Root;
 
 /// REPL requests use the configured description verbatim.
 fn repl_tool(tool_description: &str) -> Value {
@@ -30,100 +32,251 @@ fn repl_tool(tool_description: &str) -> Value {
 }
 
 /// Patch text is decoded once from JSON and passed directly to the Rust editor.
-fn patch_tool() -> Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": "apply_patch",
-            "description": crate::patch::DESCRIPTION,
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "patch": {"type": "string", "description": "The complete *** Begin Patch ... *** End Patch text."}
-                },
-                "required": ["patch"]
+/// `roots` are the agent's writable roots.
+fn patch_tool(roots: &[Root]) -> Value {
+    offer_roots(
+        json!({
+            "type": "function",
+            "function": {
+                "name": "apply_patch",
+                "description": crate::patch::DESCRIPTION,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "patch": {"type": "string", "description": "The complete *** Begin Patch ... *** End Patch text."}
+                    },
+                    "required": ["patch"]
+                }
             }
-        }
-    })
+        }),
+        roots,
+    )
 }
 
 /// File reads expose only a relative path and optional inclusive line bounds.
-fn read_tool() -> Value {
-    json!({
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read a UTF-8 text file with its original line numbers. Paths must be repository-relative. Optional start_line and end_line are 1-based and inclusive; omit them to read from line 1 through EOF. Requires read-only or read-write permission. Relative symlinks may resolve within the repository; absolute paths and escaping resolution are rejected. Results use the existing output limit.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "start_line": {"type": "integer", "minimum": 1},
-                    "end_line": {"type": "integer", "minimum": 1}
-                },
-                "required": ["path"]
+/// `roots` are the agent's roots.
+fn read_tool(roots: &[Root]) -> Value {
+    offer_roots(
+        json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a UTF-8 text file with its original line numbers. Paths must be repository-relative. Optional start_line and end_line are 1-based and inclusive; omit them to read from line 1 through EOF. Requires read-only or read-write permission. Relative symlinks may resolve within the repository; absolute paths and escaping resolution are rejected. Results use the existing output limit.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "start_line": {"type": "integer", "minimum": 1},
+                        "end_line": {"type": "integer", "minimum": 1}
+                    },
+                    "required": ["path"]
+                }
             }
-        }
-    })
+        }),
+        roots,
+    )
 }
 
 /// Describe structured search inputs and their defaults directly to the endpoint.
-fn grep_tool() -> Value {
+/// `roots` are the agent's roots.
+fn grep_tool(roots: &[Root]) -> Value {
+    offer_roots(
+        json!({
+            "type": "function",
+            "function": {
+                "name": "grep",
+                "description": crate::grep::DESCRIPTION,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string", "description": "Extended regex to search for, or literal strings when fixed is true."},
+                        "path": {"type": "string", "default": ".", "description": "Literal repository-relative file or directory. Directories are searched recursively; omitted means repository root."},
+                        "fixed": {"type": "boolean", "default": false, "description": "Match fixed strings instead of regex syntax."},
+                        "ignore_case": {"type": "boolean", "default": false, "description": "Use case-insensitive content matching."},
+                        "context": {"type": "integer", "minimum": 0, "default": 0, "description": "Lines before and after each match."},
+                        "include": {"type": "string", "default": "", "description": "Case-sensitive file-basename glob at every depth, for example *.rs. Empty means no filter."}
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        }),
+        roots,
+    )
+}
+
+/// Directory discovery exposes the same path and basename-filter vocabulary as grep.
+/// `roots` are the agent's roots.
+fn list_tool(roots: &[Root]) -> Value {
+    offer_roots(
+        json!({
+            "type": "function",
+            "function": {
+                "name": "list",
+                "description": crate::list::DESCRIPTION,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "default": ".", "description": "Repository-relative directory; omitted means repository root."},
+                        "recursive": {"type": "boolean", "default": false, "description": "Include descendant entries without following symlinks."},
+                        "include": {"type": "string", "default": "", "description": "Case-sensitive basename glob, for example *.rs. Filters output, not directory traversal. Empty means all entries."}
+                    },
+                    "required": []
+                }
+            }
+        }),
+        roots,
+    )
+}
+
+/// Offer the optional `root` argument when the agent reaches a root besides the
+/// repository: the property lists exactly `roots`, and the description gains what each
+/// one is and its access rule, naming no depth. With the repository alone there is
+/// nothing to choose, so the definition stays as it is.
+fn offer_roots(mut tool: Value, roots: &[Root]) -> Value {
+    if roots.len() < 2 {
+        return tool;
+    }
+    let function = &mut tool["function"];
+    function["parameters"]["properties"]["root"] = json!({
+        "type": "string",
+        "enum": roots.iter().map(|root| root.as_str()).collect::<Vec<_>>(),
+        "default": Root::Repository.as_str(),
+        "description": "The directory that paths are relative to."
+    });
+    let entries: Vec<&str> = roots
+        .iter()
+        .map(|root| match root {
+            Root::Repository => r#""repository" (default)"#,
+            Root::Store => {
+                r#""store" (the shared knowledge base, read-write at every permission level)"#
+            }
+            Root::Library => {
+                r#""library" (session transcripts, read-only at every permission level)"#
+            }
+        })
+        .collect();
+    let choices = match entries.as_slice() {
+        [first, last] => format!("{first} or {last}"),
+        [rest @ .., last] => format!("{}, or {last}", rest.join(", ")),
+        [] => unreachable!("at least two roots are offered"),
+    };
+    // The base text describes the repository; this note scopes it to the chosen root.
+    let description = format!(
+        "{}\nOptional root selects the directory that paths are relative to: {choices}. With another root, each mention of the repository in this tool's description and parameters means that root, and the permission level does not apply.",
+        function["description"]
+            .as_str()
+            .expect("tool definition has a description")
+    );
+    function["description"] = Value::String(description);
+    tool
+}
+
+/// `rlm` below the root, verbatim.
+const RLM_DESCRIPTION: &str = "Delegate a task to a subagent.";
+
+/// Opens the root's `rlm` description, before the depth 1 tool entries.
+const ROOT_RLM_PREAMBLE: &str = "Delegate a task to a subagent and return its final answer. The subagent sees only your task text and works on the same repository with the following tools:";
+
+/// `FYI`, verbatim.
+const FYI_DESCRIPTION: &str =
+    "Report the current date, the prompt-token count of the latest request, and the model name.";
+
+/// Delegation: one required `task`, which becomes the subagent's user message verbatim.
+fn rlm_tool(description: &str) -> Value {
     json!({
         "type": "function",
         "function": {
-            "name": "grep",
-            "description": crate::grep::DESCRIPTION,
+            "name": "rlm",
+            "description": description,
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string", "description": "Extended regex to search for, or literal strings when fixed is true."},
-                    "path": {"type": "string", "default": ".", "description": "Literal repository-relative file or directory. Directories are searched recursively; omitted means repository root."},
-                    "fixed": {"type": "boolean", "default": false, "description": "Match fixed strings instead of regex syntax."},
-                    "ignore_case": {"type": "boolean", "default": false, "description": "Use case-insensitive content matching."},
-                    "context": {"type": "integer", "minimum": 0, "default": 0, "description": "Lines before and after each match."},
-                    "include": {"type": "string", "default": "", "description": "Case-sensitive file-basename glob at every depth, for example *.rs. Empty means no filter."}
+                    "task": {"type": "string", "description": "The task for the subagent."}
                 },
-                "required": ["pattern"]
+                "required": ["task"]
             }
         }
     })
 }
 
-/// Directory discovery exposes the same path and basename-filter vocabulary as grep.
-fn list_tool() -> Value {
+/// The root's situational-awareness tool; it takes no parameters.
+fn fyi_tool() -> Value {
     json!({
         "type": "function",
         "function": {
-            "name": "list",
-            "description": crate::list::DESCRIPTION,
+            "name": "FYI",
+            "description": FYI_DESCRIPTION,
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "path": {"type": "string", "default": ".", "description": "Repository-relative directory; omitted means repository root."},
-                    "recursive": {"type": "boolean", "default": false, "description": "Include descendant entries without following symlinks."},
-                    "include": {"type": "string", "default": "", "description": "Case-sensitive basename glob, for example *.rs. Filters output, not directory traversal. Empty means all entries."}
-                },
+                "properties": {},
                 "required": []
             }
         }
     })
 }
 
-/// Keep requests and local inspection on the same authoritative set of tool definitions.
-fn tool_definitions(tool_description: &str) -> Vec<Value> {
-    vec![
-        repl_tool(tool_description),
-        patch_tool(),
-        read_tool(),
-        grep_tool(),
-        list_tool(),
-    ]
+/// The root's `rlm` description: the preamble, then one `name: description` entry per
+/// tool a depth 1 subagent is given, rendered from `subagent_tools` (the depth 1
+/// definitions themselves) so the description and the subagent's tools cannot differ.
+/// The preamble and the entries are separated by blank lines; trailing line endings of
+/// a description (a configured REPL description may end with one) are dropped so the
+/// separation stays one blank line.
+fn root_rlm_description(subagent_tools: &[Value]) -> String {
+    let mut text = ROOT_RLM_PREAMBLE.to_owned();
+    for tool in subagent_tools {
+        let function = &tool["function"];
+        let name = function["name"]
+            .as_str()
+            .expect("tool definition has a name");
+        let description = function["description"]
+            .as_str()
+            .expect("tool definition has a description");
+        text.push_str(&format!(
+            "\n\n{name}: {}",
+            description.trim_end_matches(['\r', '\n'])
+        ));
+    }
+    text
+}
+
+/// The tool set of an agent at `depth`, given the mounts it reaches; the agent holds
+/// the result, and its requests and `/tools` both read that one copy. The root (depth
+/// 0) is a pure delegator with `[rlm, FYI]`. Deeper agents get the REPL and the direct
+/// tools, each direct tool offering exactly the agent's roots and apply_patch only the
+/// writable ones, plus `rlm` above `max_depth`. No description names a depth.
+pub fn tool_definitions(
+    depth: u32,
+    max_depth: u32,
+    repl_description: &str,
+    mounts: Mounts,
+) -> Vec<Value> {
+    if depth == 0 {
+        // A depth 1 agent never has the library, so its mounts are fixed here.
+        let subagent = tool_definitions(1, max_depth, repl_description, Mounts::at(1, false));
+        return vec![rlm_tool(&root_rlm_description(&subagent)), fyi_tool()];
+    }
+    let roots: Vec<Root> = mounts.roots().collect();
+    let writable: Vec<Root> = roots
+        .iter()
+        .copied()
+        .filter(|root| root.writable())
+        .collect();
+    let mut tools = vec![
+        repl_tool(repl_description),
+        patch_tool(&writable),
+        read_tool(&roots),
+        grep_tool(&roots),
+        list_tool(&roots),
+    ];
+    if depth < max_depth {
+        tools.push(rlm_tool(RLM_DESCRIPTION));
+    }
+    tools
 }
 
 /// Keep names separate for styling; trim only display line endings, never the model's definitions.
-pub fn tool_descriptions(tool_description: &str) -> Vec<(String, String)> {
-    tool_definitions(tool_description)
+pub fn tool_descriptions(tools: &[Value]) -> Vec<(String, String)> {
+    tools
         .iter()
         .map(|tool| {
             let function = &tool["function"];
@@ -161,7 +314,7 @@ pub fn start(
     http: &reqwest::Client,
     endpoint: &ResolvedEndpoint,
     system_prompt: Option<&str>,
-    tool_description: &str,
+    tools: &[Value],
     messages: Vec<Value>,
 ) -> (JoinHandle<()>, UnboundedReceiver<StreamEvent>) {
     // The effective prompt (config or CLI override) is added at send time, never
@@ -175,7 +328,7 @@ pub fn start(
         "model": endpoint.model,
         "stream": true,
         "stream_options": { "include_usage": true },
-        "tools": tool_definitions(tool_description),
+        "tools": tools,
         "messages": messages,
     });
     // Config validation reserves the fields above; server-specific parameters
@@ -440,7 +593,13 @@ mod tests {
     #[test]
     fn tools_descriptions_are_complete() {
         let repl = "Custom REPL description\n\nKeep \\paths and \"quotes\" verbatim.  ";
-        let output = tool_descriptions(repl);
+        // A maximum-depth agent reaching only the repository: the REPL and the direct
+        // tools with their base descriptions, and no `rlm`.
+        let mounts = Mounts {
+            store: false,
+            library: false,
+        };
+        let output = tool_descriptions(&tool_definitions(1, 1, repl, mounts));
         assert_eq!(output[0], ("REPL".into(), repl.into()));
         assert_eq!(output.len(), 5);
         for (name, description) in [
@@ -460,8 +619,11 @@ mod tests {
         assert!(output[2].1.starts_with("Read a UTF-8 text file"));
         for ending in ["", "\n", "\n\n", "\r\n"] {
             let configured = format!("{repl}{ending}");
-            assert_eq!(tool_descriptions(&configured), output);
-            let definitions = tool_definitions(&configured);
+            assert_eq!(
+                tool_descriptions(&tool_definitions(1, 1, &configured, mounts)),
+                output
+            );
+            let definitions = tool_definitions(1, 1, &configured, mounts);
             assert_eq!(definitions[0]["function"]["description"], configured);
         }
     }
@@ -469,7 +631,7 @@ mod tests {
     /// The editor uses the portable function-call shape, with no interpreter argument.
     #[test]
     fn patch_definition_is_a_literal_string_function() {
-        let tool = patch_tool();
+        let tool = patch_tool(&[Root::Repository]);
         assert_eq!(tool["type"], "function");
         assert_eq!(tool["function"]["name"], "apply_patch");
         let parameters = &tool["function"]["parameters"];

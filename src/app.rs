@@ -1,20 +1,17 @@
-//! Chat loop: input events, the tool-calling turn, and session persistence.
+//! Chat loop: input events, the agent stack, and the display.
 //!
-//! A turn starts with a user message and alternates between streaming a response and
-//! handling ordered tool calls, with prompts at host operations. It ends
-//! when a response has no tool calls, on Esc, or on a stream error.
+//! The App owns the shared resources and holds the agents as a stack (`agent.rs`
+//! runs each agent's tool-calling turn): the root, then each active branch above its
+//! parent. Only the agent on top is active; the App routes events to it and acts on
+//! the outcomes it returns, creating a branch for an accepted `rlm` call and handing a
+//! branch's answer to its parent when it ends.
 //!
-//! The screen is drawn from state every frame (`build_blocks`): the session's
-//! messages, the turn in progress, and display-only notes. Handlers only change
+//! The screen is drawn from state every frame (`build_blocks`): the active agent's
+//! messages, its turn in progress, and its display-only notes. Handlers only change
 //! state; drawing is the loop's job.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::PathBuf;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
 use std::time::Duration;
 
 use anyhow::{Context, ensure};
@@ -27,99 +24,99 @@ use ratatui_textarea::TextArea;
 use serde_json::{Map, Value};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc::{self, UnboundedReceiver};
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
 
-use crate::client::{self, StreamEvent};
+use crate::agent::{
+    Agent, Outcome, Phase, Resources, STOPPED, Turn, TurnEvent, append_line, code_of, patch_of,
+};
+use crate::client;
 use crate::commands::{self, Action};
 use crate::config::{self, Settings, Theme};
 use crate::failures::FailureLog;
 use crate::grep;
-use crate::injection::{self, PreparedInjection};
 use crate::input::{self, InputAction};
 use crate::list;
 use crate::patch;
 use crate::read;
-use crate::repl::{Repl, ReplEvent, Runtime};
-use crate::session::{
-    FunctionCall, Message, NOT_RUN, Role, Session, ToolCall, Turn as SessionTurn, reasoning_text,
-};
+use crate::repl::Runtime;
+use crate::root::Library;
+use crate::session::{Message, Role, Session, ToolCall, Turn as SessionTurn, reasoning_text};
 use crate::token_count;
 use crate::tool_call_id;
-use crate::tool_reasoning;
 use crate::transcript::{Block, Key, View};
 use crate::tui::{MessageEntry, MessageOverlay, Tui};
 
-const STOPPED: &str = "[stopped by user]";
+/// The stack's invariant: the root agent is never removed.
+const ROOT_HELD: &str = "the agent stack always holds the root agent";
 
-/// Most rows either completion list shows at once.
+/// Most rows the completion list shows at once.
 const COMPLETION_ROWS: usize = 8;
 
 /// Bound one input batch so continuous wheel traffic cannot starve drawing or signals.
 const MAX_WHEEL_BATCH: usize = 64;
 
-/// Shared list entry; a missing command identifies a literal `@filename` completion.
-struct Completion {
-    spelling: String,
-    command: Option<&'static commands::Command>,
-}
-
 /// Validate persistent failure history and start workers before taking over the terminal.
 pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
     let failures = FailureLog::load(&settings.dir)?;
     let runtime = Runtime::new(&settings).await?;
+    // Each direct-tool runtime holds the repository and store capabilities; the
+    // permission level governs the repository only.
     let patch_runtime = patch::Runtime::new(
         &std::env::current_dir().context("finding launch directory")?,
+        &settings.store_path,
         settings.permission == config::Permission::ReadWrite,
     )?;
     let read_runtime = read::Runtime::new(
         &std::env::current_dir().context("finding launch directory")?,
+        &settings.store_path,
         settings.permission != config::Permission::None,
     )?;
     let grep_runtime = grep::Runtime::new(
         &std::env::current_dir().context("finding launch directory")?,
+        &settings.store_path,
         settings.permission != config::Permission::None,
     )?;
     let list_runtime = list::Runtime::new(
         &std::env::current_dir().context("finding launch directory")?,
+        &settings.store_path,
         settings.permission != config::Permission::None,
     )?;
     let mut tui = Tui::enter()?;
     let textarea = input::new_textarea(&settings.theme);
     let http = reqwest::Client::new();
     let token_counts = token_count::Counter::new(http.clone(), settings.endpoint.clone());
+    // The root is a pure delegator (`rlm`, `FYI`) with no mounts; only branches at
+    // depth 2 and deeper get the library.
+    let root = Agent::new(session, &settings, None);
     let mut app = App {
-        settings,
-        runtime,
-        patch_runtime,
-        read_runtime,
-        grep_runtime,
-        list_runtime,
+        resources: Resources {
+            settings,
+            http,
+            runtime,
+            patch_runtime,
+            read_runtime,
+            grep_runtime,
+            list_runtime,
+        },
         failures,
-        session,
-        http,
+        frames: vec![Frame {
+            agent: root,
+            notes: Vec::new(),
+        }],
+        library: None,
         token_counts,
         textarea,
         view: View::default(),
-        notes: Vec::new(),
-        turn: None,
         notice: None,
-        context_tokens: None,
-        prompt_tokens: None,
         signaled: false,
         completion: 0,
         completion_dismissed: None,
-        file_completions: Vec::new(),
-        file_completion_context: None,
-        repo: std::env::current_dir().context("finding launch directory")?,
-        loading: None,
         message_scroll: usize::MAX,
         follow_messages: false,
         messages_collapsed: false,
         overlay_gesture: false,
     };
     let result = app.run(&mut tui).await;
-    app.runtime.close().await;
+    app.resources.runtime.close().await;
     let exited = tui.exit();
     // After a signal the terminal may be gone, so restoring it can fail harmlessly.
     if !app.signaled {
@@ -129,30 +126,24 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
 }
 
 struct App {
-    settings: Settings,
-    runtime: Runtime,
-    patch_runtime: patch::Runtime,
-    read_runtime: read::Runtime,
-    grep_runtime: grep::Runtime,
-    list_runtime: list::Runtime,
+    /// Lent to each agent call.
+    resources: Resources,
     failures: FailureLog,
-    session: Session,
-    http: reqwest::Client,
+    /// The agent stack: the root at the bottom, then each active branch above its
+    /// parent; the top is the active agent, on screen and receiving input. Agents
+    /// below the top wait in `Phase::Delegating`.
+    frames: Vec<Frame>,
+    /// This tree's library for agents at depth 2 and deeper: opened on first use
+    /// (`library`) and dropped by `/rename`, so the next use opens the renamed
+    /// directory.
+    library: Option<Library>,
+    /// Counts the active agent's session; replaced whenever the top of the stack
+    /// changes (`show_top`).
     token_counts: token_count::Counter,
     textarea: TextArea<'static>,
     view: View,
-    /// Display-only lines (failure counts, errors), never saved in the session.
-    notes: Vec<Note>,
-    turn: Option<Turn>,
     /// UI-only message shown in the status line until the next key press.
     notice: Option<String>,
-    /// Context in use when the last reply finished (prompt + completion), as reported
-    /// by the server. Unknown until a reply reports usage; stopped or failed replies
-    /// report none, so the previous value stays.
-    context_tokens: Option<u64>,
-    /// Prompt tokens of the last reply, sent to the model as the next turn's FYI
-    /// snapshot. Lags one turn behind; the first turn has no measurement yet.
-    prompt_tokens: Option<u64>,
     /// Exiting because of a signal: the terminal may be gone, so a failure to
     /// restore it is ignored.
     signaled: bool,
@@ -162,13 +153,6 @@ struct App {
     /// Input text for which Esc closed the completion list; it stays closed until
     /// the input changes.
     completion_dismissed: Option<String>,
-    /// Directory-derived candidates refresh on editor changes, never during transcript redraws.
-    file_completions: Vec<String>,
-    file_completion_context: Option<(usize, String)>,
-    /// User paths resolve from launch, independently of the sandbox's working directory.
-    repo: PathBuf,
-    /// No session changes occur until every explicit attachment has loaded successfully.
-    loading: Option<PendingInjection>,
     /// First visible display position, held while idle or after manual scrolling.
     message_scroll: usize,
     /// Follow appended positions only until the user scrolls during this turn.
@@ -179,147 +163,12 @@ struct App {
     overlay_gesture: bool,
 }
 
-/// Owns one local attachment batch; dropping it prevents late reads from changing history.
-struct PendingInjection {
-    text: String,
-    task: JoinHandle<anyhow::Result<Vec<PreparedInjection>>>,
-    canceled: Arc<AtomicBool>,
-}
-
-impl PendingInjection {
-    /// Keep potentially large file reads off the event loop without granting model access.
-    fn start(text: String, paths: Vec<String>, root: PathBuf) -> Self {
-        let canceled = Arc::new(AtomicBool::new(false));
-        let signal = canceled.clone();
-        let task = tokio::task::spawn_blocking(move || injection::load(paths, root, signal));
-        Self {
-            text,
-            task,
-            canceled,
-        }
-    }
-}
-
-impl Drop for PendingInjection {
-    /// Blocking reads cooperate between chunks; cancellation never commits a late result.
-    fn drop(&mut self) {
-        self.canceled.store(true, Ordering::Relaxed);
-        self.task.abort();
-    }
-}
-
-struct Turn {
-    phase: Phase,
-    /// Tool calls from the last response not yet handled, in order.
-    queue: VecDeque<ToolCall>,
-    /// Started by the turn's first call; dropping it aborts execution and its worker.
-    repl: Option<Repl>,
-}
-
-enum Phase {
-    /// Between steps: `advance` handles the next queued call, or sends the next
-    /// request once the queue is empty.
-    Idle,
-    Streaming(Reply),
-    /// Arguments validated; `advance` runs it.
-    Ready(PendingCall),
-    /// Direct Rust editing owns its worker until every committed change is reported.
-    Patching {
-        call: ToolCall,
-        job: patch::Job,
-    },
-    /// Reads run independently of the REPL and use the same ordered tool queue.
-    Reading {
-        call: ToolCall,
-        job: read::Job,
-    },
-    /// Grep owns a confined read worker until completion or cancellation.
-    Searching {
-        call: ToolCall,
-        job: grep::Job,
-    },
-    /// Metadata listings share the ordered file-tool lifecycle without opening file contents.
-    Listing {
-        call: ToolCall,
-        job: list::Job,
-    },
-    Running {
-        call: PendingCall,
-        output: String,
-        prompt: Option<PendingPrompt>,
-    },
-    /// Keep cleanup cancelable and the UI responsive while returning the worker.
-    Finishing(JoinHandle<anyhow::Result<()>>),
-}
-
-struct PendingPrompt {
-    operation: String,
-    answer: oneshot::Sender<bool>,
-    description: Option<ApprovalDescription>,
-}
-
-impl PendingPrompt {
-    /// Cancel explanation work before allowing the suspended host operation to resume.
-    fn respond(self, allow: bool) -> anyhow::Result<()> {
-        drop(self.description);
-        self.answer
-            .send(allow)
-            .map_err(|_| anyhow::anyhow!("couldn't answer approval: the REPL stopped waiting"))
-    }
-}
-
-/// Owned by one approval, so resolving or abandoning it cannot update a later prompt.
-struct ApprovalDescription {
-    task: Option<JoinHandle<anyhow::Result<String>>>,
-    text: String,
-}
-
-impl ApprovalDescription {
-    /// Begin independently of the REPL driver; the approval answer stays immediately usable.
-    fn start(
-        http: reqwest::Client,
-        settings: config::ApprovalDescriptionSettings,
-        input: String,
-    ) -> Self {
-        Self {
-            task: Some(tokio::spawn(async move {
-                client::describe_approval(&http, &settings, &input).await
-            })),
-            text: "Generating description…".into(),
-        }
-    }
-
-    /// Consume the completed request once; errors stay visible without blocking approval.
-    fn complete(&mut self, result: anyhow::Result<String>) {
-        self.task = None;
-        self.text = match result {
-            Ok(text) => format!("Description: {text}"),
-            Err(error) => format!("Description unavailable: {error:#}"),
-        };
-    }
-}
-
-impl Drop for ApprovalDescription {
-    /// Dropping a JoinHandle alone detaches its task, so explicitly cancel pending HTTP work.
-    fn drop(&mut self) {
-        if let Some(task) = &self.task {
-            task.abort();
-        }
-    }
-}
-
-struct PendingCall {
-    call: ToolCall,
-    code: String,
-}
-
-/// A response in progress. Everything received so far.
-struct Reply {
-    task: JoinHandle<()>,
-    events: UnboundedReceiver<StreamEvent>,
-    /// The message assembled from the deltas so far (`client::accumulate`), every
-    /// field as the endpoint sent it.
-    fields: Map<String, Value>,
+/// One agent on the stack and the notes shown with its transcript. Notes anchor to its
+/// messages, so they are drawn only while it is on screen and end with it.
+struct Frame {
+    agent: Agent,
+    /// Display-only lines (failure counts, errors, `/tools`), never saved in the session.
+    notes: Vec<Note>,
 }
 
 /// Display-only transcript output, never saved or sent to the model.
@@ -344,7 +193,6 @@ enum Step {
     Signal,
     Input(Option<io::Result<Event>>),
     Turn(TurnEvent),
-    Injected(anyhow::Result<Vec<PreparedInjection>>),
     Tokens(Option<(String, crate::session::TurnTokenCache)>),
 }
 
@@ -360,17 +208,6 @@ enum WheelTarget {
 struct WheelInput {
     target: WheelTarget,
     delta: isize,
-}
-
-enum TurnEvent {
-    Stream(StreamEvent),
-    Finished(anyhow::Result<()>),
-    Repl(anyhow::Result<ReplEvent>),
-    Patch(String),
-    Read(String),
-    Grep(String),
-    List(String),
-    Description(anyhow::Result<String>),
 }
 
 enum Flow {
@@ -438,8 +275,279 @@ impl App {
         let result = self.run_loop(tui).await;
         // Exiting mid-turn, including on an error or a signal, keeps the partial
         // reply and records results for its tool calls.
-        let stopped = self.stop_turn(None);
+        let stopped = self.stop();
         result.and(stopped)
+    }
+
+    /// The frame on top of the stack: the active agent and its notes.
+    fn top(&self) -> &Frame {
+        self.frames.last().expect(ROOT_HELD)
+    }
+
+    /// The top frame, for changing the active agent or its notes.
+    fn top_mut(&mut self) -> &mut Frame {
+        self.frames.last_mut().expect(ROOT_HELD)
+    }
+
+    /// The active agent: the top of the stack, on screen and receiving input.
+    fn agent(&self) -> &Agent {
+        &self.top().agent
+    }
+
+    /// The active agent, for operations the App performs on it directly.
+    fn agent_mut(&mut self) -> &mut Agent {
+        &mut self.top_mut().agent
+    }
+
+    /// The active agent together with the shared resources its calls receive.
+    fn active(&mut self) -> (&mut Agent, &Resources) {
+        (
+            &mut self.frames.last_mut().expect(ROOT_HELD).agent,
+            &self.resources,
+        )
+    }
+
+    /// Whether a branch is running above the root.
+    fn delegating(&self) -> bool {
+        self.frames.len() > 1
+    }
+
+    /// This tree's library, `library/` of the root's tree, opened on first use; a clone
+    /// goes to each agent created at depth 2 and deeper, for its `/library` mount and
+    /// its direct tools' `root = "library"`.
+    fn library(&mut self) -> anyhow::Result<Library> {
+        if let Some(library) = &self.library {
+            return Ok(library.clone());
+        }
+        let root = &self.frames.first().expect(ROOT_HELD).agent;
+        let library = Library::open(&root.session().library_dir())?;
+        self.library = Some(library.clone());
+        Ok(library)
+    }
+
+    /// Esc, `/exit`, and app exit: stop every agent from the top of the stack down.
+    /// The deepest agent records its stop as any stopped turn does; its partial
+    /// response (or its complete final response, when stopped after that streamed;
+    /// `partial_content`) followed by `[stopped by user]` on its own line becomes its
+    /// parent's `rlm` result and passes up unchanged as each ancestor's. Each agent's
+    /// calls that never ran get `[not run: turn stopped]` (`stop_turn`). A failed save
+    /// doesn't stop the rest; the first error is returned.
+    fn stop(&mut self) -> anyhow::Result<()> {
+        let mut first_error: Option<anyhow::Error> = None;
+        let mut answer: Option<String> = None;
+        loop {
+            let (agent, resources) = self.active();
+            let mut results = Vec::new();
+            if let Some(answer) = &answer {
+                results.push(agent.finish_delegation(resources, answer.clone()));
+            }
+            let partial = agent.partial_content();
+            results.push(agent.stop_turn(resources));
+            for result in results {
+                if let Err(error) = result {
+                    first_error.get_or_insert(error);
+                }
+            }
+            if !self.delegating() {
+                break;
+            }
+            // Only the deepest agent's text is taken; ancestors pass it up unchanged.
+            answer.get_or_insert_with(|| append_line(partial, STOPPED));
+            self.frames.pop();
+        }
+        if answer.is_some()
+            && let Err(error) = self.show_top()
+        {
+            first_error.get_or_insert(error);
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// The display follows the agent now on top of the stack: its transcript from the
+    /// bottom with no selection (the previous agent's blocks share keys with this
+    /// one's), the overlay at its newest positions, and token counts of its own session.
+    fn show_top(&mut self) -> anyhow::Result<()> {
+        self.view.scroll_to_bottom();
+        self.view.clear_selection();
+        self.message_scroll = usize::MAX;
+        self.follow_messages = true;
+        self.token_counts = token_count::Counter::new(
+            self.resources.http.clone(),
+            self.resources.settings.endpoint.clone(),
+        );
+        // Counted now rather than at the next frame, so an FYI the agent reports
+        // before then sums its own turns.
+        self.count_tokens()
+    }
+
+    /// Reconcile the token counter with the active agent's session. Only completed
+    /// turns are tokenized, so a branch, whose one turn is active while it is on
+    /// screen, gets no token cache.
+    fn count_tokens(&mut self) -> anyhow::Result<()> {
+        let agent = &mut self.frames.last_mut().expect(ROOT_HELD).agent;
+        let active_user = agent
+            .turn()
+            .and_then(|_| agent.session().turns.len().checked_sub(1));
+        self.token_counts.refresh(agent.session_mut(), active_user)
+    }
+
+    /// Move the active agent forward until the agent on top waits on something, acting
+    /// on what it reports: a branch it starts becomes the active agent, and a branch
+    /// whose turn ended answers its parent, whose advance then continues.
+    async fn advance(&mut self) -> anyhow::Result<()> {
+        loop {
+            if self.delegating()
+                && let Some(answer) = self.agent().answer()
+            {
+                let answer = answer.to_owned();
+                self.end_branch(answer)?;
+                continue;
+            }
+            // Taken before advancing: advancing changes neither the agent's reported
+            // usage nor the overlay counts, so a call it runs gets the same value.
+            let prompt_tokens = self.prompt_token_total();
+            let (agent, resources) = self.active();
+            match agent.advance(resources, prompt_tokens).await {
+                Ok(Outcome::None) => return Ok(()),
+                Ok(outcome) => self.act(outcome)?,
+                Err(error) => self.agent_failed(error)?,
+            }
+        }
+    }
+
+    /// Create the branch for the active agent's accepted `rlm` call `call_id`, push it,
+    /// and open its turn with the synthetic `FYI()` queued. A branch whose session can't
+    /// be created has no turn to end, so the parent gets `[branch failed: <error>]` as
+    /// its result directly; a failure opening the turn fails the pushed branch like any
+    /// other branch error (`fail_branch`).
+    fn start_branch(&mut self, call_id: &str, task: String) -> anyhow::Result<()> {
+        let agent = match self.create_branch(call_id, task) {
+            Ok(agent) => agent,
+            Err(error) => {
+                let answer = format!("[branch failed: {error:#}]");
+                let (agent, resources) = self.active();
+                return match agent.finish_delegation(resources, answer) {
+                    Ok(()) => Ok(()),
+                    Err(error) => self.agent_failed(error),
+                };
+            }
+        };
+        self.frames.push(Frame {
+            agent,
+            notes: Vec::new(),
+        });
+        // A new session has nothing for the turn-start cleanup to remove. The display
+        // switches only once the turn is open: a branch session without an active turn
+        // would be tokenized, and branch files get no token cache.
+        if let Err(error) = self.agent_mut().start_turn() {
+            return self.agent_failed(error);
+        }
+        self.show_top()
+    }
+
+    /// A new idle branch one depth below the active agent: its session file in the
+    /// tree, saved with `task` as the user message. At depth 2 and deeper it gets the
+    /// tree's library.
+    fn create_branch(&mut self, call_id: &str, task: String) -> anyhow::Result<Agent> {
+        let mut session = self.agent().session().branch(call_id)?;
+        let library = if session.depth() >= 2 {
+            Some(self.library()?)
+        } else {
+            None
+        };
+        session.submit(task)?;
+        Ok(Agent::new(session, &self.resources.settings, library))
+    }
+
+    /// Pop the branch on top and record `answer` as its parent's `rlm` result; the
+    /// display returns to the parent. The answer is recorded first, so no later error
+    /// can leave the call unanswered. An error recording it is the parent's own.
+    fn end_branch(&mut self, answer: String) -> anyhow::Result<()> {
+        self.frames.pop();
+        let (agent, resources) = self.active();
+        if let Err(error) = agent.finish_delegation(resources, answer) {
+            return self.agent_failed(error);
+        }
+        self.show_top()
+    }
+
+    /// An error from the active agent's own step. The root's error ends the App, as it
+    /// always has; a branch fails instead.
+    fn agent_failed(&mut self, error: anyhow::Error) -> anyhow::Result<()> {
+        if !self.delegating() {
+            return Err(error);
+        }
+        self.fail_branch(&format!("{error:#}"))
+    }
+
+    /// The branch on top failed: its turn ends the way a stream error ends one (the
+    /// partial reply saved, calls that never ran answered, the error kept out of its
+    /// file), and its parent's result is the text streamed so far in the failed
+    /// response (or the complete final response, when the failure came after it
+    /// streamed; `partial_content`) followed by `[branch failed: <error>]` on its own
+    /// line.
+    fn fail_branch(&mut self, error: &str) -> anyhow::Result<()> {
+        let (agent, resources) = self.active();
+        // Taken before `stop_turn`, which discards it.
+        let partial = agent.partial_content();
+        let stopped = agent.stop_turn(resources);
+        let answer = append_line(partial, &format!("[branch failed: {error}]"));
+        let Err(save_error) = stopped else {
+            return self.end_branch(answer);
+        };
+        // A save error while ending the turn is not discarded: it ends the App, as it
+        // does when a stream error ends the root's turn. The parent still gets this
+        // branch's failure as its result first (the branch failed; the user did not
+        // stop it); the exit's stop path (`stop`) then records the remaining
+        // ancestors' results. As in `stop`, the first error is the one returned: a
+        // failed save recording the parent's result leaves the message in its session
+        // for the next save.
+        self.frames.pop();
+        let (parent, resources) = self.active();
+        let _ = parent.finish_delegation(resources, answer);
+        Err(save_error)
+    }
+
+    /// Act on what the active agent reported. A failure is persisted under the
+    /// agent's session name (the tree name for the root, the call ID for a branch)
+    /// before its count is shown; a failed append must not claim a durable occurrence.
+    fn act(&mut self, outcome: Outcome) -> anyhow::Result<()> {
+        match outcome {
+            Outcome::None => {}
+            Outcome::StartBranch { call_id, task } => return self.start_branch(&call_id, task),
+            Outcome::Failure(failure) => {
+                let agent = &self.frames.last().expect(ROOT_HELD).agent;
+                let count = self.failures.record(
+                    agent.session().name(),
+                    failure.kind,
+                    &failure.message,
+                    &failure.code,
+                )?;
+                let first_line = failure.message.lines().next().unwrap_or("");
+                self.note(
+                    Anchor::Call(failure.call_id),
+                    format!("{}: {first_line} (seen {count} times)", failure.kind),
+                    self.resources.settings.theme.warning,
+                );
+            }
+            Outcome::StreamError(error) => {
+                if self.delegating() {
+                    return self.fail_branch(&error);
+                }
+                let (agent, resources) = self.active();
+                agent.stop_turn(resources)?;
+                let end = Anchor::After(self.agent().session().message_count());
+                self.note(
+                    end,
+                    format!("error: {error}"),
+                    self.resources.settings.theme.error,
+                );
+            }
+        }
+        Ok(())
     }
 
     async fn run_loop(&mut self, tui: &mut Tui) -> anyhow::Result<()> {
@@ -453,30 +561,28 @@ impl App {
         let mut interrupt = signal(SignalKind::interrupt())?;
 
         loop {
-            // Preserve the existing fail-fast check for marked attachment pairs.
-            self.session.validate_injections()?;
-            let active_user = self
-                .turn
-                .as_ref()
-                .and_then(|_| self.session.turns.len().checked_sub(1));
-            self.token_counts.refresh(&mut self.session, active_user)?;
-            let messages = message_overlay_entries(&self.session.turns, self.token_counts.turns())?;
-            let transcript_messages: Vec<_> = self.session.messages().collect();
+            self.count_tokens()?;
+            // Field borrows below, not `top()`, so drawing can borrow other fields
+            // mutably alongside the active agent.
+            let frame = self.frames.last().expect(ROOT_HELD);
+            let agent = &frame.agent;
+            let messages =
+                message_overlay_entries(&agent.session().turns, self.token_counts.turns())?;
+            let transcript_messages: Vec<_> = agent.session().messages().collect();
             let footer = self.footer();
             let blocks = build_blocks(
-                self.settings.chat_prompt.as_deref(),
+                self.resources.settings.chat_prompt.as_deref(),
                 &transcript_messages,
-                &self.notes,
-                self.turn.as_ref(),
-                self.settings.tool_reasoning,
-                &self.settings.theme,
+                &frame.notes,
+                agent.turn(),
+                &self.resources.settings.theme,
             );
             tui.draw(
                 &blocks,
                 &mut self.view,
                 &self.textarea,
                 &footer,
-                &self.settings.theme,
+                &self.resources.settings.theme,
                 MessageOverlay {
                     entries: &messages,
                     scroll: if self.follow_messages {
@@ -492,7 +598,7 @@ impl App {
                 self.message_scroll = tui.message_scroll();
             }
             // Capture the last followed position when a turn ends; idle changes keep it.
-            if self.turn.is_none() {
+            if self.agent().turn().is_none() {
                 self.follow_messages = false;
             }
             // Biased toward input so keys (Esc above all) are handled before more
@@ -506,18 +612,19 @@ impl App {
                     _ = terminate.recv() => Step::Signal,
                     _ = interrupt.recv() => Step::Signal,
                     event = input.recv() => Step::Input(event),
-                    event = next_turn_event(&mut self.turn) => Step::Turn(event),
-                    result = next_injection(&mut self.loading) => Step::Injected(result),
+                    event = self.frames.last_mut().expect(ROOT_HELD).agent.next_turn_event() => {
+                        Step::Turn(event)
+                    }
                     result = self.token_counts.next() => Step::Tokens(result),
                 }
             };
             match step {
                 Step::Tokens(Some((digest, cache))) => {
+                    let agent = &mut self.frames.last_mut().expect(ROOT_HELD).agent;
                     self.token_counts
-                        .finish(&mut self.session, &digest, cache)?;
+                        .finish(agent.session_mut(), &digest, cache)?;
                 }
                 Step::Tokens(None) => {}
-                Step::Injected(result) => self.finish_injection(result)?,
                 Step::Signal => {
                     self.signaled = true;
                     return Ok(());
@@ -536,44 +643,11 @@ impl App {
                         return Ok(());
                     }
                 }
-                Step::Turn(TurnEvent::Stream(event)) => self.on_stream(event)?,
-                Step::Turn(TurnEvent::Finished(result)) => {
-                    self.turn = None;
-                    result.context("ending REPL session")?;
-                }
-                Step::Turn(TurnEvent::Repl(event)) => self.on_repl(event)?,
-                Step::Turn(TurnEvent::Patch(result)) => {
-                    if let Some(turn) = self.turn.as_mut()
-                        && let Phase::Patching { call, .. } =
-                            std::mem::replace(&mut turn.phase, Phase::Idle)
-                    {
-                        self.record_result(&call, result)?;
-                    }
-                }
-                Step::Turn(
-                    TurnEvent::Read(result) | TurnEvent::Grep(result) | TurnEvent::List(result),
-                ) => {
-                    if let Some(turn) = self.turn.as_mut()
-                        && let Phase::Reading { call, .. }
-                        | Phase::Searching { call, .. }
-                        | Phase::Listing { call, .. } =
-                            std::mem::replace(&mut turn.phase, Phase::Idle)
-                    {
-                        self.record_result(&call, result)?;
-                    }
-                }
-                Step::Turn(TurnEvent::Description(result)) => {
-                    if let Some(Turn {
-                        phase:
-                            Phase::Running {
-                                prompt: Some(prompt),
-                                ..
-                            },
-                        ..
-                    }) = &mut self.turn
-                        && let Some(description) = &mut prompt.description
-                    {
-                        description.complete(result);
+                Step::Turn(event) => {
+                    let (agent, resources) = self.active();
+                    match agent.on_event(resources, event) {
+                        Ok(outcome) => self.act(outcome)?,
+                        Err(error) => self.agent_failed(error)?,
                     }
                 }
             }
@@ -581,460 +655,15 @@ impl App {
         }
     }
 
-    /// Move the turn forward until it waits on something: the stream, the
-    /// user, the REPL, or worker cleanup.
-    async fn advance(&mut self) -> anyhow::Result<()> {
-        loop {
-            let Some(turn) = self.turn.as_mut() else {
-                return Ok(());
-            };
-            match std::mem::replace(&mut turn.phase, Phase::Idle) {
-                Phase::Idle => match turn.queue.pop_front() {
-                    Some(call) => self.begin_call(call)?,
-                    None => {
-                        self.start_request();
-                        return Ok(());
-                    }
-                },
-                Phase::Ready(call) => self.run_call(call).await?,
-                waiting => {
-                    turn.phase = waiting;
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    /// Build each request from current settings and the authoritative session messages.
-    fn start_request(&mut self) {
-        let messages = self.session.visible_messages();
-        let (task, events) = client::start(
-            &self.http,
-            &self.settings.endpoint,
-            self.settings.chat_prompt.as_deref(),
-            &self.settings.repl_tool_description,
-            tool_reasoning::request_messages(&messages, self.settings.tool_reasoning),
-        );
-        if let Some(turn) = self.turn.as_mut() {
-            turn.phase = Phase::Streaming(Reply {
-                task,
-                events,
-                fields: Map::new(),
-            });
-        }
-    }
-
-    fn on_stream(&mut self, event: StreamEvent) -> anyhow::Result<()> {
-        let Some(Turn {
-            phase: Phase::Streaming(reply),
-            ..
-        }) = &mut self.turn
-        else {
-            return Ok(());
-        };
-        // Take the events already queued too, so a fast stream costs one frame per
-        // batch rather than one per delta.
-        let mut event = Some(event);
-        while let Some(current) = event.take() {
-            match current {
-                StreamEvent::Delta(delta) => accumulate_reply(&mut reply.fields, delta)?,
-                StreamEvent::Usage { total, prompt } => {
-                    self.context_tokens = Some(total);
-                    if let Some(prompt) = prompt {
-                        self.prompt_tokens = Some(prompt);
-                    }
-                }
-                StreamEvent::Done { truncated } => return self.end_stream(truncated),
-                StreamEvent::Error(error) => return self.stop_turn(Some(error)),
-            }
-            event = reply.events.try_recv().ok();
-        }
-        Ok(())
-    }
-
-    /// The response finished: queue its tool calls, or end the turn. A response cut
-    /// off at the token limit is treated as interrupted.
-    fn end_stream(&mut self, truncated: bool) -> anyhow::Result<()> {
-        let Some(turn) = self.turn.as_mut() else {
-            return Ok(());
-        };
-        let Phase::Streaming(reply) = std::mem::replace(&mut turn.phase, Phase::Idle) else {
-            return Ok(());
-        };
-        let (calls, saved) = self.save_reply(reply, truncated);
-        // Queue the calls before anything can fail, so an error exit still records a
-        // result for each of them.
-        if calls.is_empty() {
-            // Keep ownership in turn state until reset finishes, so Esc and exit
-            // can abort the task and drop its REPL instead of detaching cleanup.
-            if let Some(repl) = self.turn.as_mut().and_then(|turn| turn.repl.take()) {
-                self.set_phase(Phase::Finishing(tokio::spawn(repl.finish())));
-            } else {
-                self.turn = None;
-            }
-        } else if let Some(turn) = self.turn.as_mut() {
-            turn.queue = calls.into();
-        }
-        saved
-    }
-
-    /// Save the response as an assistant message. Returns its complete tool calls and
-    /// the save result (the message is in the session either way; a failed save is
-    /// retried by the next one). Provider call IDs are replaced before saving;
-    /// other endpoint fields are retained. A call without an id or name is dropped, and when
-    /// `interrupted`, so is a call whose arguments aren't valid JSON: it was still
-    /// streaming and never ran, so nothing it did needs recording.
-    fn save_reply(
-        &mut self,
-        reply: Reply,
-        interrupted: bool,
-    ) -> (Vec<ToolCall>, anyhow::Result<()>) {
-        reply.task.abort();
-        let mut fields = reply.fields;
-        // The role is known, and `content` and `tool_calls` have typed homes; the rest
-        // stays as streamed.
-        fields.remove("role");
-        let content = match fields.remove("content") {
-            Some(Value::String(content)) => content,
-            _ => String::new(),
-        };
-        let calls: Vec<ToolCall> = match fields.remove("tool_calls") {
-            Some(Value::Array(calls)) => calls,
-            _ => Vec::new(),
-        }
-        .into_iter()
-        .filter_map(|mut call| {
-            // `index` only orders fragments within the stream.
-            call.as_object_mut()?.remove("index");
-            let call: ToolCall = serde_json::from_value(call).ok()?;
-            if interrupted && serde_json::from_str::<Value>(&call.function.arguments).is_err() {
-                return None;
-            }
-            Some(call)
-        })
-        .collect();
-        let message = Message {
-            role: Role::Assistant,
-            content,
-            tool_calls: (!calls.is_empty()).then(|| calls.clone()),
-            extra: fields,
-            ..Default::default()
-        };
-        let saved = if message.is_empty() {
-            Ok(())
-        } else {
-            self.session.push(message)
-        };
-        (calls, saved)
-    }
-
-    /// Validate and queue a call. Calls that can't run
-    /// get their result recorded here, leaving the turn `Idle`.
-    ///
-    /// Ordering rule (here and in every handler below): a call's result is recorded,
-    /// or the call is placed back in turn state, before anything that can fail, so an
-    /// error exit still leaves a result for every call.
-    fn begin_call(&mut self, call: ToolCall) -> anyhow::Result<()> {
-        if call.function.name == "list" {
-            return match serde_json::from_str::<list::Arguments>(&call.function.arguments) {
-                Ok(args) => {
-                    let job = self.list_runtime.start(args);
-                    self.set_phase(Phase::Listing { call, job });
-                    Ok(())
-                }
-                Err(error) => self.record_result(&call, format!("Invalid list arguments: {error}")),
-            };
-        }
-        if call.function.name == "grep" {
-            return match serde_json::from_str::<grep::Arguments>(&call.function.arguments) {
-                Ok(args) => {
-                    let job = self.grep_runtime.start(args);
-                    self.set_phase(Phase::Searching { call, job });
-                    Ok(())
-                }
-                Err(error) => self.record_result(&call, format!("Invalid grep arguments: {error}")),
-            };
-        }
-        if call.function.name == "read_file" {
-            let args = match serde_json::from_str::<read::Arguments>(&call.function.arguments) {
-                Ok(args) => args,
-                Err(error) => {
-                    return self
-                        .record_result(&call, format!("Invalid read_file arguments: {error}"));
-                }
-            };
-            let job = self.read_runtime.start(args);
-            self.set_phase(Phase::Reading { call, job });
-            return Ok(());
-        }
-        if call.function.name == "apply_patch" {
-            let text = match patch_of(&call) {
-                Ok(text) => text,
-                Err(error) => return self.record_result(&call, error),
-            };
-            return match self.patch_runtime.start(text) {
-                Ok(job) => {
-                    self.set_phase(Phase::Patching { call, job });
-                    Ok(())
-                }
-                Err(error) => self.record_result(&call, format!("Not applied: {error}")),
-            };
-        }
-        let code = match code_of(&call) {
-            Ok(code) => code,
-            Err(error) => return self.record_result(&call, error),
-        };
-        // `reasoning()` is a no-op the model is meant to call freely, so the call is
-        // answered here without approval and without running: in the REPL, `reasoning`
-        // is whatever the turn's earlier code bound it to, which could be anything.
-        // Kept out of `is_exempt`, which also selects the calls the per-turn cleanup
-        // removes.
-        if tool_reasoning::is_reasoning_call(&code) {
-            return self.record_result(&call, tool_reasoning::RESULT.to_string());
-        }
-        // Host operations enforce permissions individually. A synthetic call never
-        // grants approval to unrelated code bundled alongside it or in arguments.
-        self.set_phase(Phase::Ready(PendingCall { call, code }));
-        Ok(())
-    }
-
-    /// Replace only the active phase, preserving queued calls and REPL ownership.
-    fn set_phase(&mut self, phase: Phase) {
-        if let Some(turn) = self.turn.as_mut() {
-            turn.phase = phase;
-        }
-    }
-
-    /// Attach a display-only note without changing the messages sent to the model.
+    /// Attach a display-only note to the active agent's transcript without changing the
+    /// messages sent to the model.
     fn note(&mut self, anchor: Anchor, text: String, style: Style) {
-        self.notes.push(Note {
+        self.top_mut().notes.push(Note {
             anchor,
             heading: None,
             text,
             style,
         });
-    }
-
-    /// Answer only the suspended host operation; the driver produces any denial result.
-    fn approve(&mut self, allow: bool) -> anyhow::Result<()> {
-        let Some(turn) = self.turn.as_mut() else {
-            return Ok(());
-        };
-        let Phase::Running { prompt, .. } = &mut turn.phase else {
-            return Ok(());
-        };
-        if let Some(prompt) = prompt.take() {
-            prompt.respond(allow)?;
-        }
-        Ok(())
-    }
-
-    /// Lazily start the turn's driver and enqueue code without awaiting execution.
-    async fn run_call(&mut self, call: PendingCall) -> anyhow::Result<()> {
-        let prompt_tokens = self.prompt_token_total();
-        let Some(turn) = self.turn.as_mut() else {
-            return Ok(());
-        };
-        if turn.repl.is_none() {
-            turn.repl = Some(self.runtime.start());
-        }
-        let repl = turn.repl.as_mut().expect("started above");
-        // Sending only queues a message; library loading and prompts happen on the
-        // driver task after this call is restored to turn state.
-        if let Err(error) = repl.send(&call.code, prompt_tokens).await {
-            // Dropping the REPL kills it; the next call starts a fresh one.
-            turn.repl = None;
-            return self.record_result(&call.call, format!(
-                "[REPL driver failed: {error:#}. This code was not run. REPL state was lost; the next call starts a fresh session and reloads the library.]"
-            ));
-        }
-        turn.phase = Phase::Running {
-            call,
-            output: String::new(),
-            prompt: None,
-        };
-        Ok(())
-    }
-
-    /// Keep results, host prompts, and persistent failure facts attached to the active call.
-    fn on_repl(&mut self, event: anyhow::Result<ReplEvent>) -> anyhow::Result<()> {
-        let Some(turn) = self.turn.as_mut() else {
-            return Ok(());
-        };
-        let Phase::Running {
-            call,
-            output,
-            prompt,
-        } = &mut turn.phase
-        else {
-            return Ok(());
-        };
-        let (value, error) = match event {
-            Ok(ReplEvent::Output(text)) => {
-                output.push_str(&text);
-                return Ok(());
-            }
-            Ok(ReplEvent::Prompt {
-                operation,
-                description_input,
-                answer,
-            }) => {
-                anyhow::ensure!(prompt.is_none(), "REPL requested overlapping approvals");
-                let description = self.settings.approval_description.as_ref().map(|settings| {
-                    ApprovalDescription::start(
-                        self.http.clone(),
-                        settings.clone(),
-                        description_input,
-                    )
-                });
-                *prompt = Some(PendingPrompt {
-                    operation,
-                    answer,
-                    description,
-                });
-                return Ok(());
-            }
-            Ok(ReplEvent::Failure {
-                kind,
-                message,
-                code,
-            }) => {
-                let anchor = Anchor::Call(call.call.id.clone());
-                let session = self
-                    .session
-                    .path
-                    .file_stem()
-                    .and_then(|name| name.to_str())
-                    .context("session path has no UTF-8 session name")?;
-                // Persist before displaying the count; a failed append must not
-                // claim a durable occurrence or lose ownership of the running call.
-                let count = self.failures.record(session, kind, &message, &code)?;
-                let first_line = message.lines().next().unwrap_or("");
-                self.note(
-                    anchor,
-                    format!("{kind}: {first_line} (seen {count} times)"),
-                    self.settings.theme.warning,
-                );
-                return Ok(());
-            }
-            Ok(ReplEvent::Done { value, error }) => (value, error),
-            // Worker failures are reported by the driver. Closure here means the
-            // driver itself failed, so discard it and make the state loss explicit.
-            Err(error) => {
-                turn.repl = None;
-                (
-                    None,
-                    Some(format!(
-                        "[REPL driver failed: {error:#}. REPL state was lost; the next call starts a fresh session and reloads the library.]"
-                    )),
-                )
-            }
-        };
-        let Phase::Running {
-            call, mut output, ..
-        } = std::mem::replace(&mut turn.phase, Phase::Idle)
-        else {
-            return Ok(());
-        };
-        let extras: Vec<String> = [value, error].into_iter().flatten().collect();
-        for extra in &extras {
-            if !output.is_empty() && !output.ends_with('\n') {
-                output.push('\n');
-            }
-            output.push_str(extra);
-        }
-        self.record_result(&call.call, output)
-    }
-
-    /// Record a call's result, capped at the output limit.
-    fn record_result(&mut self, call: &ToolCall, result: String) -> anyhow::Result<()> {
-        let result = if result.is_empty() {
-            "(no output)".to_string()
-        } else {
-            truncate(result, self.settings.output_limit)
-        };
-        self.session.push(Message::tool(call.id.clone(), result))
-    }
-
-    /// End the turn now (Esc, `/exit`, a stream error, or app exit). The partial reply
-    /// is kept; running code is killed and its output so far recorded; every other
-    /// complete call gets a `[not run]` result so the session stays valid, shown under
-    /// its call. `error` (a stream error) is shown as a note.
-    fn stop_turn(&mut self, error: Option<String>) -> anyhow::Result<()> {
-        // Pre-submission cancellation preserves the draft and has no session effects.
-        self.loading = None;
-        let Some(mut turn) = self.turn.take() else {
-            return Ok(());
-        };
-        // A failed save doesn't stop the rest: each message is already in the
-        // session, and a later save writes it.
-        let mut first_error: Option<anyhow::Error> = None;
-        let mut check = |result: anyhow::Result<()>| {
-            if let Err(e) = result {
-                first_error.get_or_insert(e);
-            }
-        };
-        let mut not_run = Vec::new();
-        match std::mem::replace(&mut turn.phase, Phase::Idle) {
-            Phase::Idle => {}
-            Phase::Streaming(reply) => {
-                let (calls, saved) = self.save_reply(reply, true);
-                check(saved);
-                not_run = calls;
-            }
-            Phase::Finishing(task) => {
-                task.abort();
-            }
-            Phase::Ready(call) => not_run.push(call.call),
-            Phase::Reading { call, job } => {
-                drop(job);
-                check(self.record_result(&call, STOPPED.into()));
-            }
-            Phase::Searching { call, job } => {
-                drop(job);
-                check(self.record_result(&call, STOPPED.into()));
-            }
-            Phase::Listing { call, job } => {
-                drop(job);
-                check(self.record_result(&call, STOPPED.into()));
-            }
-            Phase::Patching { call, mut job } => {
-                // Join the writer after signaling cancellation: never save "stopped"
-                // while a detached task could still mutate files or lose its receipt.
-                check(self.record_result(&call, job.stop()));
-            }
-            Phase::Running {
-                call,
-                mut output,
-                prompt,
-            } => {
-                if let Some(repl) = turn.repl.as_mut() {
-                    repl.kill();
-                }
-                // Cancel execution before dropping the answer sender; otherwise
-                // sandbox code could catch a canceled prompt and run more code.
-                drop(prompt);
-                if !output.is_empty() && !output.ends_with('\n') {
-                    output.push('\n');
-                }
-                output.push_str(STOPPED);
-                check(self.record_result(&call.call, output));
-            }
-        }
-        not_run.extend(turn.queue.drain(..));
-        for call in &not_run {
-            check(self.record_result(call, NOT_RUN.to_string()));
-        }
-        drop(turn); // Kills the REPL, if any.
-
-        if let Some(error) = error {
-            let end = Anchor::After(self.session.message_count());
-            self.note(end, format!("error: {error}"), self.settings.theme.error);
-        }
-        match first_error {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
     }
 
     /// Route terminal events, restricting input while a host operation awaits approval.
@@ -1058,19 +687,16 @@ impl App {
                     self.view.page(direction);
                     return Ok(Flow::Continue);
                 }
-                // Attachment loading holds the draft until all reads finish.
-                if self.loading.is_some() {
-                    if key.code == KeyCode::Esc {
-                        self.stop_turn(None)?;
-                    }
-                    return Ok(Flow::Continue);
-                }
-                // While a call awaits approval, only y/n, Esc, and Shift+Tab act.
-                if self.pending_prompt().is_some() {
+                // While a call awaits approval, only y/n, Esc, and Shift+Tab act. The
+                // prompt is the active agent's, whichever agent that is.
+                if self.agent().pending_prompt().is_some() {
                     match key.code {
-                        KeyCode::Char('y') => self.approve(true)?,
-                        KeyCode::Char('n') => self.approve(false)?,
-                        KeyCode::Esc => self.stop_turn(None)?,
+                        KeyCode::Char(answer @ ('y' | 'n')) => {
+                            if let Err(error) = self.agent_mut().approve(answer == 'y') {
+                                self.agent_failed(error)?;
+                            }
+                        }
+                        KeyCode::Esc => self.stop()?,
                         KeyCode::BackTab => self.cycle_mode(),
                         _ => {}
                     }
@@ -1091,22 +717,15 @@ impl App {
                             return Ok(Flow::Continue);
                         }
                         KeyCode::Tab => {
-                            let completion = &completions[selected];
-                            if completion.command.is_some() {
-                                self.textarea.clear();
-                                self.textarea.insert_str(&completion.spelling);
-                            } else {
-                                // File spellings always begin with the attachment marker.
-                                input::complete_file(&mut self.textarea, &completion.spelling[1..]);
-                            }
+                            self.textarea.clear();
+                            self.textarea.insert_str(completions[selected].spelling);
                             self.input_changed();
                             return Ok(Flow::Continue);
                         }
-                        KeyCode::Enter if completions[selected].command.is_some() => {
+                        KeyCode::Enter => {
                             let completion = &completions[selected];
-                            let command = completion.command.expect("guarded command completion");
-                            if !command.takes_argument {
-                                return self.run_command(command.action, "");
+                            if !completion.command.takes_argument {
+                                return self.run_command(completion.command.action, "");
                             }
                             // Can't run without its argument: complete it, followed by a
                             // space (which closes the list), ready for the argument.
@@ -1123,21 +742,14 @@ impl App {
                         _ => {}
                     }
                 }
-                // No filename match means Tab leaves the literal path untouched.
-                if key.code == KeyCode::Tab && input::file_prefix(&self.textarea).is_some() {
-                    return Ok(Flow::Continue);
-                }
                 let before = self.textarea.lines().to_vec();
-                let before_cursor = self.textarea.cursor();
                 let action = input::handle_key(&mut self.textarea, key);
                 if self.textarea.lines() != before.as_slice() {
                     self.input_changed();
-                } else if self.textarea.cursor() != before_cursor {
-                    self.refresh_file_completions();
                 }
                 match action {
                     InputAction::Submit(text) => return self.submit(text),
-                    InputAction::Stop => self.stop_turn(None)?,
+                    InputAction::Stop => self.stop()?,
                     InputAction::CycleMode => self.cycle_mode(),
                     InputAction::None => {}
                 }
@@ -1165,7 +777,7 @@ impl App {
                 }
                 _ => {}
             },
-            Event::Paste(text) if self.pending_prompt().is_none() && self.loading.is_none() => {
+            Event::Paste(text) if self.agent().pending_prompt().is_none() => {
                 input::paste(&mut self.textarea, &text);
                 self.input_changed();
             }
@@ -1217,23 +829,13 @@ impl App {
                         self.follow_messages = false;
                     } else if let Some(turn_index) = tui.message_turn_at(mouse.column, mouse.row)
                         && can_toggle_turn(
-                            self.turn.is_some(),
+                            self.agent().turn().is_some(),
                             turn_index,
-                            self.session.turns.len(),
+                            self.agent().session().turns.len(),
                         )
+                        && let Err(error) = self.agent_mut().toggle_hidden(turn_index)
                     {
-                        match self.session.toggle_hidden(turn_index) {
-                            Ok(()) => {
-                                invalidate_reported_usage(
-                                    &mut self.context_tokens,
-                                    &mut self.prompt_tokens,
-                                );
-                            }
-                            Err(error) => {
-                                self.notice =
-                                    Some(format!("couldn't change turn visibility: {error:#}"));
-                            }
-                        }
+                        self.notice = Some(format!("couldn't change turn visibility: {error:#}"));
                     }
                 }
                 over
@@ -1252,40 +854,26 @@ impl App {
         }
     }
 
-    /// Expose the single pending prompt to key routing, completion, and status rendering.
-    fn pending_prompt(&self) -> Option<&PendingPrompt> {
-        match &self.turn.as_ref()?.phase {
-            Phase::Running { prompt, .. } => prompt.as_ref(),
-            _ => None,
-        }
-    }
-
     /// Shift+Tab: publish the new permission before persisting it; applies to the next operation.
     fn cycle_mode(&mut self) {
-        let permission = self.settings.permission.next();
-        self.settings.permission = permission;
-        self.runtime.set_permission(permission);
-        self.patch_runtime
+        let resources = &mut self.resources;
+        let permission = resources.settings.permission.next();
+        resources.settings.permission = permission;
+        resources.runtime.set_permission(permission);
+        resources
+            .patch_runtime
             .set_permission(permission == config::Permission::ReadWrite);
-        self.read_runtime
+        resources
+            .read_runtime
             .set_permission(permission != config::Permission::None);
-        self.grep_runtime
+        resources
+            .grep_runtime
             .set_permission(permission != config::Permission::None);
-        self.list_runtime
+        resources
+            .list_runtime
             .set_permission(permission != config::Permission::None);
-        if let Err(error) = config::save_permission(&self.settings.dir, permission) {
+        if let Err(error) = config::save_permission(&resources.settings.dir, permission) {
             self.notice = Some(format!("couldn't save permission: {error:#}"));
-        }
-    }
-
-    /// `/tool-reasoning`: switch tool reasoning and persist it. The transcript
-    /// changes at once and the next request is built accordingly, since both are
-    /// derived from the session.
-    fn toggle_tool_reasoning(&mut self) {
-        let enabled = !self.settings.tool_reasoning;
-        self.settings.tool_reasoning = enabled;
-        if let Err(error) = config::save_tool_reasoning(&self.settings.dir, enabled) {
-            self.notice = Some(format!("couldn't save tool_reasoning: {error:#}"));
         }
     }
 
@@ -1295,26 +883,35 @@ impl App {
     fn run_command(&mut self, action: Action, argument: &str) -> anyhow::Result<Flow> {
         match action {
             Action::Exit => return Ok(Flow::Exit),
-            Action::ToggleToolReasoning => self.toggle_tool_reasoning(),
             Action::ShowTools => {
-                // Local command output belongs to the display, never the saved conversation or model context.
-                for (name, description) in
-                    client::tool_descriptions(&self.settings.repl_tool_description)
-                {
-                    self.notes.push(Note {
-                        anchor: Anchor::After(self.session.message_count()),
+                // Local command output belongs to the display, never the saved conversation
+                // or model context. It lists the tools of the agent on screen.
+                let style = self.resources.settings.theme.status;
+                let frame = self.top_mut();
+                let end = frame.agent.session().message_count();
+                for (name, description) in client::tool_descriptions(frame.agent.tools()) {
+                    frame.notes.push(Note {
+                        anchor: Anchor::After(end),
                         heading: Some(name),
                         text: description,
-                        style: self.settings.theme.status,
+                        style,
                     });
                 }
                 self.view.scroll_to_bottom();
             }
             Action::Rename => {
-                if let Err(error) = self.session.rename(argument) {
+                // Branch agents hold the tree's library handles and write into the tree
+                // directory, so it can't move under them.
+                if self.delegating() {
+                    self.notice = Some("couldn't rename: a subagent is running".to_string());
+                    return Ok(Flow::Continue);
+                }
+                if let Err(error) = self.agent_mut().session_mut().rename(argument) {
                     self.notice = Some(format!("couldn't rename: {error:#}"));
                     return Ok(Flow::Continue);
                 }
+                // The tree directory moved; the next agent needing the library reopens it.
+                self.library = None;
             }
         }
         self.textarea.clear();
@@ -1322,16 +919,13 @@ impl App {
         Ok(Flow::Continue)
     }
 
-    /// Both providers share the list; modal operations retain ownership of the footer.
-    fn completions(&self) -> Vec<Completion> {
-        if self.pending_prompt().is_some() || self.loading.is_some() {
+    /// The command completion list for the current input; an approval prompt retains
+    /// ownership of the footer.
+    fn completions(&self) -> Vec<commands::Completion> {
+        if self.agent().pending_prompt().is_some() {
             return Vec::new();
         }
-        completion_candidates(
-            &self.textarea,
-            &self.file_completions,
-            self.completion_dismissed.as_deref(),
-        )
+        completion_candidates(&self.textarea, self.completion_dismissed.as_deref())
     }
 
     /// The input text changed: highlight the first completion again and reopen a
@@ -1339,42 +933,13 @@ impl App {
     fn input_changed(&mut self) {
         self.completion = 0;
         self.completion_dismissed = None;
-        self.refresh_file_completions();
-    }
-
-    /// Read filenames only when an attachment prefix activates or changes, never on redraw.
-    fn refresh_file_completions(&mut self) {
-        let context =
-            input::file_prefix(&self.textarea).map(|(row, prefix)| (row, prefix.to_owned()));
-        if context == self.file_completion_context {
-            return;
-        }
-        self.completion = 0;
-        self.completion_dismissed = None;
-        self.file_completions.clear();
-        if let Some((_, prefix)) = &context {
-            match injection::completions(&self.repo, prefix) {
-                Ok(files) => self.file_completions = files,
-                Err(error) => self.notice = Some(format!("couldn't complete files: {error:#}")),
-            }
-        }
-        self.file_completion_context = context;
     }
 
     /// Rows below the input: the completion list while it shows, otherwise the
     /// status line.
     fn footer(&self) -> Vec<Line<'static>> {
-        if self.loading.is_some() {
-            return vec![Line::styled(
-                "Loading files… (esc to cancel)",
-                self.settings.theme.status,
-            )];
-        }
         let completions = self.completions();
-        // A failed attachment must remain visible even when its typed prefix still has matches.
-        if completions.is_empty()
-            || (self.notice.is_some() && input::file_prefix(&self.textarea).is_some())
-        {
+        if completions.is_empty() {
             return vec![self.status_line()];
         }
         let selected = self.completion.min(completions.len() - 1);
@@ -1393,17 +958,18 @@ impl App {
             .map(|(index, completion)| {
                 // Indented to line up with the input text after the `> ` prompt.
                 let name = format!("  {:width$}   ", completion.spelling);
-                let description = completion.command.map_or("", |command| command.description);
+                let description = completion.command.description;
+                let status = self.resources.settings.theme.status;
                 if index == selected {
-                    let reversed = self.settings.theme.status.reversed();
+                    let reversed = status.reversed();
                     Line::from(vec![
                         Span::styled(name, reversed),
                         Span::styled(description, reversed),
                     ])
                 } else {
                     Line::from(vec![
-                        Span::styled(name, self.settings.theme.status),
-                        Span::styled(description, self.settings.theme.status),
+                        Span::styled(name, status),
+                        Span::styled(description, status),
                     ])
                 }
             })
@@ -1424,51 +990,17 @@ impl App {
                 }
             };
         }
-        if self.turn.is_some() {
+        if self.agent().turn().is_some() {
             self.notice = Some("turn in progress (esc to stop)".to_string());
             return Ok(Flow::Continue);
         }
-
-        if self.loading.is_some() {
-            return Ok(Flow::Continue);
-        }
-        let paths = injection::paths(&text);
-        if paths.is_empty() {
-            self.commit_submission(text)?;
-        } else {
-            self.loading = Some(PendingInjection::start(text, paths, self.repo.clone()));
-        }
+        self.commit_submission(text)?;
         Ok(Flow::Continue)
     }
 
-    /// A failed attachment batch changes neither history nor draft; no partial files are sent.
-    fn finish_injection(
-        &mut self,
-        result: anyhow::Result<Vec<PreparedInjection>>,
-    ) -> anyhow::Result<()> {
-        let Some(pending) = self.loading.take() else {
-            return Ok(());
-        };
-        match result.and_then(|injections| self.session.inject(injections)) {
-            Ok(()) => {
-                // Attachment commands are local. Do not start a turn or save draft text as a message.
-                self.textarea.clear();
-                self.textarea
-                    .insert_str(injection::remaining_text(&pending.text));
-                self.input_changed();
-                self.view.scroll_to_bottom();
-                Ok(())
-            }
-            Err(error) => {
-                self.notice = Some(format!("couldn't inject files: {error:#}"));
-                Ok(())
-            }
-        }
-    }
-
-    /// Only an explicit ordinary message starts a turn and queues FYI before its request.
+    /// Save a submitted message, which starts a turn and queues FYI before its request.
     fn commit_submission(&mut self, text: String) -> anyhow::Result<()> {
-        if let Err(error) = self.session.submit(text) {
+        if let Err(error) = self.agent_mut().session_mut().submit(text) {
             self.notice = Some(format!("couldn't submit: {error:#}"));
             return Ok(());
         }
@@ -1478,63 +1010,49 @@ impl App {
         // A new turn returns the compact session view to its newest positions.
         self.message_scroll = usize::MAX;
         self.follow_messages = true;
-        // FYI/help are the only per-turn cleanup cases. Tracked file injections persist.
-        let removed = self
-            .session
-            .remove_calls(|call| code_of(call).is_ok_and(|code| is_exempt(&code)))?;
+        let removed = self.agent_mut().start_turn()?;
         self.messages_removed(&removed);
-        // Each turn opens with an approval-exempt `FYI()` call made as if by the
-        // model. `advance` runs it, then sends the first request.
-        let calls = fyi_calls()?;
-        let saved = self.session.push(Message {
-            role: Role::Assistant,
-            content: String::new(),
-            tool_calls: Some(calls.clone()),
-            ..Default::default()
-        });
-        // Queue the calls before the save result is checked: the message is in the
-        // session either way, and an error exit must still record their results.
-        self.turn = Some(Turn {
-            phase: Phase::Idle,
-            queue: calls.into(),
-            repl: None,
-        });
-        saved?;
         Ok(())
     }
 
     /// Keep display-only note positions attached to surviving conversation messages.
     fn messages_removed(&mut self, removed: &[usize]) {
         // Notes placed after a message keep their place among the messages left.
-        for note in &mut self.notes {
+        for note in &mut self.top_mut().notes {
             if let Anchor::After(n) = &mut note.anchor {
                 *n -= removed.partition_point(|&index| index < *n);
             }
         }
     }
 
-    /// Prefer reported prompt usage, falling back to the context overlay's aggregate.
+    /// Prefer the active agent's reported prompt usage, falling back to the context
+    /// overlay's aggregate.
     fn prompt_token_total(&self) -> token_count::TokenTotal {
-        preferred_token_total(self.prompt_tokens, self.token_counts.total())
+        preferred_token_total(self.agent().prompt_tokens(), self.token_counts.total())
     }
 
-    /// Prefer reported context usage, falling back to the context overlay's aggregate.
+    /// Prefer the active agent's reported context usage, falling back to the context
+    /// overlay's aggregate.
     fn context_token_total(&self) -> token_count::TokenTotal {
-        preferred_token_total(self.context_tokens, self.token_counts.total())
+        preferred_token_total(self.agent().context_tokens(), self.token_counts.total())
     }
 
-    /// Show the current permission and the exact host operation awaiting approval.
+    /// Name the agent on screen by its session identity (the tree name for the root,
+    /// the call ID for a branch), and show the current permission and the exact host
+    /// operation awaiting approval.
     fn status_line(&self) -> Line<'static> {
-        let mut info = self.settings.endpoint.model.clone();
+        let settings = &self.resources.settings;
+        let mut info = format!(
+            "{} | {}",
+            self.agent().session().name(),
+            settings.endpoint.model
+        );
         let tokens = self.context_token_total();
         info.push_str(&format!(" | {} tokens", status_token_count(tokens)));
-        info.push_str(&format!(" | {}", self.settings.permission.as_str()));
-        if self.settings.tool_reasoning {
-            info.push_str(" | tool reasoning");
-        }
-        let status = self.settings.theme.status;
+        info.push_str(&format!(" | {}", settings.permission.as_str()));
+        let status = settings.theme.status;
         let mut spans = vec![Span::styled(info, status)];
-        let activity = match self.turn.as_ref().map(|t| &t.phase) {
+        let activity = match self.agent().turn().map(|t| &t.phase) {
             Some(Phase::Streaming(_)) => Some("responding… (esc to stop)"),
             Some(Phase::Patching { .. }) => Some("applying patch… (esc to stop)"),
             Some(Phase::Reading { .. }) => Some("reading… (esc to stop)"),
@@ -1548,11 +1066,11 @@ impl App {
         if let Some(activity) = activity {
             spans.push(Span::styled(format!(" · {activity}"), status));
         }
-        if let Some(prompt) = self.pending_prompt() {
+        if let Some(prompt) = self.agent().pending_prompt() {
             spans.push(Span::styled(" · ", status));
             spans.push(Span::styled(
                 format!("allow {}? (y/n, esc to stop)", prompt.operation),
-                self.settings.theme.approval,
+                settings.theme.approval,
             ));
         }
         if self.view.scrolled_up() {
@@ -1560,7 +1078,7 @@ impl App {
         }
         if let Some(notice) = &self.notice {
             spans.push(Span::styled(" · ", status));
-            spans.push(Span::styled(notice.clone(), self.settings.theme.warning));
+            spans.push(Span::styled(notice.clone(), settings.theme.warning));
         }
         Line::from(spans)
     }
@@ -1647,7 +1165,7 @@ fn message_overlay_entries(
                         add("reasoning", "[opaque]".into(), true);
                     }
                     for call in visible_calls {
-                        add("tool", tool_preview(call)?, true);
+                        add("tool", tool_preview(call), true);
                     }
                 }
                 Role::Tool => {
@@ -1683,24 +1201,45 @@ fn compact_preview(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Use the same decoded call content as the transcript, with attachment paths identified.
-fn tool_preview(call: &ToolCall) -> anyhow::Result<String> {
-    let content = if tool_call_id::decode(&call.id)
-        .is_some_and(|metadata| metadata.kind == tool_call_id::INJECTED_FILE)
-    {
-        format!("@{}", injection::filename(call)?)
-    } else if call.function.name == "apply_patch" {
-        patch_of(call).unwrap_or_else(|_| call.function.arguments.clone())
-    } else if matches!(call.function.name.as_str(), "read_file" | "grep" | "list") {
+/// Tools whose argument objects display raw, as stored: the direct file tools, `rlm`,
+/// and `FYI`. Their streaming previews show the same raw text.
+fn shows_raw_arguments(name: &str) -> bool {
+    matches!(name, "read_file" | "grep" | "list" | "rlm" | "FYI")
+}
+
+/// Use the same decoded call content as the transcript.
+fn tool_preview(call: &ToolCall) -> String {
+    let content = if call.function.name == "apply_patch" {
+        patch_display(call).unwrap_or_else(|_| call.function.arguments.clone())
+    } else if shows_raw_arguments(&call.function.name) {
         call.function.arguments.clone()
     } else {
         code_of(call).unwrap_or_else(|_| call.function.arguments.clone())
     };
-    Ok(format!(
-        "{} {}",
-        call.function.name,
-        compact_preview(&content)
-    ))
+    format!("{} {}", call.function.name, compact_preview(&content))
+}
+
+/// The display text of a complete apply_patch call, shared by the transcript and the
+/// context overlay: its patch, preceded by the call's `root` argument (`with_root`) so
+/// the directory a patch edits stays visible. Calls without `root`, including every
+/// historical one, display only their patch. Errors as `patch_of` does, for raw display.
+fn patch_display(call: &ToolCall) -> Result<String, String> {
+    let patch = patch_of(call)?;
+    // `patch_of` accepted the arguments, so they parse as a JSON object.
+    let arguments: Value = serde_json::from_str(&call.function.arguments)
+        .map_err(|error| format!("Invalid apply_patch arguments: {error}"))?;
+    Ok(with_root(arguments.get("root"), patch))
+}
+
+/// Precede displayed patch text with a `root: <value>` line when the arguments include
+/// `root`: a string as itself, any other value as its JSON text, since the call shows
+/// what it named even when that is not a valid root.
+fn with_root(root: Option<&Value>, patch: String) -> String {
+    match root {
+        None => patch,
+        Some(Value::String(root)) => format!("root: {root}\n{patch}"),
+        Some(root) => format!("root: {root}\n{patch}"),
+    }
 }
 
 /// Draw the complete durable transcript, including turns excluded from model requests.
@@ -1715,11 +1254,9 @@ fn build_blocks<'a>(
     messages: &[&'a Message],
     notes: &'a [Note],
     turn: Option<&'a Turn>,
-    tool_reasoning_enabled: bool,
     theme: &Theme,
 ) -> Vec<Block<'a>> {
     let blank = |key| Block::new(key, "", theme.assistant);
-    let turn_start = tool_reasoning::turn_start_refs(messages);
     let mut blocks = Vec::new();
     if let Some(system) = system {
         blocks.push(Block::new(Key::System(0), "system", theme.system));
@@ -1777,27 +1314,9 @@ fn build_blocks<'a>(
                 blocks.push(blank(part(1)));
             }
             Role::Assistant => {
-                // Converted reasoning is drawn as the synthetic call it's sent as, ahead
-                // of the message. Drawn inline rather than as extra messages, so message
-                // indices (keys, note anchors) match the session.
-                let converted = tool_reasoning_enabled
-                    .then(|| tool_reasoning::converted_message(message, i, turn_start))
-                    .flatten();
-                if let Some(text) = &converted {
-                    let part = |n| Key::Call(tool_reasoning::call_id(i, text), n);
-                    blocks.push(Block::new(part(0), "REPL", theme.tool_call));
-                    blocks.push(Block::new(
-                        part(1),
-                        tool_reasoning::code(text),
-                        theme.reasoning,
-                    ));
-                    let result = tool_reasoning::RESULT;
-                    blocks.push(Block::new(part(2), result, theme.tool_result));
-                    blocks.push(blank(part(3)));
-                }
                 // Only reasoning, content, and calls are drawn; other fields are sent
                 // back but have no display form.
-                let reasoning = message.reasoning().filter(|_| converted.is_none());
+                let reasoning = message.reasoning();
                 let has_reasoning = reasoning.is_some();
                 if let Some(reasoning) = reasoning {
                     blocks.push(Block::new(part(0), reasoning, theme.reasoning));
@@ -1819,8 +1338,8 @@ fn build_blocks<'a>(
                     // Parts: 0 label, 1 code, 2 result or live output, 3 blank, 4+ notes.
                     let part = |n| Key::Call(call.id.clone(), n);
                     match if call.function.name == "apply_patch" {
-                        patch_of(call)
-                    } else if matches!(call.function.name.as_str(), "read_file" | "grep" | "list") {
+                        patch_display(call)
+                    } else if shows_raw_arguments(&call.function.name) {
                         Ok(call.function.arguments.clone())
                     } else {
                         code_of(call)
@@ -1919,7 +1438,7 @@ fn build_blocks<'a>(
             let code = if name == "REPL" {
                 streamed_code(arguments)
             } else if name == "apply_patch" {
-                streamed_argument(arguments, "patch")
+                streamed_patch(arguments)
             } else {
                 arguments.to_owned()
             };
@@ -1930,143 +1449,86 @@ fn build_blocks<'a>(
     blocks
 }
 
-/// Assign each streamed call its local identity once, before previews or persistence can use it.
-fn accumulate_reply(
-    fields: &mut Map<String, Value>,
-    mut delta: Map<String, Value>,
-) -> anyhow::Result<()> {
-    if let Some(Value::Array(calls)) = delta.get_mut("tool_calls") {
-        // The accumulator also merges repeated indices within a single chunk.
-        let mut assigned_indices = Vec::new();
-        for call in calls {
-            let Some(call) = call.as_object_mut() else {
-                continue;
-            };
-            if call
-                .get("id")
-                .and_then(Value::as_str)
-                .is_none_or(str::is_empty)
-            {
-                continue;
-            }
-            let index = call.get("index").cloned();
-            let existing = index
-                .as_ref()
-                .and_then(|index| {
-                    fields
-                        .get("tool_calls")?
-                        .as_array()?
-                        .iter()
-                        .find(|entry| entry.get("index") == Some(index))
-                })
-                .and_then(|entry| entry.get("id"))
-                .and_then(Value::as_str);
-            let assigned_here = index
-                .as_ref()
-                .is_some_and(|index| assigned_indices.contains(index));
-            if assigned_here || existing.is_some_and(|id| !id.is_empty()) {
-                // Later provider ID fragments must not append to the already assigned local ID.
-                call.remove("id");
-            } else {
-                call.insert(
-                    "id".into(),
-                    Value::String(tool_call_id::generate(tool_call_id::NORMAL, &[])?),
-                );
-            }
-            if let Some(index) = index {
-                assigned_indices.push(index);
-            }
-        }
-    }
-    client::accumulate(fields, delta);
-    Ok(())
-}
-
-/// Mark app-generated FYI separately so the saved call stays available but its overlay row hides.
-fn fyi_calls() -> anyhow::Result<Vec<ToolCall>> {
-    ["FYI()"]
-        .into_iter()
-        .map(|code| {
-            Ok(ToolCall {
-                id: tool_call_id::generate(tool_call_id::SYNTHETIC, &[])?,
-                kind: "function".to_string(),
-                function: FunctionCall {
-                    name: "REPL".to_string(),
-                    arguments: format!(r#"{{"code": "{code}"}}"#),
-                    extra: Map::new(),
-                },
-                extra: Map::new(),
-            })
-        })
-        .collect()
-}
-
-/// Select pure FYI/help calls for history cleanup. This selector does not grant
-/// permissions: all actual host operations use the runtime's permission checks.
-fn is_exempt(code: &str) -> bool {
-    let mut statements = code
-        .split([';', '\n'])
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .peekable();
-    statements.peek().is_some() && statements.all(|s| matches!(s, "FYI()" | "help()"))
-}
-
 /// Display the code available so far without accepting incomplete JSON for execution.
 fn streamed_code(arguments: &str) -> String {
     streamed_argument(arguments, "code")
 }
 
-/// Both tools preview literal payloads without accepting partial JSON for execution.
-fn streamed_argument(arguments: &str, field: &str) -> String {
-    let parsed = serde_json::from_str::<Value>(arguments);
-    if let Ok(value) = &parsed {
-        return value[field].as_str().unwrap_or(arguments).to_owned();
+/// Preview apply_patch as its completed call displays (`patch_display`): the patch so
+/// far, preceded by the `root` line once a complete `root` value has arrived. A `root`
+/// streamed after the patch appears when the arguments complete.
+fn streamed_patch(arguments: &str) -> String {
+    match streamed_fields(arguments, "patch") {
+        Some((patch, complete)) => with_root(complete.get("root"), patch),
+        None => arguments.to_owned(),
     }
+}
+
+/// Preview a literal payload alone without accepting partial JSON for execution;
+/// malformed arguments show raw.
+fn streamed_argument(arguments: &str, field: &str) -> String {
+    streamed_fields(arguments, field)
+        .map(|(payload, _)| payload)
+        .unwrap_or_else(|| arguments.to_owned())
+}
+
+/// The string payload `field` decoded so far, with the top-level members before it
+/// whose values are already complete (every member, once the arguments parse). None
+/// means the arguments are malformed or the payload is not a string; the caller shows
+/// them raw.
+fn streamed_fields(arguments: &str, field: &str) -> Option<(String, Map<String, Value>)> {
+    let parse_error = match serde_json::from_str::<Value>(arguments) {
+        Ok(Value::Object(members)) => {
+            let payload = members.get(field)?.as_str()?.to_owned();
+            return Some((payload, members));
+        }
+        Ok(_) => return None,
+        Err(error) => error,
+    };
     // Walk only top-level fields so nested or quoted keys cannot masquerade
     // as a tool payload. Complete preceding values use serde's parser.
-    let preview = || -> Option<String> {
-        let mut rest = arguments.trim_start().strip_prefix('{')?.trim_start();
-        loop {
-            if rest.is_empty() {
-                return Some(String::new());
-            }
-            let mut keys = serde_json::Deserializer::from_str(rest).into_iter::<String>();
-            let key = match keys.next()? {
-                Ok(key) => key,
-                Err(error) if error.is_eof() => return Some(String::new()),
-                Err(_) => return None,
-            };
-            rest = rest[keys.byte_offset()..].trim_start();
-            if rest.is_empty() {
-                return Some(String::new());
-            }
-            rest = rest.strip_prefix(':')?.trim_start();
-            if rest.is_empty() {
-                return Some(String::new());
-            }
-            if key == field {
-                let (code, closed) = streamed_string(rest)?;
-                // A complete string in malformed JSON must remain visibly malformed.
-                if closed && !parsed.as_ref().unwrap_err().is_eof() {
-                    return None;
-                }
-                return Some(code);
-            }
-            let mut values = serde_json::Deserializer::from_str(rest).into_iter::<Value>();
-            match values.next()? {
-                Ok(_) => {}
-                Err(error) if error.is_eof() => return Some(String::new()),
-                Err(_) => return None,
-            }
-            rest = rest[values.byte_offset()..].trim_start();
-            if rest.is_empty() {
-                return Some(String::new());
-            }
-            rest = rest.strip_prefix(',')?.trim_start();
+    let mut members = Map::new();
+    let mut rest = arguments.trim_start().strip_prefix('{')?.trim_start();
+    loop {
+        if rest.is_empty() {
+            return Some((String::new(), members));
         }
-    };
-    preview().unwrap_or_else(|| arguments.to_owned())
+        let mut keys = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+        let key = match keys.next()? {
+            Ok(key) => key,
+            Err(error) if error.is_eof() => return Some((String::new(), members)),
+            Err(_) => return None,
+        };
+        rest = rest[keys.byte_offset()..].trim_start();
+        if rest.is_empty() {
+            return Some((String::new(), members));
+        }
+        rest = rest.strip_prefix(':')?.trim_start();
+        if rest.is_empty() {
+            return Some((String::new(), members));
+        }
+        if key == field {
+            let (payload, closed) = streamed_string(rest)?;
+            // A complete string in malformed JSON must remain visibly malformed.
+            if closed && !parse_error.is_eof() {
+                return None;
+            }
+            return Some((payload, members));
+        }
+        let mut values = serde_json::Deserializer::from_str(rest).into_iter::<Value>();
+        match values.next()? {
+            Ok(value) => {
+                members.insert(key, value);
+            }
+            Err(error) if error.is_eof() => return Some((String::new(), members)),
+            Err(_) => return None,
+        }
+        rest = rest[values.byte_offset()..].trim_start();
+        if rest.is_empty() {
+            return Some((String::new(), members));
+        }
+        rest = rest.strip_prefix(',')?.trim_start();
+    }
 }
 
 /// Decode complete characters only; partial escapes and surrogate pairs wait for more data.
@@ -2139,46 +1601,6 @@ fn streamed_hex(chars: &mut std::str::Chars<'_>) -> Option<Option<u32>> {
     Some(Some(value))
 }
 
-/// Reject malformed patch arguments before the editor can touch the filesystem.
-fn patch_of(call: &ToolCall) -> Result<String, String> {
-    #[derive(serde::Deserialize)]
-    struct Arguments {
-        patch: String,
-    }
-    serde_json::from_str::<Arguments>(&call.function.arguments)
-        .map(|args| args.patch)
-        .map_err(|error| format!("Invalid apply_patch arguments: {error}"))
-}
-
-/// The `code` argument of a REPL call, or the error to return to the model.
-fn code_of(call: &ToolCall) -> Result<String, String> {
-    if call.function.name != "REPL" {
-        return Err(format!("Unknown tool: {}", call.function.name));
-    }
-    let arguments: Value = serde_json::from_str(&call.function.arguments)
-        .map_err(|e| format!("Invalid arguments ({e}): {}", call.function.arguments))?;
-    arguments["code"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| "Invalid arguments: missing string `code`".to_string())
-}
-
-/// Cap `text` at `limit` bytes (on a character boundary), noting how much was cut.
-fn truncate(text: String, limit: usize) -> String {
-    if text.len() <= limit {
-        return text;
-    }
-    let mut end = limit;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!(
-        "{}\n[output truncated: {} more bytes]",
-        &text[..end],
-        text.len() - end
-    )
-}
-
 /// `32093` → `32,093`.
 fn thousands(n: u64) -> String {
     let digits = n.to_string();
@@ -2210,65 +1632,20 @@ fn can_toggle_turn(active: bool, turn_index: usize, turn_count: usize) -> bool {
     !active || turn_index != turn_count.saturating_sub(1)
 }
 
-/// Provider usage describes the old selection and cannot override its new local total.
-fn invalidate_reported_usage(context: &mut Option<u64>, prompt: &mut Option<u64>) {
-    *context = None;
-    *prompt = None;
-}
-
 /// Format the status value with grouping and the overlay's estimate marker.
 fn status_token_count(tokens: token_count::TokenTotal) -> String {
     let estimate = if tokens.estimated { "~" } else { "" };
     format!("{estimate}{}", thousands(tokens.count))
 }
 
-/// Await the active phase without consuming state when terminal input wins the select.
-async fn next_turn_event(turn: &mut Option<Turn>) -> TurnEvent {
-    let Some(turn) = turn else {
-        return std::future::pending().await;
-    };
-    match &mut turn.phase {
-        Phase::Streaming(reply) => {
-            TurnEvent::Stream(reply.events.recv().await.unwrap_or_else(|| {
-                StreamEvent::Error("request task ended without a result".to_string())
-            }))
-        }
-        Phase::Finishing(task) => TurnEvent::Finished(match task.await {
-            Ok(result) => result,
-            Err(error) => Err(error.into()),
-        }),
-        Phase::Running { prompt, .. } => match turn.repl.as_mut() {
-            Some(repl) => tokio::select! {
-                event = repl.next_event() => TurnEvent::Repl(event),
-                result = next_description(prompt) => TurnEvent::Description(result),
-            },
-            None => std::future::pending().await,
-        },
-        Phase::Patching { job, .. } => TurnEvent::Patch(job.result().await),
-        Phase::Reading { job, .. } => TurnEvent::Read(job.result().await),
-        Phase::Searching { job, .. } => TurnEvent::Grep(job.result().await),
-        Phase::Listing { job, .. } => TurnEvent::List(job.result().await),
-        Phase::Idle | Phase::Ready(_) => std::future::pending().await,
-    }
-}
-
-/// Select one completion provider without performing filesystem I/O while drawing or handling keys.
+/// Command completions for one-line input starting with `/` and no whitespace, unless
+/// Esc dismissed the list for this exact input.
 fn completion_candidates(
     textarea: &TextArea,
-    files: &[String],
     dismissed: Option<&str>,
-) -> Vec<Completion> {
+) -> Vec<commands::Completion> {
     if dismissed.is_some_and(|text| text == textarea.lines().join("\n")) {
         return Vec::new();
-    }
-    if input::file_prefix(textarea).is_some() {
-        return files
-            .iter()
-            .map(|name| Completion {
-                spelling: format!("@{name}"),
-                command: None,
-            })
-            .collect();
     }
     let [text] = textarea.lines() else {
         return Vec::new();
@@ -2277,36 +1654,6 @@ fn completion_candidates(
         return Vec::new();
     }
     commands::completions(text)
-        .into_iter()
-        .map(|entry| Completion {
-            spelling: entry.spelling.to_owned(),
-            command: Some(entry.command),
-        })
-        .collect()
-}
-
-/// Poll only the current batch; canceled reads cannot later update local context.
-async fn next_injection(
-    pending: &mut Option<PendingInjection>,
-) -> anyhow::Result<Vec<PreparedInjection>> {
-    let Some(pending) = pending else {
-        return std::future::pending().await;
-    };
-    (&mut pending.task)
-        .await
-        .context("joining file injection reads")?
-}
-
-/// Await only the current approval's request; cancellation never queues a stale result.
-async fn next_description(prompt: &mut Option<PendingPrompt>) -> anyhow::Result<String> {
-    let Some(task) = prompt
-        .as_mut()
-        .and_then(|prompt| prompt.description.as_mut())
-        .and_then(|description| description.task.as_mut())
-    else {
-        return std::future::pending().await;
-    };
-    task.await.context("joining approval description request")?
 }
 
 /// Read terminal events on a dedicated thread. It polls with a timeout instead of
@@ -2338,7 +1685,17 @@ fn spawn_input_reader() -> UnboundedReceiver<io::Result<Event>> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
+    use serde_json::Map;
+    use tokio::sync::oneshot;
+
     use super::*;
+    use crate::agent::{
+        ApprovalDescription, PendingCall, PendingPrompt, Reply, fyi_calls, next_description,
+    };
+    use crate::host::Mounts;
+    use crate::session::FunctionCall;
 
     /// Reported usage remains exact and takes precedence over an estimated overlay total.
     #[test]
@@ -2460,16 +1817,6 @@ mod tests {
         assert!(can_toggle_turn(false, 2, 3));
     }
 
-    /// Changing visibility invalidates both exact totals from the previous request.
-    #[test]
-    fn visibility_change_invalidates_reported_usage() {
-        let mut context = Some(200);
-        let mut prompt = Some(150);
-        invalidate_reported_usage(&mut context, &mut prompt);
-        assert_eq!(context, None);
-        assert_eq!(prompt, None);
-    }
-
     /// Derive deterministic estimates without making tokenizer requests in UI tests.
     fn counted_turns(turns: &[SessionTurn]) -> Vec<token_count::CountedTurn> {
         let endpoint = config::ResolvedEndpoint {
@@ -2520,7 +1867,7 @@ mod tests {
             ]},
             {"role":"tool", "tool_call_id":"third", "content":"hidden again"}
         ])).unwrap();
-        let synthetic = fyi_calls().unwrap().remove(0);
+        let synthetic = fyi_calls(1).unwrap().remove(0);
         let synthetic_id = synthetic.id.clone();
         messages.push(Message {
             role: Role::Assistant,
@@ -2561,246 +1908,25 @@ mod tests {
         );
     }
 
-    /// A marked user attachment stays visible even though app-generated FYI calls hide.
-    #[test]
-    fn message_overlay_keeps_file_injections() {
-        let id = tool_call_id::generate(tool_call_id::INJECTED_FILE, &[]).unwrap();
-        let code = "from pathlib import Path\nprint(Path(\"notes.txt\").read_bytes().decode('utf-8'), end='')";
-        let call: ToolCall = serde_json::from_value(serde_json::json!({
-            "id": id, "type": "function",
-            "function": {"name": "REPL", "arguments": serde_json::json!({"code": code}).to_string()}
-        }))
-        .unwrap();
-        let messages = vec![
-            Message {
-                role: Role::Assistant,
-                tool_calls: Some(vec![call]),
-                ..Default::default()
-            },
-            Message::tool(id, "file contents".into()),
-        ];
-        let session_turns = one_turn(messages);
-        let turns = counted_turns(&session_turns);
-        let rows = message_overlay_entries(&session_turns, &turns).unwrap();
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].label, "Turn 0");
-        assert!(rows[0].tokens.starts_with('~'));
-        assert_eq!(rows[1].prefix, "");
-        assert_eq!(rows[1].label, "assistant");
-        assert_eq!(rows[2].prefix, "  ");
-        assert_eq!(rows[2].label, "tool");
-        assert_eq!(rows[2].payload, "REPL @notes.txt");
-    }
-
-    /// Provider IDs cannot introduce local markers; normalization preserves other call fields.
-    #[test]
-    fn provider_ids_and_results_use_normal_format() {
-        let provider_ids = [
-            "provider-call-id".to_owned(),
-            tool_call_id::generate(tool_call_id::INJECTED_FILE, &[]).unwrap(),
-        ];
-        let calls: Vec<ToolCall> = provider_ids
-            .iter()
-            .map(|id| {
-                serde_json::from_value(serde_json::json!({
-            "id": id, "type": "function", "vendor": "preserved",
-            "function": {"name": "REPL", "arguments": "{\"code\":\"1+1\"}", "vendor_function": 7}
-        })).unwrap()
-            })
-            .collect();
-        let before: Vec<_> = calls
-            .iter()
-            .map(|call| serde_json::to_value(call).unwrap())
-            .collect();
-        let mut fields = Map::new();
-        accumulate_reply(
-            &mut fields,
-            serde_json::json!({"tool_calls": before})
-                .as_object()
-                .unwrap()
-                .clone(),
-        )
-        .unwrap();
-        let calls: Vec<ToolCall> = serde_json::from_value(fields["tool_calls"].clone()).unwrap();
-        for ((call, original), previous_id) in calls.iter().zip(before).zip(provider_ids) {
-            assert_ne!(call.id, previous_id);
-            let metadata = tool_call_id::decode(&call.id).unwrap();
-            assert_eq!(metadata.kind, tool_call_id::NORMAL);
-            assert!(metadata.data.is_empty());
-            let mut expected = original;
-            expected["id"] = Value::String(call.id.clone());
-            assert_eq!(serde_json::to_value(call).unwrap(), expected);
-            let result = Message::tool(call.id.clone(), "2".into());
-            let messages = vec![
-                Message {
-                    role: Role::Assistant,
-                    tool_calls: Some(vec![call.clone()]),
-                    ..Default::default()
-                },
-                result,
-            ];
-            let request = tool_reasoning::request_messages(&messages, false);
-            assert_eq!(
-                request[0]["tool_calls"][0]["id"],
-                request[1]["tool_call_id"]
-            );
-        }
-    }
-
-    /// Provider ID fragments never change the preview identity or concatenate into the saved ID.
-    #[test]
-    fn streamed_call_ids_stay_stable() {
-        let mut fields = Map::new();
-        accumulate_reply(
-            &mut fields,
-            serde_json::json!({"tool_calls": [{
-                "index": 0, "id": "provider-", "type": "function",
-                "function": {"name": "REPL", "arguments": "{\"code\":\""}
-            }]})
-            .as_object()
-            .unwrap()
-            .clone(),
-        )
-        .unwrap();
-        let first = fields["tool_calls"][0]["id"].as_str().unwrap().to_owned();
-        accumulate_reply(
-            &mut fields,
-            serde_json::json!({"tool_calls": [{
-                "index": 0, "id": "suffix", "function": {"arguments": "1+1\"}"}
-            }, {
-                "index": 1, "id": "second", "type": "function",
-                "function": {"name": "REPL", "arguments": "{\"code\":\"2+2\"}"}
-            }]})
-            .as_object()
-            .unwrap()
-            .clone(),
-        )
-        .unwrap();
-        assert_eq!(fields["tool_calls"][0]["id"], first);
-        assert_ne!(fields["tool_calls"][1]["id"], first);
-        assert_eq!(
-            fields["tool_calls"][0]["function"]["arguments"],
-            "{\"code\":\"1+1\"}"
-        );
-        for call in fields["tool_calls"].as_array().unwrap() {
-            let metadata = tool_call_id::decode(call["id"].as_str().unwrap()).unwrap();
-            assert_eq!(metadata.kind, tool_call_id::NORMAL);
-        }
-    }
-
-    /// Several fragments for one index in a single chunk must still produce one 32-character ID.
-    #[test]
-    fn repeated_call_index_in_one_chunk_uses_one_id() {
-        let mut fields = Map::new();
-        accumulate_reply(&mut fields, serde_json::json!({"tool_calls": [
-            {"index": 0, "id": "first", "type": "function", "function": {"name": "REPL", "arguments": "{\"code\":"}},
-            {"index": 0, "id": "second", "function": {"arguments": "\"1\"}"}}
-        ]}).as_object().unwrap().clone()).unwrap();
-        let calls = fields["tool_calls"].as_array().unwrap();
-        assert_eq!(calls.len(), 1);
-        let id = calls[0]["id"].as_str().unwrap().to_owned();
-        assert_eq!(id.len(), 32);
-        assert_eq!(
-            tool_call_id::decode(&id).unwrap().kind,
-            tool_call_id::NORMAL
-        );
-        assert_eq!(calls[0]["function"]["arguments"], "{\"code\":\"1\"}");
-        accumulate_reply(
-            &mut fields,
-            serde_json::json!({"tool_calls": [
-                {"index": 0, "id": "third"}, {"index": 0, "id": "fourth"}
-            ]})
-            .as_object()
-            .unwrap()
-            .clone(),
-        )
-        .unwrap();
-        assert_eq!(fields["tool_calls"][0]["id"], id);
-    }
-
-    /// Turn start marks only app-generated FYI, not model-authored calls.
-    #[test]
-    fn turn_start_calls_use_uniform_ids() {
-        let calls = fyi_calls().unwrap();
-        assert_eq!(calls.len(), 1);
-        for (call, code) in calls.iter().zip(["FYI()"]) {
-            assert_eq!(code_of(call).unwrap(), code);
-            let metadata = tool_call_id::decode(&call.id).unwrap();
-            assert_eq!(metadata.kind, tool_call_id::SYNTHETIC);
-            assert!(metadata.data.is_empty());
-        }
-    }
-
-    /// The shared list preserves slash actions while file matches remain path edits only.
+    /// Slash completions carry their commands' actions and close on dismissal or an argument.
     #[test]
     fn completion_providers_and_dismissal() {
         let mut textarea = TextArea::default();
         textarea.insert_str("/q");
-        let commands = completion_candidates(&textarea, &[], None);
+        let commands = completion_candidates(&textarea, None);
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].spelling, "/quit");
-        assert!(matches!(commands[0].command.unwrap().action, Action::Exit));
-        assert!(completion_candidates(&textarea, &[], Some("/q")).is_empty());
+        assert!(matches!(commands[0].command.action, Action::Exit));
+        assert!(completion_candidates(&textarea, Some("/q")).is_empty());
         textarea.clear();
         textarea.insert_str("/rename");
         assert!(
-            completion_candidates(&textarea, &[], None)[0]
+            completion_candidates(&textarea, None)[0]
                 .command
-                .unwrap()
                 .takes_argument
         );
         textarea.insert_str(" session");
-        assert!(completion_candidates(&textarea, &[], None).is_empty());
-
-        textarea.clear();
-        textarea.insert_str("Review\n@fi");
-        let names = vec!["file".into(), "file with spaces".into()];
-        let files = completion_candidates(&textarea, &names, None);
-        assert_eq!(
-            files
-                .iter()
-                .map(|entry| entry.spelling.as_str())
-                .collect::<Vec<_>>(),
-            ["@file", "@file with spaces"]
-        );
-        assert!(files.iter().all(|entry| entry.command.is_none()));
-        assert!(completion_candidates(&textarea, &names, Some("Review\n@fi")).is_empty());
-        assert!(completion_candidates(&textarea, &[], None).is_empty());
-        textarea.move_cursor(ratatui_textarea::CursorMove::Head);
-        assert!(completion_candidates(&textarea, &names, None).is_empty());
-    }
-
-    /// A failed asynchronous batch retains the exact held draft for correction.
-    #[tokio::test]
-    async fn failed_injection_keeps_held_draft() {
-        let text = "Review these\n@\n trailing space ".to_string();
-        let mut pending = Some(PendingInjection::start(
-            text.clone(),
-            injection::paths(&text),
-            std::env::temp_dir(),
-        ));
-        let error = next_injection(&mut pending).await.err().unwrap();
-        assert!(format!("{error:#}").contains("attachment path is empty"));
-        assert_eq!(pending.as_ref().unwrap().text, text);
-    }
-
-    /// Abandoning a read cannot produce a later attachment event, even if its task was ready.
-    #[tokio::test]
-    async fn canceled_injection_cannot_submit_late() {
-        let canceled = Arc::new(AtomicBool::new(false));
-        let mut pending = Some(PendingInjection {
-            text: "@file".into(),
-            task: tokio::spawn(async { Ok(Vec::new()) }),
-            canceled: canceled.clone(),
-        });
-        tokio::task::yield_now().await;
-        pending.take();
-        assert!(canceled.load(Ordering::Relaxed));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(5), next_injection(&mut pending))
-                .await
-                .is_err()
-        );
+        assert!(completion_candidates(&textarea, None).is_empty());
     }
 
     /// Tool output keeps distinct styles and one blank separator, even with trailing REPL newlines.
@@ -2815,8 +1941,12 @@ mod tests {
         assert_eq!(completions.len(), 1);
         assert!(matches!(completions[0].command.action, Action::ShowTools));
         let theme = test_theme();
-        let descriptions =
-            client::tool_descriptions("Configured REPL description\n\nSecond paragraph\n");
+        let descriptions = client::tool_descriptions(&client::tool_definitions(
+            1,
+            1,
+            "Configured REPL description\n\nSecond paragraph\n",
+            Mounts::at(1, false),
+        ));
         let notes: Vec<_> = descriptions
             .iter()
             .map(|(name, description)| Note {
@@ -2826,7 +1956,7 @@ mod tests {
                 style: theme.status,
             })
             .collect();
-        let blocks = build_blocks(None, &[], &notes, None, false, &theme);
+        let blocks = build_blocks(None, &[], &notes, None, &theme);
         assert_eq!(blocks.len(), descriptions.len() * 3);
         assert_ne!(theme.status.fg, theme.tool_result.fg);
         for (entry, (name, description)) in blocks.chunks_exact(3).zip(&descriptions) {
@@ -2872,14 +2002,7 @@ mod tests {
             },
             Message::tool("read-test".into(), "3\tline three\n".into()),
         ];
-        let blocks = build_blocks(
-            None,
-            &message_refs(&messages),
-            &[],
-            None,
-            false,
-            &test_theme(),
-        );
+        let blocks = build_blocks(None, &message_refs(&messages), &[], None, &test_theme());
         assert_eq!(blocks[0].text.as_ref(), "read_file");
         assert_eq!(blocks[1].text.as_ref(), arguments);
         assert_eq!(blocks[2].text.as_ref(), "3\tline three");
@@ -2898,14 +2021,7 @@ mod tests {
                 {"role":"assistant","content":"","tool_calls":[{"id":"list-test","type":"function","function":{"name":"list","arguments":arguments}}]},
                 {"role":"tool","tool_call_id":"list-test","content":format!("{result}\n")}
             ])).unwrap();
-            let blocks = build_blocks(
-                None,
-                &message_refs(&messages),
-                &[],
-                None,
-                false,
-                &test_theme(),
-            );
+            let blocks = build_blocks(None, &message_refs(&messages), &[], None, &test_theme());
             let visible: Vec<_> = blocks
                 .iter()
                 .map(|block| block.text.as_ref())
@@ -2938,14 +2054,7 @@ mod tests {
             ];
             let saved = serde_json::to_string(&messages).unwrap();
             let restored: Vec<Message> = serde_json::from_str(&saved).unwrap();
-            let blocks = build_blocks(
-                None,
-                &message_refs(&restored),
-                &[],
-                None,
-                false,
-                &test_theme(),
-            );
+            let blocks = build_blocks(None, &message_refs(&restored), &[], None, &test_theme());
             assert_eq!(blocks[0].text.as_ref(), "grep");
             assert_eq!(blocks[1].text.as_ref(), arguments);
             assert_eq!(blocks[2].text.as_ref(), "src café/f:2:this");
@@ -2962,7 +2071,7 @@ mod tests {
             if !arguments.is_char_boundary(end) {
                 continue;
             }
-            let preview = streamed_argument(&arguments[..end], "patch");
+            let preview = streamed_patch(&arguments[..end]);
             assert!(patch.starts_with(&preview), "{preview:?}");
             assert!(preview.starts_with(&previous));
             previous = preview;
@@ -2979,14 +2088,7 @@ mod tests {
             tool_calls: Some(vec![call.clone()]),
             ..Default::default()
         }];
-        let blocks = build_blocks(
-            None,
-            &message_refs(&messages),
-            &[],
-            None,
-            false,
-            &test_theme(),
-        );
+        let blocks = build_blocks(None, &message_refs(&messages), &[], None, &test_theme());
         assert_eq!(blocks[0].text.as_ref(), "apply_patch");
         assert_eq!(blocks[1].text.as_ref(), patch);
         for invalid in [r#"{"patch":1}"#, r#"{"patch":"unfinished"#] {
@@ -3074,7 +2176,7 @@ mod tests {
             queue: VecDeque::new(),
             repl: None,
         };
-        let streamed = build_blocks(None, &[], &[], Some(&turn), false, &test_theme());
+        let streamed = build_blocks(None, &[], &[], Some(&turn), &test_theme());
         assert_eq!(
             streamed
                 .iter()
@@ -3102,14 +2204,7 @@ mod tests {
             tool_calls: Some(calls),
             ..Message::default()
         }];
-        let completed = build_blocks(
-            None,
-            &message_refs(&messages),
-            &[],
-            None,
-            false,
-            &test_theme(),
-        );
+        let completed = build_blocks(None, &message_refs(&messages), &[], None, &test_theme());
         assert!(
             streamed
                 .iter()
@@ -3119,47 +2214,7 @@ mod tests {
         reply.task.abort();
     }
 
-    /// A slow request cannot delay yes/no; abandoning the prompt cancels its owned task too.
-    #[tokio::test]
-    async fn approval_answers_do_not_wait_for_description() {
-        for answer in [Some(true), Some(false), None] {
-            let (started, ready) = oneshot::channel();
-            let task = tokio::spawn(async move {
-                let _ = started.send(());
-                std::future::pending::<anyhow::Result<String>>().await
-            });
-            let abort = task.abort_handle();
-            ready.await.unwrap();
-            let (sender, mut receiver) = oneshot::channel();
-            let prompt = PendingPrompt {
-                operation: "operation".into(),
-                answer: sender,
-                description: Some(ApprovalDescription {
-                    task: Some(task),
-                    text: "Generating description…".into(),
-                }),
-            };
-            if let Some(answer) = answer {
-                prompt.respond(answer).unwrap();
-                assert_eq!(receiver.try_recv().unwrap(), answer);
-            } else {
-                drop(prompt);
-                assert!(matches!(
-                    receiver.try_recv(),
-                    Err(oneshot::error::TryRecvError::Closed)
-                ));
-            }
-            tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                while !abort.is_finished() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-        }
-    }
-
-    /// Native and converted reasoning retain their own undimmed color beside answers and tools.
+    /// Reasoning retains its own undimmed color beside answers and tools.
     #[tokio::test]
     async fn transcript_uses_theme_roles() {
         let theme = test_theme();
@@ -3176,7 +2231,6 @@ mod tests {
             &message_refs(&messages),
             &[],
             None,
-            false,
             &theme,
         );
         let hidden_turn = SessionTurn {
@@ -3188,7 +2242,6 @@ mod tests {
             &message_refs(&hidden_turn.messages),
             &[],
             None,
-            false,
             &theme,
         );
         assert!(
@@ -3214,15 +2267,6 @@ mod tests {
                     .contains(ratatui::style::Modifier::DIM)
             );
         }
-        let converted = build_blocks(None, &message_refs(&messages), &[], None, true, &theme);
-        assert_eq!(
-            converted
-                .iter()
-                .find(|block| block.text == "reasoning(\"thinking\")")
-                .unwrap()
-                .style,
-            theme.reasoning
-        );
         let (_, events) = mpsc::unbounded_channel();
         let task = tokio::spawn(std::future::pending());
         let turn = Turn {
@@ -3237,7 +2281,7 @@ mod tests {
             queue: VecDeque::new(),
             repl: None,
         };
-        let live = build_blocks(None, &[], &[], Some(&turn), false, &theme);
+        let live = build_blocks(None, &[], &[], Some(&turn), &theme);
         assert_eq!(
             live.iter()
                 .find(|block| block.text == "live thought")
@@ -3314,7 +2358,6 @@ mod tests {
                 &message_refs(&messages),
                 &[],
                 Some(&turn),
-                false,
                 &test_theme(),
             );
             assert!(
@@ -3333,7 +2376,6 @@ mod tests {
                 &message_refs(&messages),
                 &[],
                 Some(&turn),
-                false,
                 &test_theme(),
             );
             assert!(

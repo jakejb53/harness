@@ -1,4 +1,4 @@
-//! Permission checks before Monty services repository filesystem operations.
+//! Permission checks before Monty services filesystem operations through its mounts.
 
 use std::path::Path;
 
@@ -8,9 +8,15 @@ use monty_types::{
     unstable::{self, MontyNode},
 };
 
-use crate::{config::Permission, host::HostContext};
+use crate::{config::Permission, host::HostContext, root::Root};
 
-/// Filesystem execution belongs exclusively to the repository mount.
+/// Virtual path of the store mount, read-write regardless of the permission level.
+pub const STORE: &str = "/store";
+
+/// Virtual path of the library mount, read-only.
+pub const LIBRARY: &str = "/library";
+
+/// Filesystem execution belongs exclusively to the feed's mounts.
 pub enum FsAction {
     Mounts,
     Reply(ResumeValue),
@@ -49,33 +55,78 @@ fn dispatch(name: &str, args: &CallArgs, host: &HostContext) -> Result<FsAction,
     };
     authorize(path_arg(args, 0)?, write, host)?;
     if name == "Path.rename" {
-        // Both endpoints must be covered before the mount can perform a rename.
+        // Both endpoints must be covered before the mount can perform a rename. Each is
+        // authorized under its own root; Monty's mount table refuses a rename whose
+        // endpoints fall under different mounts.
         authorize(path_arg(args, 1)?, true, host)?;
     }
     Ok(FsAction::Mounts)
 }
 
 /// Reject uncovered paths and disallowed operations without performing host I/O.
+/// The repository follows the live permission level; the store allows everything;
+/// the library allows reads only; anything else is denied.
 fn authorize(path: &Path, write: bool, host: &HostContext) -> Result<(), MontyException> {
     let kind = if write { "write" } else { "read" };
     // CallArgs carries Monty's normalized spelling. This prefix check only
     // rejects inputs outside mount coverage; the mount checks the original call
     // and is authoritative for symlink and traversal confinement.
-    if !path.starts_with(&host.repo) {
+    let Some(root) = root_of(path, host) else {
         return Err(host.denied(format!(
-            "{kind} {}: denied: the path is outside the repository",
-            path.display()
-        )));
-    }
-    let permission = host.permission();
-    if permission == Permission::None || (write && permission == Permission::ReadOnly) {
-        return Err(host.denied(format!(
-            "{kind} {}: denied: the permission level is {}",
+            "{kind} {}: denied: the path is outside {}",
             path.display(),
-            permission.as_str()
+            covered(host)
         )));
+    };
+    match root {
+        Root::Store => {}
+        Root::Library if write => {
+            return Err(host.denied(format!(
+                "{kind} {}: denied: {LIBRARY} is read-only",
+                path.display()
+            )));
+        }
+        Root::Library => {}
+        Root::Repository => {
+            let permission = host.permission();
+            if permission == Permission::None || (write && permission == Permission::ReadOnly) {
+                return Err(host.denied(format!(
+                    "{kind} {}: denied: the permission level is {}",
+                    path.display(),
+                    permission.as_str()
+                )));
+            }
+        }
     }
     Ok(())
+}
+
+/// The root of the mount that serves `path` among the mounts this turn's feeds carry.
+/// The longest matching virtual path wins, as in Monty's mount table, so the rule
+/// applied is always that of the mount that performs the operation.
+fn root_of(path: &Path, host: &HostContext) -> Option<Root> {
+    [
+        Some((host.repo.as_path(), Root::Repository)),
+        host.mounts.store.then(|| (Path::new(STORE), Root::Store)),
+        host.mounts
+            .library
+            .then(|| (Path::new(LIBRARY), Root::Library)),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|(prefix, _)| path.starts_with(prefix))
+    .max_by_key(|(prefix, _)| prefix.as_os_str().len())
+    .map(|(_, root)| root)
+}
+
+/// The places this turn's feeds cover, for the denial of a path outside all of them.
+fn covered(host: &HostContext) -> String {
+    match (host.mounts.store, host.mounts.library) {
+        (false, false) => "the repository".into(),
+        (true, false) => format!("the repository and {STORE}"),
+        (false, true) => format!("the repository and {LIBRARY}"),
+        (true, true) => format!("the repository, {STORE}, and {LIBRARY}"),
+    }
 }
 
 /// Extract Monty's normalized path node without accepting arbitrary Python values.

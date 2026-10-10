@@ -4,7 +4,6 @@
 #[derive(Clone, Copy)]
 pub enum Action {
     Exit,
-    ToggleToolReasoning,
     ShowTools,
     Rename,
 }
@@ -28,13 +27,6 @@ const COMMANDS: &[Command] = &[
         description: "Rename this session",
         action: Action::Rename,
         takes_argument: true,
-    },
-    Command {
-        name: "/tool-reasoning",
-        aliases: &[],
-        description: "Turn tool reasoning on or off",
-        action: Action::ToggleToolReasoning,
-        takes_argument: false,
     },
     Command {
         name: "/tools",

@@ -1,7 +1,7 @@
 //! Per-turn Monty sessions. A driver task owns the checkout and all host suspensions.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
@@ -14,8 +14,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::config::{Permission, Settings};
-use crate::host::{self, HostConfig, HostContext};
-use crate::hostfs::{self, FsAction};
+use crate::host::{self, HostConfig, HostContext, Mounts};
+use crate::hostfs::{self, FsAction, LIBRARY, STORE};
 use crate::token_count::TokenTotal;
 
 pub enum ReplEvent {
@@ -49,6 +49,9 @@ pub struct Runtime {
     repo: PathBuf,
     /// Clone the opened directory capability across feeds; never reopen its path.
     mount: MountSpec,
+    /// `/store`, opened once at startup and cloned into the feeds of agents at depth 1
+    /// and deeper, like `mount`.
+    store: MountSpec,
     permission: watch::Sender<Permission>,
     memory_mb: usize,
 }
@@ -67,6 +70,8 @@ impl Runtime {
             MountSpecMode::ReadWrite,
         )
         .context("opening repository mount")?;
+        let store = MountSpec::new(STORE, &settings.store_path, MountSpecMode::ReadWrite)
+            .with_context(|| format!("opening store mount {}", settings.store_path.display()))?;
         let bytes = settings
             .max_memory_mb
             .checked_mul(1024 * 1024)
@@ -74,7 +79,10 @@ impl Runtime {
         let mut pool_config =
             PoolConfig::subprocess(std::env::current_exe().context("locating harness executable")?);
         pool_config.min_processes = 1;
-        pool_config.max_processes = 1;
+        // A chain of nested branches from depth 1 to `max_depth` is what can hold
+        // checkouts at once: each waiting parent keeps its turn's REPL.
+        pool_config.max_processes =
+            usize::try_from(settings.max_depth).context("rlm.max_depth is too large")?;
         let pool = Pool::new(pool_config)
             .await
             .context("starting Monty worker pool")?;
@@ -98,6 +106,7 @@ impl Runtime {
             repl_config: Arc::new(repl_config),
             repo,
             mount,
+            store,
             permission,
             memory_mb: settings.max_memory_mb,
         })
@@ -108,18 +117,34 @@ impl Runtime {
         self.permission.send_replace(permission);
     }
 
-    /// A fresh driver per turn; checkout and library load occur with its first call.
-    pub fn start(&self) -> Repl {
+    /// A fresh driver per turn for an agent at `depth`; checkout and library load occur
+    /// with its first call. Every feed carries the repository mount, `/store` from
+    /// depth 1, and `library`, the tree's `/library` mount, which the App supplies at
+    /// depth 2 and deeper only.
+    pub fn start(&self, depth: u32, library: Option<MountSpec>) -> Repl {
+        debug_assert!(
+            library.is_none() || depth >= 2,
+            "/library is mounted only at depth 2 and deeper"
+        );
+        let host_mounts = Mounts::at(depth, library.is_some());
+        // The repository comes first: a session's first feed sets the working
+        // directory to its first mount, so REPL relative paths resolve there.
+        let mut mounts = vec![self.mount.clone()];
+        if host_mounts.store {
+            mounts.push(self.store.clone());
+        }
+        mounts.extend(library);
         let (commands, incoming) = mpsc::unbounded_channel();
         let (events, output) = mpsc::unbounded_channel();
         let driver = Driver {
             pool: self.pool.clone(),
             config: self.repl_config.clone(),
             checkout: None,
-            mount: self.mount.clone(),
+            mounts,
             memory_mb: self.memory_mb,
             host: HostContext {
                 repo: self.repo.clone(),
+                mounts: host_mounts,
                 config: self.config.clone(),
                 permissions: self.permission.subscribe(),
                 events,
@@ -139,6 +164,13 @@ impl Runtime {
     pub async fn close(&self) {
         self.pool.close().await;
     }
+}
+
+/// Open a tree's `library/` directory as its read-only `/library` mount, for
+/// `Runtime::start`. Feeds clone the opened directory and never reopen its path.
+pub fn library_mount(dir: &Path) -> anyhow::Result<MountSpec> {
+    MountSpec::new(LIBRARY, dir, MountSpecMode::ReadOnly)
+        .with_context(|| format!("opening library mount {}", dir.display()))
 }
 
 enum DriverCommand {
@@ -207,7 +239,8 @@ struct Driver {
     config: Arc<ReplConfig>,
     checkout: Option<Checkout>,
     host: HostContext,
-    mount: MountSpec,
+    /// Passed to every feed, the repository first; `host.mounts` describes the rest.
+    mounts: Vec<MountSpec>,
     memory_mb: usize,
 }
 
@@ -324,7 +357,7 @@ impl Driver {
             .feed(
                 code,
                 NamedValues::new(),
-                vec![self.mount.clone()],
+                self.mounts.clone(),
                 false,
                 &mut on_print,
             )
@@ -479,7 +512,7 @@ fn checked_reply(value: ResumeValue, call_id: u32, function_name: &str) -> Resum
 }
 
 /// Enumerate optional library files; all errors other than an absent directory remain visible.
-fn library_paths(directory: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
+fn library_paths(directory: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -515,10 +548,16 @@ mod tests {
             pool: pool.clone(),
             config: Arc::new(ReplConfig::default()),
             checkout: None,
-            mount: MountSpec::new(repo.to_str().unwrap(), &repo, MountSpecMode::ReadWrite).unwrap(),
+            mounts: vec![
+                MountSpec::new(repo.to_str().unwrap(), &repo, MountSpecMode::ReadWrite).unwrap(),
+            ],
             memory_mb: 64,
             host: HostContext {
                 repo: repo.clone(),
+                mounts: Mounts {
+                    store: false,
+                    library: false,
+                },
                 config: Arc::new(HostConfig {
                     dir: repo,
                     model: String::new(),

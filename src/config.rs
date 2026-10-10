@@ -15,6 +15,7 @@ struct Config {
     endpoint: Endpoint,
     chat: Chat,
     repl: Repl,
+    rlm: Rlm,
     commands: Commands,
     approval_description: Option<ApprovalDescription>,
     theme: Theme,
@@ -104,9 +105,6 @@ struct Chat {
     /// System message sent ahead of the conversation in every chat request, never
     /// saved to the session. Omitted means no system message.
     prompt: Option<String>,
-    /// Send earlier turns' reasoning as `reasoning()` REPL calls (`tool_reasoning`).
-    /// Rewritten by `/tool-reasoning`.
-    tool_reasoning: bool,
 }
 
 #[derive(Deserialize)]
@@ -132,7 +130,27 @@ struct Repl {
     output_limit: usize,
 }
 
-/// REPL filesystem access inside the repository; outside access is denied at every level.
+/// Agent-tree limits; `load` rejects a zero `max_depth`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Rlm {
+    /// Deepest branch depth (the root is depth 0); agents at this depth are not offered `rlm`.
+    max_depth: u32,
+    store: Store,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Store {
+    /// Shared knowledge-base directory mounted at `/store` for branch agents, read-write
+    /// regardless of the repository permission. `load` requires an absolute path to an
+    /// existing directory.
+    path: PathBuf,
+}
+
+/// Repository access, for the REPL and the direct tools alike. The store (read-write) and
+/// the library (read-only), where an agent has them, do not depend on the level; every
+/// other path is denied.
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Permission {
@@ -187,12 +205,16 @@ pub struct Settings {
     pub dir: PathBuf,
     pub endpoint: ResolvedEndpoint,
     pub chat_prompt: Option<String>,
-    pub tool_reasoning: bool,
     pub repl_tool_description: String,
     pub permission: Permission,
     pub max_memory_mb: usize,
     pub commands: Commands,
     pub output_limit: usize,
+    /// `[rlm] max_depth`, at least 1.
+    pub max_depth: u32,
+    /// `[rlm.store] path`: absolute, and a directory when `load` checked it; the store
+    /// mount is opened from it at startup.
+    pub store_path: PathBuf,
     pub approval_description: Option<ApprovalDescriptionSettings>,
     pub theme: Theme,
 }
@@ -223,6 +245,38 @@ pub fn load(dir: &Path) -> anyhow::Result<Settings> {
                 path.display()
             );
         }
+    }
+
+    // Zero would leave no branch depth.
+    if config.rlm.max_depth == 0 {
+        bail!(
+            "{}: rlm.max_depth must be at least 1, got 0",
+            config_path.display()
+        );
+    }
+    // The store must already exist: it is never created or resolved against the
+    // launch directory. Symlinks are followed, so a link to a directory is accepted.
+    let store_path = config.rlm.store.path;
+    if !store_path.is_absolute() {
+        bail!(
+            "{}: rlm.store.path must be an absolute path, got {}",
+            config_path.display(),
+            store_path.display()
+        );
+    }
+    let store_metadata = std::fs::metadata(&store_path).with_context(|| {
+        format!(
+            "{}: rlm.store.path must be an existing directory, got {}",
+            config_path.display(),
+            store_path.display()
+        )
+    })?;
+    if !store_metadata.is_dir() {
+        bail!(
+            "{}: rlm.store.path must be a directory, got {}",
+            config_path.display(),
+            store_path.display()
+        );
     }
 
     // `.env` is read privately, never exported to the app's environment or its
@@ -258,12 +312,13 @@ pub fn load(dir: &Path) -> anyhow::Result<Settings> {
         approval_description,
         theme: config.theme,
         chat_prompt: config.chat.prompt,
-        tool_reasoning: config.chat.tool_reasoning,
         repl_tool_description: config.repl.tool_description,
         permission: config.repl.permission,
         max_memory_mb: config.repl.max_memory_mb,
         commands: config.commands,
         output_limit: config.repl.output_limit,
+        max_depth: config.rlm.max_depth,
+        store_path,
     })
 }
 
@@ -402,11 +457,6 @@ fn json_parameter(value: &toml::Value, key: &str) -> anyhow::Result<serde_json::
 /// Persist `permission` (Shift+Tab).
 pub fn save_permission(dir: &Path, permission: Permission) -> anyhow::Result<()> {
     save_setting(dir, "repl", "permission", permission.as_str().into())
-}
-
-/// Persist `tool_reasoning` (`/tool-reasoning`).
-pub fn save_tool_reasoning(dir: &Path, enabled: bool) -> anyhow::Result<()> {
-    save_setting(dir, "chat", "tool_reasoning", enabled.into())
 }
 
 /// Change only `[table] key` (creating the table if missing) so comments and

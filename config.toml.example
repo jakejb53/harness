@@ -156,12 +156,6 @@ If completed work requires running a script before it functions, the completion 
 - Plan files record the concrete inputs later phases need — IDs, commands, paths. Verify repo-defined flags, keys, and APIs exist before writing them into a plan step; if only execution can verify, that's the question to ask.
 """
 
-# Converts native reasoning to tool calls the agent can see.
-# This is non-destructive. It doesn't change the durable session file. Instead, it converts the messages array during runtime.
-# Toggleable via /tool-reasoning in the TUI
-#
-tool_reasoning = false
-
 [repl]
 tool_description = """
 Execute Python in a REPL session. State persists for the lifetime of the current turn — variables and data survive across the tool calls you make during the current turn, but never carry over to a later turn. Call help() to see the available functions and libraries.
@@ -169,6 +163,33 @@ Execute Python in a REPL session. State persists for the lifetime of the current
 permission = "none"          # none | read-only | read-write; Shift+Tab cycles
 max_memory_mb = 2048         # REPL worker memory limit in MiB
 output_limit = 100000        # bytes of output per call sent to the model
+
+# Recursive subagents. The root agent only delegates: its tools are rlm (hand a
+# task to a subagent and get back its final answer) and FYI (date, prompt-token
+# count, model name). Subagents get the REPL, apply_patch, read_file, grep, list,
+# and the store below, plus rlm while their depth is below max_depth.
+#
+[rlm]
+# Deepest subagent nesting. The root is depth 0, its subagents depth 1, theirs
+# depth 2, and so on; agents at max_depth are not offered rlm, so 1 means the
+# root's subagents cannot delegate. Agents at depth 2 and deeper can also read
+# this session's root and depth-1 transcripts (/library, read-only). A parent
+# keeps its REPL worker while its subagent runs, so up to max_depth workers run
+# at once, each capped at [repl] max_memory_mb. Integer >= 1.
+#
+max_depth = 2
+
+[rlm.store]
+# Shared knowledge-base directory for subagents: /store in the REPL and
+# root = "store" in apply_patch, read_file, grep, and list. Always read-write,
+# whatever [repl] permission is; the root agent has no access. One directory for
+# every session and repository; contents persist across runs. Absolute path (~ is
+# not expanded) to an existing directory, which may be a symlink; the harness
+# never creates it and refuses to start without it. It must not be inside, or
+# contain, the directory the harness is launched in: subagent REPL calls then
+# fail with an overlapping-mounts error.
+#
+path = "/absolute/path/to/store"
 
 [commands]
 deny = ["git", "rm"]         # always denied, even when also in allow

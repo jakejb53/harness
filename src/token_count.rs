@@ -241,11 +241,7 @@ impl Plan {
 /// Build progressive valid chat slices in the same order as compact display positions.
 fn build_plan(turn: &Turn, turn_index: usize, endpoint: &ResolvedEndpoint) -> anyhow::Result<Plan> {
     let slice = turn.messages.as_slice();
-    let injection = turn.is_injection();
     let mut current = Vec::new();
-    if injection {
-        current.push(json!({"role": "user", "content": ""}));
-    }
     let mut prefixes = Vec::new();
     let mut consumed_results = HashSet::new();
     let mut position = 0;
@@ -326,13 +322,8 @@ fn build_plan(turn: &Turn, turn_index: usize, endpoint: &ResolvedEndpoint) -> an
     }
 
     let expected: Vec<Value> = slice.iter().map(|message| json!(message)).collect();
-    let actual = if injection {
-        &current[1..]
-    } else {
-        &current[..]
-    };
     ensure!(
-        actual == expected,
+        current == expected,
         "turn prefix construction changed message order"
     );
     if prefixes
@@ -453,35 +444,25 @@ mod tests {
         }
     }
 
-    /// User turns and marked file pairs get independent ranges and matching positions.
+    /// Hidden synthetic prefixes advance the baseline without creating positions.
     #[test]
     fn turn_and_position_boundaries() {
-        let injection_id =
-            crate::tool_call_id::generate(crate::tool_call_id::INJECTED_FILE, &[]).unwrap();
         let synthetic_id =
             crate::tool_call_id::generate(crate::tool_call_id::SYNTHETIC, &[]).unwrap();
         let messages: Vec<Message> = serde_json::from_value(json!([
-            {"role":"assistant","content":"","tool_calls":[{"id":injection_id,"type":"function","function":{"name":"REPL","arguments":"{}"}}]},
-            {"role":"tool","tool_call_id":injection_id,"content":"file"},
             {"role":"user","content":"question"},
             {"role":"assistant","content":"","tool_calls":[{"id":synthetic_id,"type":"function","function":{"name":"REPL","arguments":"{\"code\":\"FYI()\"}"}}]},
             {"role":"tool","tool_call_id":synthetic_id,"content":"FYI"},
             {"role":"assistant","content":"answer","reasoning":"thought"}
         ])).unwrap();
-        let turns = vec![turn(messages[..2].to_vec()), turn(messages[2..].to_vec())];
+        let turns = vec![turn(messages)];
         let plans = plans(&turns, &endpoint()).unwrap();
-        assert_eq!(plans.len(), 2);
+        assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].turn_index, 0);
-        assert_eq!(plans[0].position_count(), 2);
-        assert_eq!(plans[1].turn_index, 1);
-        assert_eq!(plans[1].position_count(), 3);
-        let counted = from_prefix_counts(&plans[1], vec![10, 20, 30, 40], false);
+        assert_eq!(plans[0].position_count(), 3);
+        let counted = from_prefix_counts(&plans[0], vec![10, 20, 30, 40], false);
         assert_eq!(counted.positions, [10, 10, 10]);
         assert_eq!(counted.total, 40);
-        let injection = estimated(&plans[0]);
-        assert_eq!(injection.positions.len(), 2);
-        assert!(injection.estimated);
-        assert!(injection.total >= injection.positions.iter().sum());
     }
 
     /// Digest identity changes with durable content and tokenizer identity.
@@ -559,7 +540,7 @@ mod tests {
     /// Ending a turn queues its unchanged message revision for provider tokenization.
     #[test]
     fn active_turn_transition_queues_completed_plan() {
-        let mut session = crate::session::Session::new(std::path::Path::new("/unused"));
+        let mut session = crate::session::Session::new(std::path::Path::new("/unused")).unwrap();
         session.turns = vec![turn(vec![
             Message::user("question".into()),
             Message {

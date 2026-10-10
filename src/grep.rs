@@ -1,4 +1,4 @@
-//! Structured text searches backed by ripgrep and confined to the repository.
+//! Structured text searches backed by ripgrep and confined to the root a call names.
 
 use ::grep::printer::StandardBuilder;
 use ::grep::regex::{RegexMatcher, RegexMatcherBuilder};
@@ -13,6 +13,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use tokio::task::JoinHandle;
+
+use crate::root::{Access, Root};
 
 pub const DESCRIPTION: &str = "Search repository text files. Pattern is an extended regex unless fixed is true. Path is a literal repository-relative file or directory and defaults to the repository root; directories are searched recursively, including hidden and ignored files. Include is a case-sensitive glob matched against file basenames at every depth; empty means no filter. Matching and context lines are always file:line:text, with -- between context groups. Binary files are skipped. Recursive symlinks and special files are skipped with brief warnings. Reads require read-only or read-write permission and cannot escape the repository or follow absolute symlink targets. Generated filenames and diagnostics are repository-relative. The existing output limit applies.";
 
@@ -31,37 +33,50 @@ pub struct Arguments {
     pub include: String,
 }
 
-/// An omitted path explicitly means the launch repository, independently of the host working directory.
+/// An omitted path explicitly means the top of the root the call names, independently of
+/// the host working directory.
 fn default_path() -> String {
     ".".into()
 }
 
 pub struct Runtime {
-    root: Arc<Dir>,
+    /// The launch directory; searches follow `readable`.
+    repository: Arc<Dir>,
+    /// The store, readable at every permission level.
+    store: Arc<Dir>,
+    /// Whether the permission level allows repository reads.
     readable: Arc<AtomicBool>,
 }
 
 impl Runtime {
-    /// Acquire ambient authority only once, when establishing the launch-directory boundary.
-    pub fn new(root: &Path, readable: bool) -> io::Result<Self> {
+    /// Acquire ambient authority only once, when establishing the repository and store
+    /// boundaries.
+    pub fn new(repository: &Path, store: &Path, readable: bool) -> io::Result<Self> {
         Ok(Self {
-            root: Arc::new(Dir::open_ambient_dir(root, cap_std::ambient_authority())?),
+            repository: Arc::new(Dir::open_ambient_dir(
+                repository,
+                cap_std::ambient_authority(),
+            )?),
+            store: Arc::new(Dir::open_ambient_dir(store, cap_std::ambient_authority())?),
             readable: Arc::new(AtomicBool::new(readable)),
         })
     }
 
-    /// Permission changes affect the next filesystem operation of an active search too.
+    /// Permission changes affect the next filesystem operation of an active repository
+    /// search too.
     pub fn set_permission(&self, readable: bool) {
         self.readable.store(readable, Ordering::SeqCst);
     }
 
-    /// Keep pattern compilation, traversal, and searching off the UI thread, under one cancellable job.
-    pub fn start(&self, args: Arguments) -> Job {
-        let root = self.root.clone();
-        let readable = self.readable.clone();
+    /// Keep pattern compilation, traversal, and searching off the UI thread, under one
+    /// cancellable job confined to the root `access` names.
+    pub fn start(&self, args: Arguments, access: Access) -> Job {
+        let name = access.root();
+        let (root, readable) = access.readable(&self.repository, &self.store, &self.readable);
         let canceled = Arc::new(AtomicBool::new(false));
         let signal = canceled.clone();
-        let task = tokio::task::spawn_blocking(move || search(&root, &args, &readable, &signal));
+        let task =
+            tokio::task::spawn_blocking(move || search(&root, name, &args, &readable, &signal));
         Job { task, canceled }
     }
 }
@@ -72,7 +87,7 @@ pub struct Job {
 }
 
 impl Job {
-    /// Normal failures become tool results and never expose the ambient repository path.
+    /// Normal failures become tool results and never expose the ambient path of the root.
     pub async fn result(&mut self) -> String {
         match (&mut self.task).await {
             Ok(Ok(output)) => output,
@@ -155,8 +170,11 @@ struct Search<'a> {
 }
 
 /// Compile the pattern once and retain normal grep output plus visible per-file diagnostics.
+/// `root` is the capability of the root `name`, which errors about the call's path name
+/// ("store-relative", "repository-relative").
 fn search(
     root: &Dir,
+    name: Root,
     args: &Arguments,
     readable: &AtomicBool,
     canceled: &AtomicBool,
@@ -167,7 +185,7 @@ fn search(
     if path.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "path must be repository-relative",
+            format!("path must be {}-relative", name.as_str()),
         ));
     }
     let include = if args.include.is_empty() {
@@ -244,7 +262,8 @@ impl Search<'_> {
         Ok(())
     }
 
-    /// Every lookup uses the original repository capability, including paths reached recursively.
+    /// Every lookup uses the capability for the root the call names, including paths reached
+    /// recursively.
     fn search_path(&mut self, path: &Path, operand: bool) -> io::Result<()> {
         let metadata = self.root.symlink_metadata(path)?;
         // Traversal never follows links; direct file operands retain confined link-following.
@@ -372,6 +391,7 @@ mod tests {
             let args = serde_json::from_value(arguments).map_err(io::Error::other)?;
             search(
                 &self.root,
+                Root::Repository,
                 &args,
                 &AtomicBool::new(true),
                 &AtomicBool::new(false),
@@ -694,18 +714,21 @@ mod tests {
     async fn grep_runtime_permissions_and_job_drop() {
         let repo = Fixture::new();
         repo.write("f", "needle\n");
-        let runtime = Runtime::new(&repo.path, false).unwrap();
+        let runtime = Runtime::new(&repo.path, &repo.path, false).unwrap();
         let args = || serde_json::from_value(json!({"pattern":"needle","path":"f"})).unwrap();
         assert!(
             runtime
-                .start(args())
+                .start(args(), Access::Repository)
                 .result()
                 .await
                 .contains("permission level is none")
         );
         runtime.set_permission(true);
-        assert_eq!(runtime.start(args()).result().await, "f:1:needle\n");
-        let job = runtime.start(args());
+        assert_eq!(
+            runtime.start(args(), Access::Repository).result().await,
+            "f:1:needle\n"
+        );
+        let job = runtime.start(args(), Access::Repository);
         let signal = job.canceled.clone();
         drop(job);
         assert!(signal.load(Ordering::SeqCst));

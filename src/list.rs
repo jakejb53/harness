@@ -1,4 +1,5 @@
-//! Directory entry metadata through repository capabilities, without opening file contents.
+//! Directory entry metadata through a root's directory capability, without opening file
+//! contents.
 
 use cap_std::fs::{Dir, DirEntry, Metadata};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -16,6 +17,8 @@ use std::sync::{
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 
+use crate::root::{Access, Root};
+
 pub const DESCRIPTION: &str = "List a repository-relative directory; path defaults to the repository root. Non-recursive by default. Include is a case-sensitive basename glob filtering emitted entries at every depth; empty means all entries. Recursive traversal enters nonmatching directories too. Hidden entries are included. Output is sorted by relative path, one row per entry: quoted/escaped path, exact metadata size in bytes, and UTC mtime with nanosecond precision. Directories have a trailing /; symlinks and special files have type labels and use their own metadata. Directory sizes are metadata sizes, not recursive totals. Recursive traversal never follows symlinks. Requires read-only or read-write permission; repository containment and the existing output limit apply.";
 
 #[derive(Deserialize)]
@@ -28,37 +31,50 @@ pub struct Arguments {
     pub include: String,
 }
 
-/// An omitted path explicitly means the launch repository, independently of the host working directory.
+/// An omitted path explicitly means the top of the root the call names, independently of
+/// the host working directory.
 fn default_path() -> String {
     ".".into()
 }
 
 pub struct Runtime {
-    root: Arc<Dir>,
+    /// The launch directory; listings follow `readable`.
+    repository: Arc<Dir>,
+    /// The store, readable at every permission level.
+    store: Arc<Dir>,
+    /// Whether the permission level allows repository reads.
     readable: Arc<AtomicBool>,
 }
 
 impl Runtime {
-    /// Acquire ambient authority only once, when establishing the launch-directory boundary.
-    pub fn new(root: &Path, readable: bool) -> io::Result<Self> {
+    /// Acquire ambient authority only once, when establishing the repository and store
+    /// boundaries.
+    pub fn new(repository: &Path, store: &Path, readable: bool) -> io::Result<Self> {
         Ok(Self {
-            root: Arc::new(Dir::open_ambient_dir(root, cap_std::ambient_authority())?),
+            repository: Arc::new(Dir::open_ambient_dir(
+                repository,
+                cap_std::ambient_authority(),
+            )?),
+            store: Arc::new(Dir::open_ambient_dir(store, cap_std::ambient_authority())?),
             readable: Arc::new(AtomicBool::new(readable)),
         })
     }
 
-    /// Permission changes affect the next metadata operation of an active listing too.
+    /// Permission changes affect the next metadata operation of an active repository
+    /// listing too.
     pub fn set_permission(&self, readable: bool) {
         self.readable.store(readable, Ordering::SeqCst);
     }
 
-    /// Keep directory traversal and metadata formatting off the UI thread in one cancellable job.
-    pub fn start(&self, args: Arguments) -> Job {
-        let root = self.root.clone();
-        let readable = self.readable.clone();
+    /// Keep directory traversal and metadata formatting off the UI thread in one
+    /// cancellable job confined to the root `access` names.
+    pub fn start(&self, args: Arguments, access: Access) -> Job {
+        let name = access.root();
+        let (root, readable) = access.readable(&self.repository, &self.store, &self.readable);
         let canceled = Arc::new(AtomicBool::new(false));
         let signal = canceled.clone();
-        let task = tokio::task::spawn_blocking(move || listing(&root, &args, &readable, &signal));
+        let task =
+            tokio::task::spawn_blocking(move || listing(&root, name, &args, &readable, &signal));
         Job { task, canceled }
     }
 }
@@ -69,7 +85,7 @@ pub struct Job {
 }
 
 impl Job {
-    /// Normal failures become tool results and never expose the ambient repository path.
+    /// Normal failures become tool results and never expose the ambient path of the root.
     pub async fn result(&mut self) -> String {
         match (&mut self.task).await {
             Ok(Ok(output)) => output,
@@ -111,9 +127,12 @@ struct Listing<'a> {
     diagnostics: Vec<String>,
 }
 
-/// Resolve the requested directory inside the repository and return freshly measured, sorted entries.
+/// Resolve the requested directory inside the root the call names and return freshly
+/// measured, sorted entries. `root` is the capability of the root `name`, which errors
+/// about the call's path name ("store-relative", "repository-relative").
 fn listing(
     root: &Dir,
+    name: Root,
     args: &Arguments,
     readable: &AtomicBool,
     canceled: &AtomicBool,
@@ -123,7 +142,7 @@ fn listing(
     if path.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "path must be a repository-relative directory",
+            format!("path must be a {}-relative directory", name.as_str()),
         ));
     }
     let include = if args.include.is_empty() {
@@ -328,6 +347,7 @@ mod tests {
             let args = serde_json::from_value(arguments).map_err(io::Error::other)?;
             listing(
                 &self.root,
+                Root::Repository,
                 &args,
                 &AtomicBool::new(true),
                 &AtomicBool::new(false),
@@ -501,11 +521,11 @@ mod tests {
     async fn list_permissions_and_cancellation() {
         let repo = Fixture::new();
         repo.write("f", "x");
-        let runtime = Runtime::new(&repo.path, false).unwrap();
+        let runtime = Runtime::new(&repo.path, &repo.path, false).unwrap();
         let args = || serde_json::from_value(json!({})).unwrap();
         assert!(
             runtime
-                .start(args())
+                .start(args(), Access::Repository)
                 .result()
                 .await
                 .contains("permission level is none")
@@ -513,13 +533,22 @@ mod tests {
         runtime.set_permission(true);
         assert!(
             runtime
-                .start(args())
+                .start(args(), Access::Repository)
                 .result()
                 .await
                 .starts_with("\"./f\"  1  ")
         );
         let canceled = AtomicBool::new(true);
-        assert!(listing(&repo.root, &args(), &AtomicBool::new(true), &canceled).is_err());
+        assert!(
+            listing(
+                &repo.root,
+                Root::Repository,
+                &args(),
+                &AtomicBool::new(true),
+                &canceled
+            )
+            .is_err()
+        );
         let readable = AtomicBool::new(true);
         let active = AtomicBool::new(false);
         allowed(&readable, &active).unwrap();
@@ -528,7 +557,7 @@ mod tests {
             allowed(&readable, &active).unwrap_err().kind(),
             io::ErrorKind::PermissionDenied
         );
-        let job = runtime.start(args());
+        let job = runtime.start(args(), Access::Repository);
         let signal = job.canceled.clone();
         drop(job);
         assert!(signal.load(Ordering::SeqCst));

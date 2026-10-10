@@ -1,7 +1,7 @@
-//! Session turns are the durable conversation, before request-time context filtering
-//! and tool reasoning. Messages are appended within turns, except that resume inserts results for
-//! unanswered tool calls, and each turn removes earlier `FYI()`/`help()`-only calls
-//! (`remove_calls`).
+//! Session turns are the durable conversation, before request-time context filtering.
+//! Messages are appended within turns, except that resume inserts results for
+//! unanswered tool calls, and each turn removes earlier `FYI` tool calls and earlier
+//! REPL calls made only of `FYI()`/`help()` (`remove_calls`).
 //! Partial replies are kept as-is, except that a tool call still
 //! streaming when the reply ended is dropped. Assistant messages keep every field
 //! the endpoint streamed, including ones the app doesn't know.
@@ -14,9 +14,20 @@ use anyhow::{Context, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-/// Sessions directory, inside the harness directory. A session's name is its file
-/// name without `.json`.
+/// Sessions directory, inside the harness directory. Each tree is one directory,
+/// `sessions/<name>/`: the root is `library/root.json`, depth 1 branches are
+/// `library/<call-id>.json`, and deeper branches are `deep/<call-id>.json`. Anything
+/// else under `sessions/`, such as a pre-RLM flat `<name>.json`, is not a session.
 const SESSIONS_DIR: &str = "sessions";
+
+/// Tree subdirectory holding the root and depth 1 branches.
+const LIBRARY_DIR: &str = "library";
+
+/// Tree subdirectory holding branches at depth 2 and deeper.
+const DEEP_DIR: &str = "deep";
+
+/// The root session's ID: its file stem, and the `parent` its depth 1 branches record.
+const ROOT_ID: &str = "root";
 
 /// Result recorded for a complete tool call that never ran.
 pub const NOT_RUN: &str = "[not run: turn stopped]";
@@ -140,19 +151,22 @@ pub struct FunctionCall {
     pub extra: Map<String, Value>,
 }
 
-/// Cached derived data is local to Harness and never enters provider requests.
-#[derive(Serialize, Deserialize, Default, Clone)]
+/// Harness-only session data that never enters provider requests. `repository`,
+/// `depth`, and `parent` are set when the session is created and never rewritten, so
+/// they are private to this module; only the derived token cache changes.
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct LocalMetadata {
+    /// Canonical launch directory of the process that created the session. Recorded
+    /// only; resume never compares it with the current launch directory.
+    repository: String,
+    /// 0 for the root; a branch is one deeper than the agent that spawned it.
+    depth: u32,
+    /// Absent at depth 0; `root` at depth 1; the parent's call ID deeper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub turn_token_cache: Vec<TurnTokenCache>,
-}
-
-impl LocalMetadata {
-    /// Empty metadata is omitted so ordinary session files retain their minimal shape.
-    fn is_empty(&self) -> bool {
-        self.turn_token_cache.is_empty()
-    }
 }
 
 /// One complete tokenization result, keyed by every input that affects it.
@@ -171,13 +185,6 @@ pub struct TurnTokenCache {
 pub struct Turn {
     pub messages: Vec<Message>,
     pub hidden: bool,
-}
-
-impl Turn {
-    /// File injections are dedicated two-message turns identified by their encoded call ID.
-    pub fn is_injection(&self) -> bool {
-        self.messages.len() == 2 && is_injection_start(&self.messages, 0)
-    }
 }
 
 /// A local marker follows the turn it hides inside the saved `messages` stream.
@@ -227,7 +234,9 @@ impl<'de> Deserialize<'de> for SessionEntry {
 #[serde(deny_unknown_fields)]
 struct SessionFile {
     messages: Vec<SessionEntry>,
-    #[serde(default, rename = "_harness_local")]
+    // Required: a file without `repository` and `depth` (such as a pre-RLM session)
+    // is not a session.
+    #[serde(rename = "_harness_local")]
     local: LocalMetadata,
 }
 
@@ -243,79 +252,71 @@ enum SessionEntryRef<'a> {
 #[derive(Serialize)]
 struct SessionFileRef<'a> {
     messages: Vec<SessionEntryRef<'a>>,
-    #[serde(
-        rename = "_harness_local",
-        skip_serializing_if = "LocalMetadata::is_empty"
-    )]
+    #[serde(rename = "_harness_local")]
     local: &'a LocalMetadata,
 }
 
+/// One session file in a tree. Its location is derived from the tree name, its ID,
+/// and its depth (`path`), never stored separately.
 pub struct Session {
-    pub path: PathBuf,
+    /// The harness's `sessions/` directory.
+    sessions_dir: PathBuf,
+    /// The tree directory's name under `sessions_dir`; `/rename` changes it.
+    tree: String,
+    /// `ROOT_ID` for the root, else the branch's call ID. Names the file.
+    id: String,
     pub turns: Vec<Turn>,
     pub local: LocalMetadata,
     revision: u64,
 }
 
-/// Session file name for `name`. Names must stay inside the sessions directory and
-/// not collide with hidden or temp files: not empty, no `/`, no leading `.`.
-fn file_name(name: &str) -> anyhow::Result<String> {
+/// Tree names must stay inside the sessions directory and not collide with hidden or
+/// temp entries: not empty, no `/`, no leading `.`.
+fn validate_name(name: &str) -> anyhow::Result<()> {
     if name.is_empty() || name.contains('/') || name.starts_with('.') {
         bail!("invalid session name: {name:?}");
     }
-    Ok(format!("{name}.json"))
+    Ok(())
 }
 
-/// A marked injection is one dedicated assistant call followed by its result.
-fn is_injection_start(messages: &[Message], index: usize) -> bool {
-    let Some(message) = messages.get(index) else {
-        return false;
-    };
-    let Some(call) = message.tool_calls.as_ref().and_then(|calls| calls.first()) else {
-        return false;
-    };
-    message.role == Role::Assistant
-        && message
-            .tool_calls
-            .as_ref()
-            .is_some_and(|calls| calls.len() == 1)
-        && crate::tool_call_id::decode(&call.id)
-            .is_some_and(|metadata| metadata.kind == crate::tool_call_id::INJECTED_FILE)
-        && messages.get(index + 1).is_some_and(|result| {
-            result.role == Role::Tool && result.tool_call_id.as_deref() == Some(call.id.as_str())
-        })
+/// The file of session `id` at `depth` in tree directory `tree`: the root and depth 1
+/// branches are in `library/`, deeper branches in `deep/`.
+fn file_path(tree: &Path, depth: u32, id: &str) -> PathBuf {
+    let subdir = if depth <= 1 { LIBRARY_DIR } else { DEEP_DIR };
+    tree.join(subdir).join(format!("{id}.json"))
 }
 
-/// Split provider messages into user turns and standalone marked file injections.
+/// The canonical launch directory of this process, recorded as a new session's
+/// `repository`. Not UTF-8 is an error rather than a lossy record.
+fn launch_repository() -> anyhow::Result<String> {
+    let directory = std::env::current_dir()
+        .context("finding launch directory")?
+        .canonicalize()
+        .context("resolving launch directory")?;
+    directory
+        .into_os_string()
+        .into_string()
+        .map_err(|directory| anyhow::anyhow!("launch directory is not valid UTF-8: {directory:?}"))
+}
+
+/// Split provider messages into turns, each starting at a user message. Messages
+/// before the first user message form a turn of their own.
 fn turn_ranges(messages: &[Message]) -> Vec<std::ops::Range<usize>> {
     let mut ranges = Vec::new();
     let mut start = None;
-    let mut index = 0;
-    while index < messages.len() {
-        if is_injection_start(messages, index) {
-            if let Some(first) = start.take() {
-                ranges.push(first..index);
-            }
-            ranges.push(index..index + 2);
-            index += 2;
-            continue;
-        }
-        if messages[index].role == Role::User {
+    for (index, message) in messages.iter().enumerate() {
+        if message.role == Role::User {
             if let Some(first) = start.replace(index) {
                 ranges.push(first..index);
             }
         } else if start.is_none() {
             start = Some(index);
         }
-        index += 1;
     }
     if let Some(first) = start {
         ranges.push(first..messages.len());
     }
     ranges
-        .into_iter()
-        .filter(|range| !range.is_empty())
-        .collect()
 }
 
 /// Resolve local markers against derived turn boundaries without guessing placement.
@@ -353,8 +354,8 @@ fn turns_from_entries(entries: Vec<SessionEntry>) -> anyhow::Result<Vec<Turn>> {
         .collect())
 }
 
-/// Names of saved sessions, least recently changed first. No sessions directory
-/// means no sessions.
+/// Names of saved trees, least recently changed root first (`root.json` mtime). No
+/// sessions directory means no sessions.
 pub fn list(harness_dir: &Path) -> anyhow::Result<Vec<String>> {
     let dir = harness_dir.join(SESSIONS_DIR);
     let entries = match std::fs::read_dir(&dir) {
@@ -364,51 +365,102 @@ pub fn list(harness_dir: &Path) -> anyhow::Result<Vec<String>> {
     };
     let mut sessions = Vec::new();
     for entry in entries {
-        let path = entry
-            .with_context(|| format!("reading {}", dir.display()))?
-            .path();
-        // Skips `.json.tmp` files left by an interrupted save.
-        if path.extension().is_none_or(|extension| extension != "json") {
-            continue;
-        }
-        let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+        let Ok(name) = entry.file_name().into_string() else {
             continue;
         };
-        let modified = std::fs::metadata(&path)
-            .and_then(|metadata| metadata.modified())
-            .with_context(|| format!("reading {}", path.display()))?;
-        sessions.push((modified, name.to_string()));
+        // An entry without `library/root.json` is not a tree: a pre-RLM flat file
+        // (`NotADirectory`), or a directory whose first save was interrupted before
+        // the root file was renamed into place (`NotFound`).
+        let root = file_path(&entry.path(), 0, ROOT_ID);
+        let modified = match std::fs::metadata(&root).and_then(|metadata| metadata.modified()) {
+            Ok(modified) => modified,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error).with_context(|| format!("reading {}", root.display())),
+        };
+        sessions.push((modified, name));
     }
     sessions.sort();
     Ok(sessions.into_iter().map(|(_, name)| name).collect())
 }
 
 impl Session {
-    /// A new session, named by its start time. The file is not created until the
-    /// first `save`, so a launch with no messages leaves nothing behind.
-    pub fn new(harness_dir: &Path) -> Self {
-        let name = chrono::Local::now().format("%Y%m%d-%H%M%S");
-        Session {
-            path: harness_dir.join(SESSIONS_DIR).join(format!("{name}.json")),
+    /// A new root session at depth 0, in a tree named by its start time. The file is
+    /// not created until the first `save`, so a launch with no messages leaves nothing
+    /// behind.
+    pub fn new(harness_dir: &Path) -> anyhow::Result<Self> {
+        Ok(Session {
+            sessions_dir: harness_dir.join(SESSIONS_DIR),
+            tree: chrono::Local::now().format("%Y%m%d-%H%M%S").to_string(),
+            id: ROOT_ID.to_string(),
             turns: Vec::new(),
-            local: LocalMetadata::default(),
+            local: LocalMetadata {
+                repository: launch_repository()?,
+                depth: 0,
+                parent: None,
+                turn_token_cache: Vec::new(),
+            },
             revision: 0,
-        }
+        })
     }
 
-    /// Load session `name`. Tool calls left without results (the app was killed or
-    /// crashed mid-turn) get `NOT_RUN` results, saved immediately, since the endpoint
-    /// rejects every request while any are missing. Returns how many were added.
+    /// A new branch in this session's tree for the `rlm` call `call_id`, one depth
+    /// below this session and recording it as `parent`. Like `new`, the file is not
+    /// created until the first `save`.
+    pub fn branch(&self, call_id: &str) -> anyhow::Result<Self> {
+        // Branch IDs use the encoded call-ID format, which also keeps them valid file
+        // names distinct from `ROOT_ID`.
+        ensure!(
+            crate::tool_call_id::decode(call_id).is_some(),
+            "invalid branch call ID: {call_id:?}"
+        );
+        Ok(Session {
+            sessions_dir: self.sessions_dir.clone(),
+            tree: self.tree.clone(),
+            id: call_id.to_string(),
+            turns: Vec::new(),
+            local: LocalMetadata {
+                repository: launch_repository()?,
+                depth: self.local.depth + 1,
+                parent: Some(self.id.clone()),
+                turn_token_cache: Vec::new(),
+            },
+            revision: 0,
+        })
+    }
+
+    /// Load the root of tree `name`, `library/root.json`. Tool calls left without
+    /// results (the app was killed or crashed mid-turn) get `NOT_RUN` results, saved
+    /// immediately, since the endpoint rejects every request while any are missing.
+    /// Returns how many were added.
     pub fn resume(harness_dir: &Path, name: &str) -> anyhow::Result<(Self, usize)> {
-        let path = harness_dir.join(SESSIONS_DIR).join(file_name(name)?);
+        validate_name(name)?;
+        let sessions_dir = harness_dir.join(SESSIONS_DIR);
+        let path = file_path(&sessions_dir.join(name), 0, ROOT_ID);
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
         let file: SessionFile =
             serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         let turns = turns_from_entries(file.messages)
             .with_context(|| format!("parsing {}", path.display()))?;
+        // The root file's location fixes its identity; metadata claiming otherwise is
+        // corrupt, and accepting it would move the file on the next save (`path`).
+        ensure!(
+            file.local.depth == 0 && file.local.parent.is_none(),
+            "parsing {}: the root session must record depth 0 and no parent",
+            path.display()
+        );
         let mut session = Session {
-            path,
+            sessions_dir,
+            tree: name.to_string(),
+            id: ROOT_ID.to_string(),
             turns,
             local: file.local,
             revision: 0,
@@ -421,12 +473,43 @@ impl Session {
         Ok((session, repaired))
     }
 
+    /// This session's file, derived from the current tree name, so it follows
+    /// `/rename`.
+    pub fn path(&self) -> PathBuf {
+        file_path(
+            &self.sessions_dir.join(&self.tree),
+            self.local.depth,
+            &self.id,
+        )
+    }
+
+    /// This tree's `library/` directory (the root and depth 1 transcripts), derived
+    /// from the current tree name, so it follows `/rename`.
+    pub fn library_dir(&self) -> PathBuf {
+        self.sessions_dir.join(&self.tree).join(LIBRARY_DIR)
+    }
+
+    /// The recorded depth: 0 for the root.
+    pub fn depth(&self) -> u32 {
+        self.local.depth
+    }
+
+    /// The name that identifies this session to the user and in failure records: the
+    /// tree directory name for the root, the call ID for a branch.
+    pub fn name(&self) -> &str {
+        if self.local.depth == 0 {
+            &self.tree
+        } else {
+            &self.id
+        }
+    }
+
     /// Every durable provider message in transcript order, including hidden turns.
     pub fn messages(&self) -> impl DoubleEndedIterator<Item = &Message> {
         self.turns.iter().flat_map(|turn| turn.messages.iter())
     }
 
-    /// Provider messages selected by the context editor, copied for request-time rewrites.
+    /// Provider messages selected by the context editor: the conversation requests send.
     pub fn visible_messages(&self) -> Vec<Message> {
         self.turns
             .iter()
@@ -514,114 +597,29 @@ impl Session {
         Ok(())
     }
 
-    /// Attach completed local reads without a user message or any turn-start calls.
-    pub fn inject(
-        &mut self,
-        prepared: Vec<crate::injection::PreparedInjection>,
-    ) -> anyhow::Result<()> {
-        let turn_count = self.turns.len();
-        for injection in prepared {
-            let id = injection.call.id.clone();
-            self.turns.push(Turn {
-                messages: vec![
-                    Message {
-                        role: Role::Assistant,
-                        tool_calls: Some(vec![injection.call]),
-                        ..Default::default()
-                    },
-                    Message::tool(id, injection.content),
-                ],
-                hidden: false,
-            });
-        }
-        if let Err(error) = self.save() {
-            self.turns.truncate(turn_count);
-            return Err(error);
-        }
-        self.revision = self.revision.wrapping_add(1);
-        Ok(())
-    }
-
-    /// Keep marked attachments exclusive and paired, even without a removal control.
-    pub fn validate_injections(&self) -> anyhow::Result<()> {
-        let messages: Vec<_> = self.messages().collect();
-        let mut base = 0;
-        for turn in &self.turns {
-            for (offset, message) in turn.messages.iter().enumerate() {
-                let Some(calls) = &message.tool_calls else {
-                    continue;
-                };
-                for call in calls {
-                    if crate::tool_call_id::decode(&call.id)
-                        .is_none_or(|metadata| metadata.kind != crate::tool_call_id::INJECTED_FILE)
-                    {
-                        continue;
-                    }
-                    // A marked call identifies one whole attachment turn, not a mixed message.
-                    let call_count = messages
-                        .iter()
-                        .filter_map(|entry| entry.tool_calls.as_ref())
-                        .flatten()
-                        .filter(|entry| entry.id == call.id)
-                        .count();
-                    if call_count != 1
-                        || turn.messages.len() != 2
-                        || offset != 0
-                        || message.role != Role::Assistant
-                        || !message.content.is_empty()
-                        || !message.extra.is_empty()
-                        || calls.len() != 1
-                        || call.function.name != "REPL"
-                    {
-                        bail!(
-                            "invalid file injection {:?}: expected one dedicated REPL call",
-                            call.id
-                        );
-                    }
-                    let results: Vec<_> = messages
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, entry)| {
-                            entry.tool_call_id.as_deref() == Some(call.id.as_str())
-                        })
-                        .collect();
-                    if results.len() != 1
-                        || results[0].0 != base + offset + 1
-                        || results[0].1.role != Role::Tool
-                    {
-                        bail!(
-                            "invalid file injection {:?}: expected its result immediately after the call",
-                            call.id
-                        );
-                    }
-                    crate::injection::filename(call)?;
-                }
-            }
-            base += turn.messages.len();
-        }
-        Ok(())
-    }
-
-    /// `/rename`: rename the session file, or before the first save, the file it will
-    /// be created as. An existing session is never overwritten.
+    /// `/rename`: rename the tree directory, or before the first save, the directory
+    /// it will be created as. Every session file in the tree moves with it. An
+    /// existing destination is never overwritten; the explicit check matters because
+    /// a directory rename silently replaces an empty destination directory.
     pub fn rename(&mut self, name: &str) -> anyhow::Result<()> {
-        let path = self.path.with_file_name(file_name(name)?);
-        if path == self.path {
+        validate_name(name)?;
+        if name == self.tree {
             return Ok(());
         }
-        if path.exists() {
+        let from = self.sessions_dir.join(&self.tree);
+        let to = self.sessions_dir.join(name);
+        if to.exists() {
             bail!("session {name} already exists");
         }
-        if self.path.exists() {
-            std::fs::rename(&self.path, &path).with_context(|| {
-                format!("renaming {} to {}", self.path.display(), path.display())
-            })?;
+        if from.exists() {
+            std::fs::rename(&from, &to)
+                .with_context(|| format!("renaming {} to {}", from.display(), to.display()))?;
         }
-        self.path = path;
+        self.tree = name.to_string();
         Ok(())
     }
 
-    /// Remove untracked tool calls matching `matches`, with results, and save if
+    /// Remove tool calls matching `matches`, with results, and save if
     /// anything changed. An assistant message left empty (`Message::is_empty`) is
     /// removed too; one that still has content or another field stays without the
     /// call. Returns the pre-removal indices of the removed messages, ascending.
@@ -638,11 +636,7 @@ impl Session {
                     continue;
                 };
                 calls.retain(|call| {
-                    // Only explicit instance removal may delete a user attachment.
-                    let injected = crate::tool_call_id::decode(&call.id).is_some_and(|metadata| {
-                        metadata.kind == crate::tool_call_id::INJECTED_FILE
-                    });
-                    let remove = !injected && matches(call);
+                    let remove = matches(call);
                     if remove {
                         removed_ids.insert(call.id.clone());
                     }
@@ -699,7 +693,9 @@ impl Session {
     fn save(&self) -> anyhow::Result<()> {
         use std::io::Write;
 
-        if let Some(dir) = self.path.parent() {
+        let path = self.path();
+        // The first save of a tree creates `sessions/<name>/` and its subdirectory.
+        if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         let mut messages = Vec::with_capacity(
@@ -717,21 +713,20 @@ impl Session {
             messages,
             local: &self.local,
         })?;
-        let tmp = self.path.with_extension("json.tmp");
+        let tmp = path.with_extension("json.tmp");
         let mut file =
             std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         file.write_all(json.as_bytes())
             .and_then(|()| file.sync_all())
             .with_context(|| format!("writing {}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path)
-            .with_context(|| format!("renaming {} to {}", tmp.display(), self.path.display()))
+        std::fs::rename(&tmp, &path)
+            .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))
     }
 }
 
 #[cfg(test)]
-mod injection_tests {
+mod tests {
     use super::*;
-    use crate::injection::PreparedInjection;
     use serde_json::json;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -742,7 +737,7 @@ mod injection_tests {
         fn new() -> Self {
             static SEQUENCE: AtomicU64 = AtomicU64::new(0);
             let root = std::env::temp_dir().join(format!(
-                "harness-session-injection-{}-{}-{}",
+                "harness-session-{}-{}-{}",
                 std::process::id(),
                 chrono::Local::now().timestamp_nanos_opt().unwrap(),
                 SEQUENCE.fetch_add(1, Ordering::Relaxed)
@@ -753,8 +748,8 @@ mod injection_tests {
 
         /// Use a fixed session name within this fixture for resume assertions.
         fn session(&self) -> Session {
-            let mut session = Session::new(&self.0);
-            session.path = self.0.join("sessions/test.json");
+            let mut session = Session::new(&self.0).unwrap();
+            session.tree = "test".into();
             session
         }
 
@@ -771,23 +766,6 @@ mod injection_tests {
         }
     }
 
-    /// Construct a marked completed read without accessing any source file.
-    fn prepared(content: &str) -> PreparedInjection {
-        PreparedInjection {
-            call: ToolCall {
-                id: crate::tool_call_id::generate(crate::tool_call_id::INJECTED_FILE, &[]).unwrap(),
-                kind: "function".into(),
-                function: FunctionCall {
-                    name: "REPL".into(),
-                    arguments: json!({"code": "from pathlib import Path\nprint(Path(\"missing.txt\").read_bytes().decode('utf-8'), end='')"}).to_string(),
-                    extra: Map::new(),
-                },
-                extra: Map::new(),
-            },
-            content: content.into(),
-        }
-    }
-
     /// Borrow the flat provider-message view used by transcript and request tests.
     fn messages(session: &Session) -> Vec<&Message> {
         session.messages().collect()
@@ -796,42 +774,6 @@ mod injection_tests {
     /// Compare the provider-message state independently of local caches.
     fn state(session: &Session) -> Value {
         json!({"messages": messages(session)})
-    }
-
-    /// Duplicate injections and full results survive resume as saved messages.
-    #[test]
-    fn marked_duplicate_instances_persist_as_messages_only() {
-        let fixture = Fixture::new();
-        let mut session = fixture.session();
-        let large = "full contents\r\n".repeat(20_000);
-        session
-            .inject(vec![prepared(&large), prepared("")])
-            .unwrap();
-        let current = messages(&session);
-        assert_eq!(current.len(), 4);
-        assert_eq!(current[1].content, large);
-        assert_eq!(current[3].content, "");
-        let first = &current[0].tool_calls.as_ref().unwrap()[0].id;
-        let second = &current[2].tool_calls.as_ref().unwrap()[0].id;
-        assert_ne!(first, second);
-        let saved: Value =
-            serde_json::from_str(&std::fs::read_to_string(&session.path).unwrap()).unwrap();
-        assert_eq!(saved, state(&session));
-        assert_eq!(saved.as_object().unwrap().len(), 1);
-        let (resumed, repaired) = fixture.resume().unwrap();
-        assert_eq!(repaired, 0);
-        assert_eq!(state(&resumed), saved);
-        for enabled in [false, true] {
-            let visible = resumed.visible_messages();
-            assert_eq!(
-                json!(crate::tool_reasoning::request_messages(&visible, enabled)),
-                saved["messages"]
-            );
-        }
-        session.submit("Review these".into()).unwrap();
-        let current = messages(&session);
-        assert!(current[4].role == Role::User);
-        assert_eq!(json!(&current[..4]), saved["messages"]);
     }
 
     /// Hidden state is adjacent to its turn, survives resume, and never reaches requests.
@@ -865,26 +807,24 @@ mod injection_tests {
         session.toggle_hidden(0).unwrap();
 
         let saved: Value =
-            serde_json::from_str(&std::fs::read_to_string(&session.path).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(session.path()).unwrap()).unwrap();
         assert_eq!(
             saved["messages"][3],
             json!({"_harness_local":{"hidden":true}})
         );
         assert_eq!(session.visible_messages().len(), 1);
         assert_eq!(session.visible_messages()[0].content, "second");
-        for enabled in [false, true] {
-            assert_eq!(
-                crate::tool_reasoning::request_messages(&session.visible_messages(), enabled),
-                [json!({"role":"user","content":"second"})]
-            );
-        }
+        assert_eq!(
+            json!(session.visible_messages()),
+            json!([{"role":"user","content":"second"}])
+        );
 
         let mut resumed = fixture.resume().unwrap().0;
         assert!(resumed.turns[0].hidden);
         assert!(!resumed.turns[1].hidden);
         resumed.toggle_hidden(0).unwrap();
         let saved: Value =
-            serde_json::from_str(&std::fs::read_to_string(&resumed.path).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(resumed.path()).unwrap()).unwrap();
         assert!(
             saved["messages"]
                 .as_array()
@@ -894,26 +834,6 @@ mod injection_tests {
         );
     }
 
-    /// Standalone file-injection turns use the same persistent visibility marker.
-    #[test]
-    fn injected_file_turn_can_be_hidden() {
-        let fixture = Fixture::new();
-        let mut session = fixture.session();
-        session.inject(vec![prepared("file contents")]).unwrap();
-        session.toggle_hidden(0).unwrap();
-        assert!(session.visible_messages().is_empty());
-
-        let saved: Value =
-            serde_json::from_str(&std::fs::read_to_string(&session.path).unwrap()).unwrap();
-        assert_eq!(
-            saved["messages"][2],
-            json!({"_harness_local":{"hidden":true}})
-        );
-        let resumed = fixture.resume().unwrap().0;
-        assert!(resumed.turns[0].is_injection());
-        assert!(resumed.turns[0].hidden);
-    }
-
     /// Markers must follow exactly one derived turn; unmarked sessions stay fully visible.
     #[test]
     fn marker_validation_preserves_unmarked_sessions() {
@@ -921,13 +841,15 @@ mod injection_tests {
         let mut session = fixture.session();
         session.submit("message".into()).unwrap();
         assert!(!fixture.resume().unwrap().0.turns[0].hidden);
+        // Hand-written files carry the required metadata so only the markers vary.
+        let local = json!(session.local);
 
         std::fs::write(
-            &session.path,
+            session.path(),
             json!({"messages":[
                 {"role":"user","content":"message"},
                 {"_harness_local":{"hidden":false}}
-            ]})
+            ], "_harness_local": local})
             .to_string(),
         )
         .unwrap();
@@ -935,7 +857,7 @@ mod injection_tests {
         assert!(!visible.turns[0].hidden);
         visible.save().unwrap();
         let canonical: Value =
-            serde_json::from_str(&std::fs::read_to_string(&visible.path).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(visible.path()).unwrap()).unwrap();
         assert_eq!(canonical["messages"].as_array().unwrap().len(), 1);
 
         for messages in [
@@ -949,16 +871,20 @@ mod injection_tests {
                 {"_harness_local":{"hidden":true}}
             ]),
         ] {
-            std::fs::write(&session.path, json!({"messages":messages}).to_string()).unwrap();
+            std::fs::write(
+                session.path(),
+                json!({"messages":messages, "_harness_local": local}).to_string(),
+            )
+            .unwrap();
             assert!(fixture.resume().is_err());
         }
 
         std::fs::write(
-            &session.path,
+            session.path(),
             json!({"messages":[
                 {"role":"user","content":"message"},
                 {"_harness_local":{"hidden":"yes"}}
-            ]})
+            ], "_harness_local": local})
             .to_string(),
         )
         .unwrap();
@@ -973,11 +899,15 @@ mod injection_tests {
         let mut session = fixture.session();
         session.submit("message".into()).unwrap();
         let messages = json!(messages(&session));
+        // Otherwise-valid metadata, so each file fails only for its unknown field.
+        let local = json!(session.local);
+        let mut unknown_local = local.clone();
+        unknown_local["unknown"] = json!(true);
         for invalid in [
-            json!({"messages": messages, "injections": []}),
-            json!({"messages": messages, "_harness_local": {"unknown": true}}),
+            json!({"messages": messages, "_harness_local": local, "injections": []}),
+            json!({"messages": messages, "_harness_local": unknown_local}),
         ] {
-            std::fs::write(&session.path, invalid.to_string()).unwrap();
+            std::fs::write(session.path(), invalid.to_string()).unwrap();
             assert!(fixture.resume().is_err());
         }
     }
@@ -996,88 +926,30 @@ mod injection_tests {
         };
         session.save_token_cache(vec![cache.clone()]).unwrap();
         let saved: Value =
-            serde_json::from_str(&std::fs::read_to_string(&session.path).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(session.path()).unwrap()).unwrap();
         assert_eq!(saved["_harness_local"]["turn_token_cache"][0]["total"], 42);
         let resumed = fixture.resume().unwrap().0;
         assert_eq!(resumed.local.turn_token_cache, [cache]);
         assert_eq!(json!(messages(&resumed)), saved["messages"]);
     }
 
-    /// Even a broad automatic cleanup preserves instances carrying the injection marker.
-    #[test]
-    fn cleanup_preserves_marked_calls() {
-        let fixture = Fixture::new();
-        let mut session = fixture.session();
-        session.inject(vec![prepared("file")]).unwrap();
-        let id = messages(&session)[0].tool_calls.as_ref().unwrap()[0]
-            .id
-            .clone();
-        let mut normal = prepared("environment");
-        normal.call.id = "fyi-test".into();
-        normal.call.function.arguments = json!({"code": "FYI()"}).to_string();
-        session.inject(vec![normal]).unwrap();
-        assert_eq!(session.remove_calls(|_| true).unwrap(), [2, 3]);
-        assert_eq!(messages(&session)[0].tool_calls.as_ref().unwrap()[0].id, id);
-        assert_eq!(state(&fixture.resume().unwrap().0), state(&session));
-    }
-
-    /// Failed injection and submission saves preserve the in-memory conversation.
+    /// Failed submission saves preserve the in-memory conversation.
     #[test]
     fn failed_saves_preserve_memory() {
         let fixture = Fixture::new();
         let mut session = fixture.session();
         session.submit("earlier".into()).unwrap();
-        session
-            .inject(vec![prepared("one"), prepared("two"), prepared("three")])
-            .unwrap();
         session.submit("later".into()).unwrap();
         let current = messages(&session);
         assert_eq!(current[0].content, "earlier");
-        assert_eq!(current[7].content, "later");
+        assert_eq!(current[1].content, "later");
         let before = state(&session);
         assert_eq!(state(&fixture.resume().unwrap().0), before);
         let blocked = fixture.0.join("not-a-directory");
         std::fs::write(&blocked, "blocked").unwrap();
-        session.path = blocked.join("session.json");
-        assert!(session.inject(vec![prepared("new")]).is_err());
-        assert_eq!(state(&session), before);
+        session.sessions_dir = blocked.join("sessions");
         assert!(session.submit("new draft".into()).is_err());
         assert_eq!(state(&session), before);
         assert_eq!(state(&fixture.resume().unwrap().0), before);
-    }
-
-    /// Marked attachments remain exclusive, paired, and decodable after UI removal goes away.
-    #[test]
-    fn marked_attachment_validation_rejects_malformed_pairs() {
-        let fixture = Fixture::new();
-        let mut session = fixture.session();
-        session.inject(vec![prepared("contents")]).unwrap();
-        let original = state(&session);
-        assert!(session.validate_injections().is_ok());
-        for defect in 0..4 {
-            let mut invalid = original.clone();
-            match defect {
-                0 => {
-                    invalid["messages"].as_array_mut().unwrap().pop();
-                }
-                1 => invalid["messages"][0]["content"] = json!("mixed content"),
-                2 => invalid["messages"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(original["messages"][1].clone()),
-                3 => {
-                    invalid["messages"][0]["tool_calls"][0]["function"]["arguments"] =
-                        json!("not JSON")
-                }
-                _ => unreachable!(),
-            }
-            let entries: Vec<SessionEntry> =
-                serde_json::from_value(invalid["messages"].clone()).unwrap();
-            session.turns = turns_from_entries(entries).unwrap();
-            assert!(
-                session.validate_injections().is_err(),
-                "accepted defect {defect}"
-            );
-        }
     }
 }

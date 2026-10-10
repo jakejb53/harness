@@ -13,7 +13,7 @@ Contract for the root agent, branch agents, the library, and the store. Base con
 
 ## Bounds
 
-- Maximum depth and maximum fan-out per response are configured and enforced by the harness. `rlm` is not offered to agents at the maximum depth. In one response, `rlm` calls beyond the fan-out limit, in call order, receive an error result and do not run.
+- Maximum depth is configured and enforced by the harness: `rlm` is not offered to agents at the maximum depth. Every `rlm` call in a response runs, in call order.
 
 ## Files
 
@@ -56,6 +56,6 @@ Contract for the root agent, branch agents, the library, and the store. Base con
 
 ## Deferred
 
-- Concurrent branch execution.
+- Concurrent branch execution, with a per-response fan-out bound.
 - Messaging between agents through the store.
 - Opening a branch file with `--resume`.
