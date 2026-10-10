@@ -10,7 +10,7 @@ The REPL uses Monty, a sandboxed Python-subset interpreter. Repository filesyste
 
 Requires a Rust toolchain. The Monty interpreter is built into the app.
 
-The app keeps its files in `~/.harness`: `config.toml`, `.env`, `sessions/`, `replib/`, optional `repl-notes.md`, and `failures.jsonl`. They are shared by every repository you run it in. `~/.harness` can be a symlink to a checkout of this repo.
+The app keeps its files in `~/.harness`: `config.toml`, `.env`, `sessions/`, `replib/`, optional `repl-notes.md`, and `failures.jsonl`. They are shared by every repository you run it in.
 
 Create `~/.harness/config.toml`:
 
@@ -257,7 +257,7 @@ def word_count(path: str) -> int:
 
 **Mistakes.** Load errors appear in the turn's first call (the app's `FYI()`); other files still load. Failed files are omitted from `help()`. Library code follows the same permissions as other REPL code.
 
-This repo ships `replib/reasoning.py`, `replib/glob.py`, and `replib/search.py`. Use them through the `~/.harness` symlink or copy them into `~/.harness/replib/`:
+This repo ships `replib/reasoning.py`, `replib/glob.py`, and `replib/search.py`. Copy them into `~/.harness/replib/`:
 
 - `reasoning(text)` does nothing and returns `None`. It gives the model a way to record its reasoning as part of the conversation, and the model is encouraged to call it: a call that is only `reasoning("...")` on a plain string never needs approval, and the app answers it with `(no output)` without running it.
 - That answer, and tool reasoning (below), depend on it staying a no-op that prints nothing. Edit its docstring freely (it's what `help()` shows the model), but not its behavior.
