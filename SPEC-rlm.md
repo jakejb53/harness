@@ -1,6 +1,6 @@
 # Recursive language model agents
 
-Contract for the root agent, branch agents, the library, and the store. Base contract: `SPEC.md`. Implementation plan: `PLAN-rlm.md`.
+Contract for the root agent, branch agents, the library, and the store. Base contract: `SPEC.md`, which this contract supersedes where they differ. Implementation plan: `PLAN-rlm.md`.
 
 ## Agents
 
@@ -19,12 +19,12 @@ Contract for the root agent, branch agents, the library, and the store. Base con
 
 - A branch is a session file in the session format. Its ID uses the encoded call-ID format.
 - A tree is one directory, `sessions/<name>/`. `library/` holds the root transcript as `root.json` and depth 1 branches as `<id>.json`. `deep/` holds depth 2 and deeper as `<id>.json`. `/rename` renames the directory. Session listing shows directory names.
-- Every session records its repository root under `_harness_local`. Every branch records its parent ID and depth under `_harness_local`. These fields are immutable.
+- Every session records under `_harness_local` its repository root, the canonical launch directory of the process that created it, and its depth, 0 for the root. Every branch also records its parent: `root` at depth 1, the parent's call ID deeper. These fields are immutable.
 
 ## Library
 
 - The library is this tree's depth 0 and 1 transcripts, `sessions/<name>/library/`.
-- It is a read-only mount into the REPL sessions of agents at depth 2 and deeper, at the virtual path `/library`, and the direct tools' `root = "library"`. Agents at depth 0 and 1 have no mount of any session file. `deep/` is never mounted. Sessions never read each other's files.
+- It is a read-only mount into the REPL sessions of agents at depth 2 and deeper, at the virtual path `/library`, and the direct tools' `root = "library"`. Agents at depth 0 and 1 have no mount of any session file. `deep/` is never mounted. Trees never read each other's files.
 
 ## Store
 
@@ -36,17 +36,23 @@ Contract for the root agent, branch agents, the library, and the store. Base con
 ## Data kinds
 
 - REPL variables are memory: local to one agent, alive for one turn, never addressable by another agent.
-- Transcripts are durable. A transcript is append-only while its agent runs and fixed once it ends. Every save replaces the file atomically, so a reader sees a complete version, never a partial one.
+- Transcripts are durable. A branch transcript is append-only while its agent runs and fixed once it ends. The root transcript may also be rewritten as `SPEC.md` describes (turn-start `FYI` cleanup, hidden turns, token cache), never while a branch runs. Every save replaces the file atomically, so a reader sees a complete version, never a partial one.
 - The store and the repository are durable and shared.
 - Memory becomes durable only by an explicit write to the store or the repository. Durable data enters memory only by an explicit read.
 
 ## Human control
 
 - Approvals from any branch arrive at the one approval prompt.
-- Esc stops the whole tree.
+- Esc stops the whole tree; the deepest agent's partial response followed by `[stopped by user]` reaches the root as the `rlm` result at each level.
 - The filesystem permission level applies to every branch.
 - Every branch file is inspectable as a session.
 - The transcript, context overlay, and status line follow the deepest active agent and return to its parent when it ends. The status line names the agent on screen.
+
+## Removed
+
+- Tool reasoning. The `reasoning()` approval exemption remains.
+- File injection.
+- Pre-RLM session files: they are neither listed nor resumable.
 
 ## Deferred
 
