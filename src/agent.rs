@@ -891,7 +891,7 @@ impl Agent {
             // Dropping the REPL kills it; the next call starts a fresh one.
             turn.repl = None;
             return self.record_result(res, &call.call, format!(
-                "[REPL driver failed: {error:#}. This code was not run. REPL state was lost; the next call starts a fresh session and reloads the library.]"
+                "[REPL driver failed: {error:#}. This code was not run. REPL state was lost; the next call starts a fresh session and reloads the helper functions.]"
             ));
         }
         turn.phase = Phase::Running {
@@ -965,7 +965,7 @@ impl Agent {
                 (
                     None,
                     Some(format!(
-                        "[REPL driver failed: {error:#}. REPL state was lost; the next call starts a fresh session and reloads the library.]"
+                        "[REPL driver failed: {error:#}. REPL state was lost; the next call starts a fresh session and reloads the helper functions.]"
                     )),
                 )
             }

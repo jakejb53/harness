@@ -182,6 +182,10 @@ const ROOT_RLM_PREAMBLE: &str = "Delegate a task to a subagent and return its fi
 const ROOT_RLM_CLOSING: &str =
     "These tools are available only to the subagent, not to you. You cannot call them directly.";
 
+/// Ends the root's `rlm` description: the root has no store access, so subagents keep
+/// large data out of its context by passing store paths, which the root relays.
+const ROOT_RLM_REFERENCES: &str = "Ask subagents for short answers. To hand large data from one subagent to another, have the first write it to the shared store and return the path, then include that path in the next subagent's task.";
+
 /// `FYI`, verbatim.
 const FYI_DESCRIPTION: &str =
     "Report the current date, the prompt-token count of the latest request, and the model name.";
@@ -246,6 +250,8 @@ fn root_rlm_description(subagent_tools: &[Value]) -> String {
     }
     text.push_str("\n\n");
     text.push_str(ROOT_RLM_CLOSING);
+    text.push_str("\n\n");
+    text.push_str(ROOT_RLM_REFERENCES);
     text
 }
 
