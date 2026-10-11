@@ -7,18 +7,23 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use cap_std::fs::Dir;
 use monty_pool::ResumeValue;
 use monty_types::{CallArgs, ExcType, MontyException, MontyObject, ObjectRef};
 use ruff_python_ast::{Expr, Stmt};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::{Permission, Settings};
+use crate::hostfs::{self, LIBRARY, STORE};
+use crate::list;
 use crate::repl::ReplEvent;
 use crate::root::Root;
 use crate::token_count::TokenTotal;
 
-/// Signatures shown by help(); dispatch validates host arguments at runtime.
+/// Signatures shown by help(); dispatch validates host arguments at runtime. The mount
+/// summary signatures below follow these only where their mount is present.
 pub const STUBS: &str = r#"
 from typing import Any
 def FYI() -> None: ...
@@ -26,6 +31,19 @@ def help() -> None: ...
 def run(argv: list[str], cwd: str | None = None) -> dict[str, Any]: ...
 def lib_source(name: str) -> str: ...
 "#;
+
+/// `store_summary()`'s signature, listed by help() where `/store` is mounted.
+const STORE_SUMMARY_STUB: &str = "def store_summary() -> None: ...";
+
+/// `library_summary()`'s signature, listed by help() where `/library` is mounted.
+const LIBRARY_SUMMARY_STUB: &str = "def library_summary() -> None: ...";
+
+/// The strftime format of every local date host functions print: `FYI()`'s `Date` and
+/// a mount summary's last update.
+const DATE_FORMAT: &str = "%a %b %d %H:%M:%S %:z %Y";
+
+/// The most recently modified paths a mount summary lists.
+const RECENT_PATHS: usize = 5;
 
 /// Immutable projection of startup settings; permission changes use the watch channel.
 pub struct HostConfig {
@@ -110,6 +128,12 @@ pub struct HostContext {
     /// Canonical repository path, which is also its mount's virtual path.
     pub repo: PathBuf,
     pub mounts: Mounts,
+    /// The directory behind `/store`, held exactly where `mounts` has the store, for
+    /// `store_summary()`, which reads it directly rather than through a feed.
+    pub store_dir: Option<Arc<Dir>>,
+    /// The directory behind `/library` (the agent's own library capability), held
+    /// exactly where `mounts` has the library, for `library_summary()`.
+    pub library_dir: Option<Arc<Dir>>,
     pub config: Arc<HostConfig>,
     pub permissions: watch::Receiver<Permission>,
     pub events: mpsc::UnboundedSender<ReplEvent>,
@@ -165,18 +189,38 @@ impl HostContext {
     }
 }
 
-/// Only these names may become host function objects during sandbox name lookup.
-pub fn is_host_function(name: &str) -> bool {
-    matches!(name, "FYI" | "help" | "run" | "lib_source")
+/// Only these names may become host function objects during sandbox name lookup, and
+/// only these are dispatched. A mount's summary function exists only where the mount
+/// does, so where a mount is absent its function is absent too, like the mount.
+pub fn is_host_function(name: &str, mounts: Mounts) -> bool {
+    match name {
+        "FYI" | "help" | "run" | "lib_source" => true,
+        "store_summary" => mounts.store,
+        "library_summary" => mounts.library,
+        _ => false,
+    }
 }
 
 /// Answer one host suspension; argument evaluation has already followed normal permissions.
 pub async fn dispatch(name: &str, args: &CallArgs, host: &mut HostContext) -> ResumeValue {
+    // Name lookup applies the same check; repeating it keeps an absent mount's summary
+    // function undispatchable however its call was reached.
+    if !is_host_function(name, host.mounts) {
+        return ResumeValue::NotFound;
+    }
     let result = match name {
         "FYI" => fyi(args, host),
         "help" => help(args, host),
         "run" => run(args, host).await,
         "lib_source" => lib_source(args, host),
+        "store_summary" => summary(args, host, "store_summary", STORE, host.store_dir.as_ref()),
+        "library_summary" => summary(
+            args,
+            host,
+            "library_summary",
+            LIBRARY,
+            host.library_dir.as_ref(),
+        ),
         _ => return ResumeValue::NotFound,
     };
     match result {
@@ -228,10 +272,7 @@ fn fyi(args: &CallArgs, host: &HostContext) -> Result<MontyObject, MontyExceptio
 /// The `Date`, `Prompt tokens` (when known), and `Model` lines, shared by the REPL's
 /// `FYI()` host function and the root's `FYI` tool so the two report alike.
 pub fn fyi_lines(prompt_tokens: Option<TokenTotal>, model: &str) -> String {
-    let mut text = format!(
-        "Date: {}\n",
-        chrono::Local::now().format("%a %b %d %H:%M:%S %:z %Y")
-    );
+    let mut text = format!("Date: {}\n", chrono::Local::now().format(DATE_FORMAT));
     if let Some(tokens) = prompt_tokens {
         text.push_str(&prompt_tokens_line(tokens));
     }
@@ -275,11 +316,22 @@ fn help(args: &CallArgs, host: &HostContext) -> Result<MontyObject, MontyExcepti
     }
     text.push_str("\nHost functions:\n");
     text.push_str(STUBS.trim());
+    // Like the mounts above, each mount's summary function is listed only where the
+    // feeds carry the mount (`is_host_function`).
+    for (mounted, stub) in [
+        (host.mounts.store, STORE_SUMMARY_STUB),
+        (host.mounts.library, LIBRARY_SUMMARY_STUB),
+    ] {
+        if mounted {
+            text.push('\n');
+            text.push_str(stub);
+        }
+    }
     text.push_str("\nrun: executes a command name directly; returns exit_code, stdout, stderr.\nlib_source: reads replib/<name>.py.\n");
-    text.push_str("\nLibrary functions:\n");
+    text.push_str("\nHelper functions:\n");
     // Explicit empty states distinguish complete listings from truncated output.
     if host.library.is_empty() {
-        text.push_str("No library functions loaded.\n");
+        text.push_str("No helper functions loaded.\n");
     }
     for (name, function) in &host.library {
         text.push_str(&format!(
@@ -298,6 +350,142 @@ fn help(args: &CallArgs, host: &HostContext) -> Result<MontyObject, MontyExcepti
     text.push_str("\nOther commands found on PATH require approval unless denied.\n");
     host.output(text);
     Ok(MontyObject::none())
+}
+
+/// `store_summary()` and `library_summary()` (`name`): print the summary block of the
+/// mount at `mount`, read through its directory capability `dir`. The read is first
+/// authorized like any REPL read under that mount (`hostfs::authorize`), so it follows
+/// the mount's rules: the store and the library are both readable at every level.
+fn summary(
+    args: &CallArgs,
+    host: &HostContext,
+    name: &str,
+    mount: &str,
+    dir: Option<&Arc<Dir>>,
+) -> Result<MontyObject, MontyException> {
+    arguments(args, &[])?;
+    hostfs::authorize(Path::new(mount), false, host)?;
+    // `Runtime::start` gives the capability wherever `mounts` has the mount, which the
+    // authorization above required, so a missing one is a harness bug.
+    let dir = dir.ok_or_else(|| {
+        exception(
+            ExcType::RuntimeError,
+            format!("{name}: {mount} has no directory capability"),
+        )
+    })?;
+    let mut tally = Tally {
+        name,
+        mount,
+        bytes: 0,
+        files: Vec::new(),
+    };
+    tally.walk(dir, Path::new(""))?;
+    host.output(tally.block()?);
+    Ok(MontyObject::none())
+}
+
+/// One mount's regular files, gathered for its summary block (`summary`).
+struct Tally<'a> {
+    /// The summary function and the mount's virtual path, which errors name.
+    name: &'a str,
+    mount: &'a str,
+    /// The files' total size. `u128` because sparse files can each report a size near
+    /// `i64::MAX`, so a `u64` sum of a few could overflow.
+    bytes: u128,
+    /// Each file's mtime and mount-relative path, in walk order.
+    files: Vec<(SystemTime, PathBuf)>,
+}
+
+impl Tally<'_> {
+    /// Add every regular file under `dir`, whose mount-relative path is `path`, hidden
+    /// ones included. Entries are inspected without following symlinks, and directories
+    /// are entered through `list::open_child_directory`, which refuses a symlink swapped
+    /// in after the inspection, so symlinks are never followed or counted; special files
+    /// are not counted either. The first failure ends the walk as the Python error.
+    fn walk(&mut self, dir: &Dir, path: &Path) -> Result<(), MontyException> {
+        let entries = dir.entries().map_err(|error| self.error(path, error))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| self.error(path, error))?;
+            let name = entry.file_name();
+            let child = path.join(&name);
+            let metadata = entry
+                .metadata()
+                .map_err(|error| self.error(&child, error))?;
+            if metadata.is_file() {
+                let modified = metadata
+                    .modified()
+                    .map_err(|error| self.error(&child, error))?;
+                self.bytes += u128::from(metadata.len());
+                self.files.push((modified.into_std(), child));
+            } else if metadata.is_dir() {
+                let directory = list::open_child_directory(dir, &name)
+                    .map_err(|error| self.error(&child, error))?;
+                self.walk(&directory, &child)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The Python error for a failed read at mount-relative `path`, naming the summary
+    /// function and the virtual path, never the host path behind the mount.
+    fn error(&self, path: &Path, error: std::io::Error) -> MontyException {
+        let mut virtual_path = PathBuf::from(self.mount);
+        // Pushing an empty path would append a separator to the mount itself.
+        if !path.as_os_str().is_empty() {
+            virtual_path.push(path);
+        }
+        io_error(&format!("{}: read", self.name), &virtual_path, error)
+    }
+
+    /// The block `summary` prints: `<mount>: empty` without regular files; otherwise
+    /// the file count, total bytes, and newest mtime in local time, then, indented, up
+    /// to `RECENT_PATHS` mount-relative paths, newest mtime first.
+    fn block(mut self) -> Result<String, MontyException> {
+        if self.files.is_empty() {
+            return Ok(format!("{}: empty\n", self.mount));
+        }
+        // Newest first; equal mtimes fall back to ascending path so the output does not
+        // depend on the filesystem's walk order.
+        self.files.sort_by(|(a_time, a_path), (b_time, b_path)| {
+            b_time.cmp(a_time).then_with(|| a_path.cmp(b_path))
+        });
+        let (newest, newest_path) = &self.files[0];
+        let updated = local_time(*newest).ok_or_else(|| {
+            self.error(
+                newest_path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "modification time is outside the supported date range",
+                ),
+            )
+        })?;
+        let recent: Vec<String> = self
+            .files
+            .iter()
+            .take(RECENT_PATHS)
+            .map(|(_, path)| path.display().to_string())
+            .collect();
+        Ok(format!(
+            "{}: {} files, {} bytes, last updated {}\n  Recent: {}\n",
+            self.mount,
+            self.files.len(),
+            self.bytes,
+            updated.format(DATE_FORMAT),
+            recent.join(", ")
+        ))
+    }
+}
+
+/// `time` as a local date, or `None` outside chrono's range: an mtime can be set to
+/// any value, and chrono's own `SystemTime` conversion panics outside it.
+fn local_time(time: SystemTime) -> Option<chrono::DateTime<chrono::Local>> {
+    let utc = match time.duration_since(UNIX_EPOCH) {
+        Ok(after) => chrono::DateTime::UNIX_EPOCH
+            .checked_add_signed(chrono::TimeDelta::from_std(after).ok()?),
+        Err(before) => chrono::DateTime::UNIX_EPOCH
+            .checked_sub_signed(chrono::TimeDelta::from_std(before.duration()).ok()?),
+    }?;
+    Some(utc.with_timezone(&chrono::Local))
 }
 
 /// Read only a named library file; reject names that could escape its directory.

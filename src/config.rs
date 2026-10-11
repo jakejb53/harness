@@ -102,8 +102,9 @@ struct ApprovalDescription {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Chat {
-    /// System message sent ahead of the conversation in every chat request, never
-    /// saved to the session. Omitted means no system message.
+    /// System message sent ahead of the conversation in every chat request (a
+    /// subagent's uses `[rlm] subagent_prompt` instead when that is set), never saved
+    /// to the session. Omitted means no system message.
     prompt: Option<String>,
 }
 
@@ -136,6 +137,9 @@ struct Repl {
 struct Rlm {
     /// Deepest branch depth (the root is depth 0); agents at this depth are not offered `rlm`.
     max_depth: u32,
+    /// System message for every subagent (depth >= 1), replacing `[chat] prompt` for
+    /// them only. Omitted means subagents get the root's system message.
+    subagent_prompt: Option<String>,
     store: Store,
 }
 
@@ -204,6 +208,8 @@ pub struct Settings {
     /// The harness directory the settings were loaded from (`harness_dir`).
     pub dir: PathBuf,
     pub endpoint: ResolvedEndpoint,
+    /// `[chat] prompt`, replaced by `--system-prompt` when given. Read through
+    /// `system_prompt`, never directly.
     pub chat_prompt: Option<String>,
     pub repl_tool_description: String,
     pub permission: Permission,
@@ -212,11 +218,27 @@ pub struct Settings {
     pub output_limit: usize,
     /// `[rlm] max_depth`, at least 1.
     pub max_depth: u32,
+    /// `[rlm] subagent_prompt`, kept verbatim (an empty string included). Read through
+    /// `system_prompt`, never directly.
+    pub subagent_prompt: Option<String>,
     /// `[rlm.store] path`: absolute, and a directory when `load` checked it; the store
     /// mount is opened from it at startup.
     pub store_path: PathBuf,
     pub approval_description: Option<ApprovalDescriptionSettings>,
     pub theme: Theme,
+}
+
+impl Settings {
+    /// The effective system message for an agent at `depth`, the one rule for both
+    /// requests and the transcript: `subagent_prompt` for subagents (depth >= 1) when
+    /// set, even if empty; otherwise `chat_prompt`, which the root always gets. `None`
+    /// means no system message.
+    pub fn system_prompt(&self, depth: u32) -> Option<&str> {
+        match &self.subagent_prompt {
+            Some(prompt) if depth >= 1 => Some(prompt),
+            _ => self.chat_prompt.as_deref(),
+        }
+    }
 }
 
 /// `~/.harness`: config, `.env`, sessions, and `replib/`, shared by every directory the
@@ -318,6 +340,7 @@ pub fn load(dir: &Path) -> anyhow::Result<Settings> {
         commands: config.commands,
         output_limit: config.repl.output_limit,
         max_depth: config.rlm.max_depth,
+        subagent_prompt: config.rlm.subagent_prompt,
         store_path,
     })
 }

@@ -494,8 +494,9 @@ impl Session {
         self.local.depth
     }
 
-    /// The name that identifies this session to the user and in failure records: the
-    /// tree directory name for the root, the call ID for a branch.
+    /// The name that identifies this session in failure records: the tree directory
+    /// name for the root, the call ID for a branch. The App also shows it on screen for
+    /// the root; a branch is shown by its caller-given `rlm` name instead.
     pub fn name(&self) -> &str {
         if self.local.depth == 0 {
             &self.tree

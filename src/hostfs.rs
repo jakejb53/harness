@@ -65,8 +65,9 @@ fn dispatch(name: &str, args: &CallArgs, host: &HostContext) -> Result<FsAction,
 
 /// Reject uncovered paths and disallowed operations without performing host I/O.
 /// The repository follows the live permission level; the store allows everything;
-/// the library allows reads only; anything else is denied.
-fn authorize(path: &Path, write: bool, host: &HostContext) -> Result<(), MontyException> {
+/// the library allows reads only; anything else is denied. REPL filesystem calls and
+/// the mount summary host functions (`host::summary`) are both checked here.
+pub fn authorize(path: &Path, write: bool, host: &HostContext) -> Result<(), MontyException> {
     let kind = if write { "write" } else { "read" };
     // CallArgs carries Monty's normalized spelling. This prefix check only
     // rejects inputs outside mount coverage; the mount checks the original call

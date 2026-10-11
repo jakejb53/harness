@@ -35,6 +35,13 @@ use crate::transcript::{Block, View};
 /// Prompt marker at the start of the input box.
 const PROMPT: &str = "> ";
 
+/// The context overlay's title. The header is this followed by the on-screen agent's
+/// name in brackets, and the title itself is never shortened.
+const CONTEXT_TITLE: &str = "[Context]";
+
+/// Top-border cells beside the header: the two corners and the `[-]`/`[+]` toggle.
+const HEADER_CHROME: usize = 5;
+
 /// Mouse reporting for what the app uses: presses, releases, and the wheel (1000),
 /// motion only while a button is held, for dragging (1002), in SGR encoding (1006).
 /// Unlike crossterm's `EnableMouseCapture`, it leaves out 1003, which reports every
@@ -57,6 +64,8 @@ pub struct MessageOverlay<'a> {
     pub entries: &'a [MessageEntry],
     pub scroll: usize,
     pub collapsed: bool,
+    /// The agent on screen, named in the header as `[Context][<name>]`.
+    pub name: &'a str,
 }
 
 /// Context rows carry semantic segments so labels and counts can be styled independently.
@@ -281,7 +290,14 @@ fn render_messages(
     let max_width = (u32::from(transcript.width) * 9 / 16) as u16;
     let max_height = (u32::from(transcript.height) * 9 / 16) as u16;
     let min_height = if overlay.collapsed { 1 } else { 3 };
-    if max_width < 14 || max_height < min_height {
+    // Controls in the name are replaced up front, as `clip_line` replaces them when
+    // drawing, so the width measured for it is the width drawn.
+    let name = clip_line(overlay.name, usize::MAX);
+    let title_width = Line::raw(CONTEXT_TITLE).width();
+    // Hidden unless the cap fits the shortest header, the title and the name clipped
+    // to its ellipsis (`[Context][…]`), with the corners and toggle.
+    let min_width = title_width + Line::raw("[…]").width() + HEADER_CHROME;
+    if usize::from(max_width) < min_width || max_height < min_height {
         return MessageGeometry::default();
     }
     let content_width = overlay
@@ -298,9 +314,15 @@ fn render_messages(
         })
         .max()
         .unwrap_or("(empty)".len());
+    // At least wide enough for the full header, `[Context][<name>]`, with the corners
+    // and toggle, in both forms. Only when the cap binds does the header shorten the
+    // name (`render_context_header`).
+    let header_width = Line::raw(name.as_str())
+        .width()
+        .saturating_add(title_width + 2);
     let width = content_width
         .saturating_add(2)
-        .max(14)
+        .max(header_width.saturating_add(HEADER_CHROME))
         .min(max_width as usize) as u16;
     if overlay.collapsed {
         let area = Rect::new(transcript.right() - width, transcript.y, width, 1);
@@ -309,7 +331,7 @@ fn render_messages(
             .borders(Borders::TOP)
             .border_style(theme.status)
             .render(area, buf);
-        let toggle = render_context_header(buf, area, true, theme);
+        let toggle = render_context_header(buf, area, true, &name, theme);
         return MessageGeometry {
             area,
             toggle,
@@ -334,7 +356,7 @@ fn render_messages(
         .borders(Borders::ALL)
         .border_style(theme.status)
         .render(area, buf);
-    let toggle = render_context_header(buf, area, false, theme);
+    let toggle = render_context_header(buf, area, false, &name, theme);
     let entries = &overlay.entries[scroll..overlay.entries.len().min(scroll + rows)];
     let mut turn_rows = Vec::with_capacity(entries.len());
     for row in 0..rows {
@@ -404,16 +426,27 @@ fn half_brightness(mut style: Style) -> Style {
     style
 }
 
-/// Draw the centered persistent title and the visibility control over the top border.
-fn render_context_header(buf: &mut Buffer, area: Rect, collapsed: bool, theme: &Theme) -> Rect {
+/// Draw the centered persistent header, `[Context][<name>]` for the agent on screen,
+/// and the visibility control over the top border. When the width cap leaves too
+/// little room for the full header, only the name shortens, with `clip_line`'s
+/// ellipsis; `render_messages` never draws an overlay too narrow for `[Context][…]`.
+fn render_context_header(
+    buf: &mut Buffer,
+    area: Rect,
+    collapsed: bool,
+    name: &str,
+    theme: &Theme,
+) -> Rect {
     let toggle = Rect::new(area.right() - 4, area.y, 3, 1);
     let control = if collapsed { "[+]" } else { "[-]" };
     buf.set_string(toggle.x, toggle.y, control, theme.status);
-    let title = "[Context]";
-    let title_width = Line::raw(title).width() as u16;
     let title_space = toggle.x.saturating_sub(area.x + 1);
-    let title_x = area.x + 1 + title_space.saturating_sub(title_width) / 2;
-    buf.set_string(title_x, area.y, title, theme.assistant);
+    // The cells left for the name once the title and the name's brackets are placed.
+    let name_space = usize::from(title_space).saturating_sub(Line::raw(CONTEXT_TITLE).width() + 2);
+    let header = format!("{CONTEXT_TITLE}[{}]", clip_line(name, name_space));
+    let header_width = Line::raw(header.as_str()).width() as u16;
+    let title_x = area.x + 1 + title_space.saturating_sub(header_width) / 2;
+    buf.set_string(title_x, area.y, &header, theme.assistant);
     toggle
 }
 
@@ -515,6 +548,7 @@ mod tests {
             entries: &entries,
             scroll: usize::MAX,
             collapsed: false,
+            name: "test",
         };
         let geometry = render_messages(&mut buffer, area, &overlay, &theme);
         assert_eq!(geometry.area, Rect::new(18, 0, 22, 9));
@@ -560,13 +594,15 @@ mod tests {
                 entries: &entries,
                 scroll: 0,
                 collapsed: false,
+                name: "test",
             },
             &theme,
         );
         let x = geometry.area.x + 1;
         assert_eq!(buffer[(x, 1)].fg, theme.context_turn.fg.unwrap());
         assert_eq!(buffer[(x + 9, 1)].fg, theme.context_tokens.fg.unwrap());
-        let title_x = geometry.area.x + 1 + (geometry.toggle.x - geometry.area.x - 10) / 2;
+        // Centered: `[Context][test]` is 15 cells, after the left corner.
+        let title_x = geometry.area.x + 1 + (geometry.toggle.x - geometry.area.x - 16) / 2;
         assert_eq!(buffer[(title_x, 0)].symbol(), "[");
         assert_eq!(buffer[(title_x, 0)].fg, theme.assistant.fg.unwrap());
     }
@@ -604,6 +640,7 @@ mod tests {
                 entries: &entries,
                 scroll: 0,
                 collapsed: false,
+                name: "test",
             },
             &theme,
         );
@@ -637,12 +674,14 @@ mod tests {
             entries: &[],
             scroll: 0,
             collapsed: false,
+            name: "test",
         };
         let area = Rect::new(0, 0, 80, 24);
         let mut buffer = Buffer::empty(area);
         let geometry = render_messages(&mut buffer, area, &overlay, &theme);
         assert!(geometry.contains(79, 2));
-        assert_eq!(buffer[(67, 1)].symbol(), "(");
+        // Sized by the header: `[Context][test]` plus the corners and toggle is 20 cells.
+        assert_eq!(buffer[(61, 1)].symbol(), "(");
         for area in [
             Rect::default(),
             Rect::new(0, 0, 9, 20),
@@ -672,6 +711,7 @@ mod tests {
             entries: &entries,
             scroll: 2,
             collapsed: true,
+            name: "test",
         };
         let area = Rect::new(0, 0, 80, 24);
         let mut buffer = Buffer::empty(area);
@@ -683,8 +723,9 @@ mod tests {
         assert!(geometry.toggle_at(78, 0));
         assert!(!geometry.toggle_at(79, 0));
         assert!(!geometry.contains(60, 1));
-        assert_eq!(buffer[(64, 0)].symbol(), "[");
-        assert_eq!(buffer[(64, 0)].fg, theme.assistant.fg.unwrap());
+        // `[Context][test]` exactly fills the 15 cells between the corner and toggle.
+        assert_eq!(buffer[(61, 0)].symbol(), "[");
+        assert_eq!(buffer[(61, 0)].fg, theme.assistant.fg.unwrap());
         assert_eq!(buffer[(76, 0)].symbol(), "[");
         assert_eq!(buffer[(78, 0)].symbol(), "]");
     }

@@ -177,11 +177,18 @@ const RLM_DESCRIPTION: &str = "Delegate a task to a subagent.";
 /// Opens the root's `rlm` description, before the depth 1 tool entries.
 const ROOT_RLM_PREAMBLE: &str = "Delegate a task to a subagent and return its final answer. The subagent sees only your task text and works on the same repository with the following tools:";
 
+/// Closes the root's `rlm` description, after the depth 1 tool entries: the root reads
+/// the subagent's tool list and must not mistake those tools for its own.
+const ROOT_RLM_CLOSING: &str =
+    "These tools are available only to the subagent, not to you. You cannot call them directly.";
+
 /// `FYI`, verbatim.
 const FYI_DESCRIPTION: &str =
     "Report the current date, the prompt-token count of the latest request, and the model name.";
 
-/// Delegation: one required `task`, which becomes the subagent's user message verbatim.
+/// Delegation: a required `task`, which becomes the subagent's user message verbatim,
+/// and a required `name`, the label the App shows for the subagent while it is on
+/// screen.
 fn rlm_tool(description: &str) -> Value {
     json!({
         "type": "function",
@@ -191,9 +198,10 @@ fn rlm_tool(description: &str) -> Value {
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "task": {"type": "string", "description": "The task for the subagent."}
+                    "task": {"type": "string", "description": "The task for the subagent."},
+                    "name": {"type": "string", "description": "A short (3-5 word) name for this subagent, shown to the user."}
                 },
-                "required": ["task"]
+                "required": ["task", "name"]
             }
         }
     })
@@ -217,10 +225,10 @@ fn fyi_tool() -> Value {
 
 /// The root's `rlm` description: the preamble, then one `name: description` entry per
 /// tool a depth 1 subagent is given, rendered from `subagent_tools` (the depth 1
-/// definitions themselves) so the description and the subagent's tools cannot differ.
-/// The preamble and the entries are separated by blank lines; trailing line endings of
-/// a description (a configured REPL description may end with one) are dropped so the
-/// separation stays one blank line.
+/// definitions themselves) so the description and the subagent's tools cannot differ,
+/// then the closing sentence. The parts are separated by blank lines; trailing line
+/// endings of a description (a configured REPL description may end with one) are
+/// dropped so the separation stays one blank line.
 fn root_rlm_description(subagent_tools: &[Value]) -> String {
     let mut text = ROOT_RLM_PREAMBLE.to_owned();
     for tool in subagent_tools {
@@ -236,6 +244,8 @@ fn root_rlm_description(subagent_tools: &[Value]) -> String {
             description.trim_end_matches(['\r', '\n'])
         ));
     }
+    text.push_str("\n\n");
+    text.push_str(ROOT_RLM_CLOSING);
     text
 }
 

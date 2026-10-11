@@ -179,6 +179,15 @@ output_limit = 100000        # bytes of output per call sent to the model
 #
 max_depth = 2
 
+# System message for every subagent, replacing [chat] prompt (or --system-prompt)
+# for them only; the root agent keeps [chat] prompt. Optional: omit it and
+# subagents get the same system message as the root. Sent verbatim, including
+# an empty string.
+#
+# subagent_prompt = """
+# ...
+# """
+
 [rlm.store]
 # Shared knowledge-base directory for subagents: /store in the REPL and
 # root = "store" in apply_patch, read_file, grep, and list. Always read-write,

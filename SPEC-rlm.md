@@ -4,9 +4,10 @@ Contract for the root agent, branch agents, the library, and the store. Base con
 
 ## Agents
 
-- One kind of agent. The root is depth 0. A branch spawned by an agent at depth `d` is at depth `d + 1`. Tools, mounts, and host functions are fixed by depth. Every agent receives the `[chat] prompt` system message.
+- One kind of agent. The root is depth 0. A branch spawned by an agent at depth `d` is at depth `d + 1`. Tools, mounts, and host functions are fixed by depth. Every agent receives the `[chat] prompt` system message; when `[rlm] subagent_prompt` is set, subagents receive it instead.
 - The root is a pure delegator. Its tools are `rlm` and `FYI`. It has no REPL, no repository access, and no store access. `FYI` takes no arguments and returns the date, the prompt-token count of the latest request, and the model. Each root turn opens with a synthetic `FYI` call.
-- `rlm` takes one required string, `task`, which becomes the branch's user message verbatim.
+- Each branch turn opens with synthetic `FYI()`, `help()`, and `store_summary()` REPL calls, plus `library_summary()` where `/library` is mounted.
+- `rlm` takes two required strings: `task`, which becomes the branch's user message verbatim, and `name`, a short label for the branch shown to the user.
 - A branch is one-shot: it receives a task, runs until a response has no tool calls, and ends. That response's content is the `rlm` result, subject to the parent's `output_limit` like any tool result. No agent resumes a branch.
 - The `rlm` calls in one response run one at a time, in call order, in the ordered tool queue with the response's other calls. Results are saved as tool messages in call order.
 - Anything a branch returns is opaque text to its parent, including references into the store.
@@ -46,7 +47,7 @@ Contract for the root agent, branch agents, the library, and the store. Base con
 - Esc stops the whole tree; the deepest agent's partial response followed by `[stopped by user]` reaches the root as the `rlm` result at each level.
 - The filesystem permission level applies to every branch.
 - Every branch file is inspectable as a session.
-- The transcript, context overlay, and status line follow the deepest active agent and return to its parent when it ends. The status line names the agent on screen.
+- The transcript, context overlay, and status line follow the deepest active agent and return to its parent when it ends. The status line and the context overlay's header name the agent on screen: the session name for the root, its `name` for a branch.
 
 ## Removed
 
@@ -57,5 +58,6 @@ Contract for the root agent, branch agents, the library, and the store. Base con
 ## Deferred
 
 - Concurrent branch execution, with a per-response fan-out bound.
+- A tabbed context overlay for switching between agents' context views.
 - Messaging between agents through the store.
 - Opening a branch file with `--resume`.

@@ -101,6 +101,7 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
         frames: vec![Frame {
             agent: root,
             notes: Vec::new(),
+            branch_name: None,
         }],
         library: None,
         token_counts,
@@ -169,6 +170,25 @@ struct Frame {
     agent: Agent,
     /// Display-only lines (failure counts, errors, `/tools`), never saved in the session.
     notes: Vec<Note>,
+    /// A branch's display label: the `name` argument of the `rlm` call that started it,
+    /// taken when the branch starts and held only here (the call's saved arguments are
+    /// its one durable copy). `None` for the root, which `Frame::name` shows by its
+    /// session name instead. Never an identity: the call ID names a branch's file, its
+    /// `parent`, and its failure-log records.
+    branch_name: Option<String>,
+}
+
+impl Frame {
+    /// The name the status line and the context overlay's header show while this
+    /// agent is on screen: a branch's `branch_name`; for the root, its session name
+    /// (the tree directory name), read from the session each time so it follows
+    /// `/rename`.
+    fn name(&self) -> &str {
+        match &self.branch_name {
+            Some(name) => name,
+            None => self.agent.session().name(),
+        }
+    }
 }
 
 /// Display-only transcript output, never saved or sent to the model.
@@ -419,11 +439,12 @@ impl App {
     }
 
     /// Create the branch for the active agent's accepted `rlm` call `call_id`, push it,
-    /// and open its turn with the synthetic `FYI()` queued. A branch whose session can't
-    /// be created has no turn to end, so the parent gets `[branch failed: <error>]` as
-    /// its result directly; a failure opening the turn fails the pushed branch like any
-    /// other branch error (`fail_branch`).
-    fn start_branch(&mut self, call_id: &str, task: String) -> anyhow::Result<()> {
+    /// and open its turn with its synthetic turn-start calls queued (`turn_start_calls`).
+    /// A branch whose session can't be created has no turn to end, so the parent gets
+    /// `[branch failed: <error>]` as its result directly; a failure opening the turn
+    /// fails the pushed branch like any other branch error (`fail_branch`). `name` is
+    /// the call's display label for the branch while it is on screen.
+    fn start_branch(&mut self, call_id: &str, task: String, name: String) -> anyhow::Result<()> {
         let agent = match self.create_branch(call_id, task) {
             Ok(agent) => agent,
             Err(error) => {
@@ -438,6 +459,7 @@ impl App {
         self.frames.push(Frame {
             agent,
             notes: Vec::new(),
+            branch_name: Some(name),
         });
         // A new session has nothing for the turn-start cleanup to remove. The display
         // switches only once the turn is open: a branch session without an active turn
@@ -517,7 +539,11 @@ impl App {
     fn act(&mut self, outcome: Outcome) -> anyhow::Result<()> {
         match outcome {
             Outcome::None => {}
-            Outcome::StartBranch { call_id, task } => return self.start_branch(&call_id, task),
+            Outcome::StartBranch {
+                call_id,
+                task,
+                name,
+            } => return self.start_branch(&call_id, task, name),
             Outcome::Failure(failure) => {
                 let agent = &self.frames.last().expect(ROOT_HELD).agent;
                 let count = self.failures.record(
@@ -570,8 +596,12 @@ impl App {
                 message_overlay_entries(&agent.session().turns, self.token_counts.turns())?;
             let transcript_messages: Vec<_> = agent.session().messages().collect();
             let footer = self.footer();
+            // The on-screen agent's effective system message, by the same rule as its
+            // requests (`Settings::system_prompt`).
             let blocks = build_blocks(
-                self.resources.settings.chat_prompt.as_deref(),
+                self.resources
+                    .settings
+                    .system_prompt(agent.session().depth()),
                 &transcript_messages,
                 &frame.notes,
                 agent.turn(),
@@ -591,6 +621,7 @@ impl App {
                         self.message_scroll
                     },
                     collapsed: self.messages_collapsed,
+                    name: frame.name(),
                 },
             )?;
             // Collapsing changes geometry, not the position to restore when reopened.
@@ -1037,16 +1068,12 @@ impl App {
         preferred_token_total(self.agent().context_tokens(), self.token_counts.total())
     }
 
-    /// Name the agent on screen by its session identity (the tree name for the root,
-    /// the call ID for a branch), and show the current permission and the exact host
-    /// operation awaiting approval.
+    /// Name the agent on screen (`Frame::name`: the session name for the root, the
+    /// caller-given `name` for a branch), and show the current permission and the exact
+    /// host operation awaiting approval.
     fn status_line(&self) -> Line<'static> {
         let settings = &self.resources.settings;
-        let mut info = format!(
-            "{} | {}",
-            self.agent().session().name(),
-            settings.endpoint.model
-        );
+        let mut info = format!("{} | {}", self.top().name(), settings.endpoint.model);
         let tokens = self.context_token_total();
         info.push_str(&format!(" | {} tokens", status_token_count(tokens)));
         info.push_str(&format!(" | {}", settings.permission.as_str()));
@@ -1692,7 +1719,7 @@ mod tests {
 
     use super::*;
     use crate::agent::{
-        ApprovalDescription, PendingCall, PendingPrompt, Reply, fyi_calls, next_description,
+        ApprovalDescription, PendingCall, PendingPrompt, Reply, next_description, turn_start_calls,
     };
     use crate::host::Mounts;
     use crate::session::FunctionCall;
@@ -1867,7 +1894,7 @@ mod tests {
             ]},
             {"role":"tool", "tool_call_id":"third", "content":"hidden again"}
         ])).unwrap();
-        let synthetic = fyi_calls(1).unwrap().remove(0);
+        let synthetic = turn_start_calls(1, Mounts::at(1, false)).unwrap().remove(0);
         let synthetic_id = synthetic.id.clone();
         messages.push(Message {
             role: Role::Assistant,

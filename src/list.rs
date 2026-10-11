@@ -239,7 +239,8 @@ impl Listing<'_> {
 }
 
 /// Open one enumerated basename without following links, even if it changed after metadata collection.
-fn open_child_directory(parent: &Dir, name: &OsStr) -> io::Result<Dir> {
+/// The REPL's mount summaries (`host::summary`) descend through it too.
+pub fn open_child_directory(parent: &Dir, name: &OsStr) -> io::Result<Dir> {
     let mut components = Path::new(name).components();
     if !matches!(
         (components.next(), components.next()),

@@ -85,9 +85,10 @@ impl Access {
 }
 
 /// This tree's `library/` directory: the REPL's read-only `/library` mount and the
-/// direct tools' `root = "library"` capability. The App opens it on first use and
-/// opens it again from the renamed path after `/rename`; each agent at depth 2 and
-/// deeper gets a clone and uses both handles as given, never opening them by path.
+/// capability behind the direct tools' `root = "library"` and the REPL's
+/// `library_summary()`. The App opens it on first use and opens it again from the
+/// renamed path after `/rename`; each agent at depth 2 and deeper gets a clone and
+/// uses both handles as given, never opening them by path.
 #[derive(Clone)]
 pub struct Library {
     pub mount: MountSpec,

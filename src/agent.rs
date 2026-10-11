@@ -69,9 +69,15 @@ pub enum Outcome {
     /// message, and a branch fails.
     StreamError(String),
     /// An accepted `rlm` call (`call_id`) put this agent in `Phase::Delegating`; the
-    /// App creates the branch with `task` as its user message and pushes it. The
+    /// App creates the branch with `task` as its user message and pushes it, showing
+    /// it as `name` while it is on screen. `name` is display-only: it is kept nowhere
+    /// but the call's saved arguments, and `call_id` stays the branch's identity. The
     /// branch's answer comes back through `finish_delegation`.
-    StartBranch { call_id: String, task: String },
+    StartBranch {
+        call_id: String,
+        task: String,
+        name: String,
+    },
 }
 
 /// Facts about one REPL failure. The running call keeps its phase; the App persists
@@ -98,8 +104,9 @@ pub struct Agent {
     /// branch's answer to its parent's `rlm` call (`answer`), or the text it passes up
     /// with its marker when it stops or fails after that response (`partial_content`).
     final_content: Option<String>,
-    /// The tree's library, for this agent's REPL `/library` mount and its direct tools'
-    /// `root = "library"`, supplied by the App at creation at depth 2 and deeper only.
+    /// The tree's library, for this agent's REPL `/library` mount and `library_summary()`
+    /// and its direct tools' `root = "library"`, supplied by the App at creation at
+    /// depth 2 and deeper only.
     library: Option<Library>,
     /// Context in use when the last reply finished (prompt + completion), as reported
     /// by the server. Unknown until a reply reports usage; stopped or failed replies
@@ -365,10 +372,12 @@ impl Agent {
         self.final_content = None;
         // FYI/help are the only per-turn cleanup cases.
         let removed = self.session.remove_calls(is_cleanup)?;
-        // Each turn opens with an approval-exempt synthetic FYI call made as if by the
-        // model: the `FYI` tool at the root, `FYI()` in the REPL below it. `advance`
-        // runs it, then sends the first request.
-        let calls = fyi_calls(self.session.depth())?;
+        // Each turn opens with approval-exempt synthetic calls made as if by the model,
+        // saved together in one assistant message: the `FYI` tool at the root; `FYI()`,
+        // `help()`, `store_summary()`, and, where `/library` is mounted,
+        // `library_summary()` in the REPL below it. `advance` runs them in order, then
+        // sends the first request.
+        let calls = turn_start_calls(self.session.depth(), self.mounts())?;
         let saved = self.session.push(Message {
             role: Role::Assistant,
             content: String::new(),
@@ -490,7 +499,7 @@ impl Agent {
         let (task, events) = client::start(
             &res.http,
             &res.settings.endpoint,
-            res.settings.chat_prompt.as_deref(),
+            res.settings.system_prompt(self.session.depth()),
             &self.tools,
             messages,
         );
@@ -664,22 +673,30 @@ impl Agent {
     }
 
     /// Accept an `rlm` call, or record that its arguments are invalid; an accepted
-    /// call's `task` becomes the branch's user message verbatim.
+    /// call's `task` becomes the branch's user message verbatim and its `name` the
+    /// branch's display label. Both are required strings, so a missing or non-string
+    /// `name` is rejected exactly like a missing `task`.
     fn begin_delegation(&mut self, res: &Resources, call: ToolCall) -> anyhow::Result<Outcome> {
         #[derive(serde::Deserialize)]
         struct Arguments {
             task: String,
+            name: String,
         }
-        let task = match serde_json::from_str::<Arguments>(&call.function.arguments) {
-            Ok(args) => args.task,
-            Err(error) => {
-                self.record_result(res, &call, format!("Invalid rlm arguments: {error}"))?;
-                return Ok(Outcome::None);
-            }
-        };
+        let Arguments { task, name } =
+            match serde_json::from_str::<Arguments>(&call.function.arguments) {
+                Ok(args) => args,
+                Err(error) => {
+                    self.record_result(res, &call, format!("Invalid rlm arguments: {error}"))?;
+                    return Ok(Outcome::None);
+                }
+            };
         let call_id = call.id.clone();
         self.set_phase(Phase::Delegating(call));
-        Ok(Outcome::StartBranch { call_id, task })
+        Ok(Outcome::StartBranch {
+            call_id,
+            task,
+            name,
+        })
     }
 
     /// Whether `name` is one of this agent's tools (`tools`).
@@ -838,10 +855,10 @@ impl Agent {
             return Ok(());
         };
         if turn.repl.is_none() {
-            turn.repl = Some(res.runtime.start(
-                self.session.depth(),
-                self.library.as_ref().map(|library| library.mount.clone()),
-            ));
+            turn.repl = Some(
+                res.runtime
+                    .start(self.session.depth(), self.library.clone()),
+            );
         }
         let repl = turn.repl.as_mut().expect("started above");
         // Sending only queues a message; library loading and prompts happen on the
@@ -1122,25 +1139,44 @@ fn accumulate_reply(
     Ok(())
 }
 
-/// The synthetic call opening each turn of an agent at `depth`: the `FYI` tool call at
-/// the root, an `FYI()` REPL call below it. Marked with the synthetic ID kind so the
-/// saved call stays available but its overlay row hides.
-pub fn fyi_calls(depth: u32) -> anyhow::Result<Vec<ToolCall>> {
-    let (name, arguments) = if depth == 0 {
-        ("FYI", "{}")
+/// The synthetic calls opening each turn of an agent at `depth` with `mounts`, in run
+/// order: the `FYI` tool call at the root (which has no REPL); below it, separate
+/// `FYI()`, `help()`, and `store_summary()` REPL calls, then `library_summary()` where
+/// `/library` is mounted, so a branch sees its tools, mounts, store guidance, and what
+/// its mounts hold before its first request. Each is marked with the synthetic ID kind
+/// so the saved call stays available but its overlay row hides; no REPL call needs
+/// approval, since these host functions never ask for it.
+pub fn turn_start_calls(depth: u32, mounts: Mounts) -> anyhow::Result<Vec<ToolCall>> {
+    let mut calls = Vec::new();
+    if depth == 0 {
+        calls.push(("FYI", "{}"));
     } else {
-        ("REPL", r#"{"code": "FYI()"}"#)
-    };
-    Ok(vec![ToolCall {
-        id: tool_call_id::generate(tool_call_id::SYNTHETIC, &[])?,
-        kind: "function".to_string(),
-        function: FunctionCall {
-            name: name.to_string(),
-            arguments: arguments.to_string(),
-            extra: Map::new(),
-        },
-        extra: Map::new(),
-    }])
+        calls.push(("REPL", r#"{"code": "FYI()"}"#));
+        calls.push(("REPL", r#"{"code": "help()"}"#));
+        // Each mount's summary runs where its function exists (`host::is_host_function`):
+        // with the mount, which for `/store` is every branch depth.
+        if mounts.store {
+            calls.push(("REPL", r#"{"code": "store_summary()"}"#));
+        }
+        if mounts.library {
+            calls.push(("REPL", r#"{"code": "library_summary()"}"#));
+        }
+    }
+    calls
+        .into_iter()
+        .map(|(name, arguments)| {
+            Ok(ToolCall {
+                id: tool_call_id::generate(tool_call_id::SYNTHETIC, &[])?,
+                kind: "function".to_string(),
+                function: FunctionCall {
+                    name: name.to_string(),
+                    arguments: arguments.to_string(),
+                    extra: Map::new(),
+                },
+                extra: Map::new(),
+            })
+        })
+        .collect()
 }
 
 /// Select the calls the per-turn cleanup removes: every `FYI` tool call, and every
@@ -1358,16 +1394,26 @@ mod tests {
         assert_eq!(fields["tool_calls"][0]["id"], id);
     }
 
-    /// Turn start marks only app-generated FYI, not model-authored calls.
+    /// Turn start marks only app-generated calls, not model-authored ones, and adds
+    /// `library_summary()` only where `/library` is mounted.
     #[test]
     fn turn_start_calls_use_uniform_ids() {
-        let calls = fyi_calls(1).unwrap();
-        assert_eq!(calls.len(), 1);
-        for (call, code) in calls.iter().zip(["FYI()"]) {
-            assert_eq!(code_of(call).unwrap(), code);
-            let metadata = tool_call_id::decode(&call.id).unwrap();
-            assert_eq!(metadata.kind, tool_call_id::SYNTHETIC);
-            assert!(metadata.data.is_empty());
+        for (depth, library, codes) in [
+            (1, false, &["FYI()", "help()", "store_summary()"][..]),
+            (
+                2,
+                true,
+                &["FYI()", "help()", "store_summary()", "library_summary()"][..],
+            ),
+        ] {
+            let calls = turn_start_calls(depth, Mounts::at(depth, library)).unwrap();
+            assert_eq!(calls.len(), codes.len());
+            for (call, code) in calls.iter().zip(codes) {
+                assert_eq!(code_of(call).unwrap(), *code);
+                let metadata = tool_call_id::decode(&call.id).unwrap();
+                assert_eq!(metadata.kind, tool_call_id::SYNTHETIC);
+                assert!(metadata.data.is_empty());
+            }
         }
     }
 

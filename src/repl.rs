@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
+use cap_std::fs::Dir;
 use monty_pool::{
     Checkout, MountSpec, MountSpecMode, Pool, PoolConfig, PoolError, ReplConfig, ResumeValue,
     TurnEvent, on_print_sync,
@@ -16,6 +17,7 @@ use tokio::task::JoinHandle;
 use crate::config::{Permission, Settings};
 use crate::host::{self, HostConfig, HostContext, Mounts};
 use crate::hostfs::{self, FsAction, LIBRARY, STORE};
+use crate::root::Library;
 use crate::token_count::TokenTotal;
 
 pub enum ReplEvent {
@@ -52,6 +54,9 @@ pub struct Runtime {
     /// `/store`, opened once at startup and cloned into the feeds of agents at depth 1
     /// and deeper, like `mount`.
     store: MountSpec,
+    /// The store's directory capability, opened once at startup and cloned into the
+    /// host context of every agent with `/store`, for `store_summary()`.
+    store_dir: Arc<Dir>,
     permission: watch::Sender<Permission>,
     memory_mb: usize,
 }
@@ -72,6 +77,9 @@ impl Runtime {
         .context("opening repository mount")?;
         let store = MountSpec::new(STORE, &settings.store_path, MountSpecMode::ReadWrite)
             .with_context(|| format!("opening store mount {}", settings.store_path.display()))?;
+        let store_dir =
+            Dir::open_ambient_dir(&settings.store_path, cap_std::ambient_authority())
+                .with_context(|| format!("opening store {}", settings.store_path.display()))?;
         let bytes = settings
             .max_memory_mb
             .checked_mul(1024 * 1024)
@@ -107,6 +115,7 @@ impl Runtime {
             repo,
             mount,
             store,
+            store_dir: Arc::new(store_dir),
             permission,
             memory_mb: settings.max_memory_mb,
         })
@@ -119,9 +128,11 @@ impl Runtime {
 
     /// A fresh driver per turn for an agent at `depth`; checkout and library load occur
     /// with its first call. Every feed carries the repository mount, `/store` from
-    /// depth 1, and `library`, the tree's `/library` mount, which the App supplies at
-    /// depth 2 and deeper only.
-    pub fn start(&self, depth: u32, library: Option<MountSpec>) -> Repl {
+    /// depth 1, and `library`'s `/library` mount, the tree's library, which the App
+    /// supplies at depth 2 and deeper only. The host context holds the directory
+    /// capability of each mount the feeds carry beside the repository, for the mount
+    /// summaries.
+    pub fn start(&self, depth: u32, library: Option<Library>) -> Repl {
         debug_assert!(
             library.is_none() || depth >= 2,
             "/library is mounted only at depth 2 and deeper"
@@ -133,7 +144,10 @@ impl Runtime {
         if host_mounts.store {
             mounts.push(self.store.clone());
         }
-        mounts.extend(library);
+        let library_dir = library.map(|library| {
+            mounts.push(library.mount);
+            library.dir
+        });
         let (commands, incoming) = mpsc::unbounded_channel();
         let (events, output) = mpsc::unbounded_channel();
         let driver = Driver {
@@ -145,6 +159,8 @@ impl Runtime {
             host: HostContext {
                 repo: self.repo.clone(),
                 mounts: host_mounts,
+                store_dir: host_mounts.store.then(|| self.store_dir.clone()),
+                library_dir,
                 config: self.config.clone(),
                 permissions: self.permission.subscribe(),
                 events,
@@ -368,11 +384,12 @@ impl Driver {
                 TurnEvent::NameLookup {
                     name, object_id, ..
                 } => {
-                    let result = if object_id.is_none() && host::is_host_function(&name) {
-                        NameLookupResult::Value(MontyObject::function(name, None))
-                    } else {
-                        NameLookupResult::Undefined
-                    };
+                    let result =
+                        if object_id.is_none() && host::is_host_function(&name, self.host.mounts) {
+                            NameLookupResult::Value(MontyObject::function(name, None))
+                        } else {
+                            NameLookupResult::Undefined
+                        };
                     checkout.resume_name_lookup(result, &mut on_print).await?
                 }
                 TurnEvent::FunctionCall {
@@ -448,7 +465,7 @@ impl Driver {
                 format!("REPL worker crashed: {error}")
             };
             format!(
-                "[{cause}. The REPL was restarted: every variable, import, and function defined earlier in this turn is gone; library functions are reloaded.]"
+                "[{cause}. The REPL was restarted: every variable, import, and function defined earlier in this turn is gone; helper functions are reloaded.]"
             )
         } else {
             // Expected failures carry Python frames too; report the cause without
@@ -558,6 +575,8 @@ mod tests {
                     store: false,
                     library: false,
                 },
+                store_dir: None,
+                library_dir: None,
                 config: Arc::new(HostConfig {
                     dir: repo,
                     model: String::new(),

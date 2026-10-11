@@ -44,7 +44,7 @@ struct Args {
     /// sessions and exit.
     #[arg(long, value_name = "NAME")]
     resume: Option<Option<String>>,
-    /// Override the configured system prompt with literal text for this invocation.
+    /// Replace `[chat] prompt` with literal text for this invocation.
     #[arg(long, value_name = "TEXT")]
     system_prompt: Option<String>,
 }
@@ -72,7 +72,9 @@ async fn run_app(args: Args) -> anyhow::Result<()> {
     }
     // Config and session errors are reported before the terminal UI starts.
     let mut settings = config::load(&dir)?;
-    // Requests and transcript rendering share this invocation's effective prompt.
+    // Replaces `[chat] prompt` for this invocation: the root's system message, and the
+    // subagents' too unless `[rlm] subagent_prompt` is set. Requests and transcript
+    // rendering both resolve it through `Settings::system_prompt`.
     if let Some(prompt) = args.system_prompt {
         settings.chat_prompt = Some(prompt);
     }
