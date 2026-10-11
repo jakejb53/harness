@@ -10,6 +10,13 @@ use monty_types::{
 
 use crate::{config::Permission, host::HostContext, root::Root};
 
+/// Virtual path of the repository mount, which follows the permission level. As the
+/// feeds' first mount it is the sandbox working directory, so REPL paths and filesystem
+/// errors never show the repository's host path, and a host path written in REPL code
+/// is outside every mount. Among host functions only `run()`, whose commands are host
+/// processes, uses the host path (`HostContext::repo`).
+pub const REPOSITORY: &str = "/repository";
+
 /// Virtual path of the store mount, read-write regardless of the permission level.
 pub const STORE: &str = "/store";
 
@@ -107,7 +114,7 @@ pub fn authorize(path: &Path, write: bool, host: &HostContext) -> Result<(), Mon
 /// applied is always that of the mount that performs the operation.
 fn root_of(path: &Path, host: &HostContext) -> Option<Root> {
     [
-        Some((host.repo.as_path(), Root::Repository)),
+        Some((Path::new(REPOSITORY), Root::Repository)),
         host.mounts.store.then(|| (Path::new(STORE), Root::Store)),
         host.mounts
             .library
@@ -120,13 +127,15 @@ fn root_of(path: &Path, host: &HostContext) -> Option<Root> {
     .map(|(_, root)| root)
 }
 
-/// The places this turn's feeds cover, for the denial of a path outside all of them.
+/// The mounts this turn's feeds cover, by virtual path, for the denial of a path outside
+/// all of them. Naming `/repository` rather than "the repository" keeps the message true
+/// when the denied path is the repository's host path, copied from command output.
 fn covered(host: &HostContext) -> String {
     match (host.mounts.store, host.mounts.library) {
-        (false, false) => "the repository".into(),
-        (true, false) => format!("the repository and {STORE}"),
-        (false, true) => format!("the repository and {LIBRARY}"),
-        (true, true) => format!("the repository, {STORE}, and {LIBRARY}"),
+        (false, false) => REPOSITORY.into(),
+        (true, false) => format!("{REPOSITORY} and {STORE}"),
+        (false, true) => format!("{REPOSITORY} and {LIBRARY}"),
+        (true, true) => format!("{REPOSITORY}, {STORE}, and {LIBRARY}"),
     }
 }
 

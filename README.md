@@ -35,6 +35,7 @@ output_limit = 100000            # bytes of output per call returned to the mode
 
 [rlm]
 max_depth = 2                    # deepest subagent depth, at least 1 (see Agents)
+# subagent_prompt = "..."        # optional; subagents' system message (see Agents)
 
 [rlm.store]
 path = "/absolute/path/to/store" # existing directory shared by subagents (see Agents)
@@ -47,7 +48,7 @@ env_filter = ["GITHUB_TOKEN"]    # exact names removed from command environments
 # cargo = "/absolute/path/to/cargo"  # configured commands run without asking
 ```
 
-These are example values, not runtime defaults. All settings shown are required except `api_key_env`, `chat.prompt`, and individual allow-list entries. Keep `[chat]` and `[commands.allow]` even when empty. Also copy the required `[theme]` table from `config.toml.example`: its foreground colors must be `#RRGGBB` strings. Colors load at startup without dimming or background changes. Missing required settings, unknown keys, and relative allow-list executable paths are startup errors. `tool_description` is sent verbatim to the model. `[rlm.store] path` must be an absolute path (`~` is not expanded) to an existing directory; the app never creates it. The store must lie outside the launch directory and contain neither it nor `~/.harness/sessions/`, and the launch directory must not contain `~/.harness/sessions/`, or subagent REPL calls fail. Up to `max_depth` REPL workers run at once, each limited by `max_memory_mb`. See `config.toml.example` for a complete example.
+These are example values, not runtime defaults. All settings shown are required except `api_key_env`, `chat.prompt`, and individual allow-list entries. Keep `[chat]` and `[commands.allow]` even when empty. Also copy the required `[theme]` table from `config.toml.example`: its foreground colors must be `#RRGGBB` strings. Colors load at startup without dimming or background changes. Missing required settings, unknown keys, and relative allow-list executable paths are startup errors. `tool_description` is sent verbatim to the model. `[rlm.store] path` must be an absolute path (`~` is not expanded) to an existing directory; the app never creates it. The store must lie outside the launch directory and not contain it, or every subagent REPL call fails; neither the store nor the launch directory may contain `~/.harness/sessions/`, or REPL calls of subagents at depth 2 and deeper fail. Up to `max_depth` REPL workers run at once, each limited by `max_memory_mb`. See `config.toml.example` for a complete example.
 
 Optional `[endpoint.parameters]` entries are sent as top-level request fields. Uncomment the table heading and desired values in `config.toml` to enable overrides:
 
@@ -75,7 +76,7 @@ A variable already set in your shell takes precedence over `.env`. The app reads
 
 Run `harness` from the directory the agent should work in, normally the root of a repository.
 
-Each run starts a new conversation, saved under `~/.harness/sessions/YYYYMMDD-HHMMSS/` when you send the first message. The directory name is the session's name; `/rename <name>` changes it. To list saved sessions, oldest first, or continue one:
+Each run starts a new conversation, saved under `~/.harness/sessions/YYYYMMDD-HHMMSS/` when you send the first message. The directory name is the session's name; `/rename <name>` changes it. To list saved sessions, least recently updated first, or continue one:
 
 ```
 harness --resume
@@ -94,7 +95,7 @@ This also works with `--resume <NAME>`. The text is used verbatim, including an 
 
 ## Using it
 
-Type at the `> ` prompt and press Enter to send. The reply streams above the prompt: reasoning uses `theme.reasoning`, followed by the answer in `theme.assistant`.
+Type at the `> ` prompt and press Enter to send. The reply streams above the prompt: reasoning uses `theme.reasoning`, followed by the answer in `theme.assistant`. The on-screen agent's system message, when it has one, heads the transcript in `theme.system`.
 
 Tool arguments appear as they stream in; execution waits for the complete response. Printed REPL output appears while it runs. Host commands return captured output when they finish. The model keeps calling tools until it answers without one. Esc stops the turn and every running subagent; a patch finishes accounting for any current file commit before reporting what changed.
 
@@ -102,9 +103,9 @@ The status line under the prompt shows the name of the agent on screen, the mode
 
 While the model is working, you can keep typing your next message. It sends once the turn finishes and you press Enter.
 
-**Situational awareness.** Each root turn starts with the app calling `FYI` on the model's behalf; each subagent starts with the app calling `FYI()`, `help()`, `store_summary()`, and, where `/library` is mounted, `library_summary()` in its REPL. `FYI` prints the current date, the agent's prompt-token count, and the model. The count prefers the agent's latest endpoint-reported prompt usage; before one is available, it uses the context overlay's aggregate and prefixes `~` when any contributing turn is heuristic. The calls and their output are shown and saved like any other. Agents can call `FYI` themselves at any time, and subagents `help()`; `help()` lists the subagent's files, output limit, and helper functions. `store_summary()` and `library_summary()` print the file count, total bytes, last update, and up to five recently changed paths of `/store` and `/library`; subagents can call them at any time. Before adding `FYI` to a root turn, the app removes every earlier `FYI` call from the conversation and its session file.
+**Situational awareness.** Each root turn starts with the app calling `FYI` on the model's behalf; each subagent starts with the app calling `FYI()`, `help()`, `store_summary()`, and, where `/library` is mounted, `library_summary()` in its REPL. `FYI` prints the current date, the agent's prompt-token count, and the model. The count prefers the agent's latest endpoint-reported prompt usage; before one is available, it uses the context overlay's aggregate and prefixes `~` when any contributing turn is heuristic. The calls and their output are shown and saved like any other. Agents can call `FYI` themselves at any time, and subagents `help()`, which describes the subagent's REPL (see The REPL). `store_summary()` and `library_summary()` print, for `/store` and `/library`, the regular-file count, total bytes, latest modification time, and up to five most recently modified paths, or `<mount>: empty` when it has none; subagents can call each wherever its mount exists. Before adding `FYI` to a root turn, the app removes every earlier `FYI` call from the conversation and its session file.
 
-**Approval exemptions.** All synthetic tool calls, present and future, including `FYI()`, never require approval, whether the app generates them or the model calls them explicitly. Explicit `help()` calls also require no approval. This applies at every permission level. Unrelated code bundled with them, including code evaluated in arguments, follows normal permissions and approval rules.
+**Approval exemptions.** All synthetic tool calls, present and future (the `FYI` tool, `FYI()`, `help()`, `store_summary()`, and `library_summary()`), never require approval, whether the app generates them or the model calls them explicitly. This applies at every permission level. Unrelated code bundled with them, including code evaluated in arguments, follows normal permissions and approval rules.
 
 ### Agents
 
@@ -118,7 +119,7 @@ While a subagent runs, the transcript, context overlay, and status line show it,
 
 **Library.** Agents at depth 2 and deeper can read this session's root and depth 1 conversation files, read-only, at `/library`.
 
-`read_file`, `apply_patch`, `grep`, and `list` take an optional `root`: `repository` (default), `store`, or `library`, each offered only where the agent has it; `apply_patch` never offers `library`. Paths are then relative to that directory, and the permission level applies only to `repository`.
+`read_file`, `apply_patch`, `grep`, and `list` take an optional `root`: `repository` (default), `store`, or `library`, each offered only where the agent has it; `apply_patch` never offers `library`. Paths are then relative to that directory; in the tool sections below, "the repository" means the chosen root, and permission requirements apply only to `repository`. The transcript and context overlay show an `apply_patch` call's `root`, when given, as a `root: <value>` line above its patch.
 
 ### Context display
 
@@ -126,9 +127,9 @@ The upper-right overlay is a compact context editor. User and assistant content,
 
 Click any row to hide or restore its completed turn in model requests. Hidden turns remain in the main transcript and context editor, but every part of their context-editor display is rendered at half brightness. The active turn cannot be hidden until it ends. Hidden state is saved with the session.
 
-Counts are cached incrementally. Missing or changed turns are sent as progressive prefixes to the provider's `/tokenize` endpoint, derived by removing a final `/v1` from `[endpoint] base_url`. If any prefix request fails, the complete turn uses `ceil(compact JSON UTF-8 bytes / 3.25)` estimates; `~` marks estimated counts. Unchanged cached turns make no tokenizer requests. Hidden turns keep their individual displayed counts but are excluded from aggregate context totals.
+Counts are cached incrementally. Missing or changed completed turns are sent as progressive prefixes to the provider's `/tokenize` endpoint, derived by removing a final `/v1` from `[endpoint] base_url`. If any prefix request fails, the complete turn uses `ceil(compact JSON UTF-8 bytes / 3.25)` estimates, as the active turn does until it ends; `~` marks estimated counts. Unchanged cached turns make no tokenizer requests. Hidden turns keep their individual displayed counts but are excluded from aggregate context totals.
 
-The expanded overlay is capped at nine-sixteenths of the transcript width and height. Its top border centers a bright `[Context][<name>]` header, naming the agent on screen, and the mouse wheel scrolls its rows. Click `[-]` to collapse the overlay to that one-row header; click `[+]` to reopen it at the retained width and scroll position. The overlay covers transcript cells without changing transcript wrapping or input width.
+The expanded overlay is capped at nine-sixteenths of the transcript width and height. Its top border centers a `[Context][<root>]…[<name>]` header in `theme.assistant`, naming each agent from the root to the one on screen as the status line does; when space runs short, the oldest names collapse into one `[…]`, then the on-screen name shortens with an ellipsis. The mouse wheel scrolls its rows. Click `[-]` to collapse the overlay to that one-row header; click `[+]` to reopen it at the retained width and scroll position. The overlay covers transcript cells without changing transcript wrapping or input width.
 
 ### Approval descriptions
 
@@ -148,7 +149,7 @@ Shift+Tab cycles `none → read-only → read-write`; the choice is saved to `co
 | `read-only` | Reads are allowed; writes are denied. |
 | `read-write` | Reads and writes are allowed. |
 
-The repository is the directory from which you launch the app. Access outside it is denied at every level, including traversal and symlink escapes, without an approval prompt, except a subagent's `/store` and `/library` (see Agents). Monty also rejects absolute symlink targets inside the repository; use relative targets. `Path.resolve()` normalizes paths lexically rather than following host symlinks.
+The repository is the directory from which you launch the app; the REPL mounts it at the virtual path `/repository`, which is also its working directory, so REPL paths and errors never show its host path, and a host path written in REPL code is outside every mount. Access outside it is denied at every level, including traversal and symlink escapes, without an approval prompt, except a subagent's `/store` and `/library` (see Agents). Monty also rejects absolute symlink targets inside the repository; use relative targets. `Path.resolve()` normalizes paths lexically rather than following host symlinks.
 
 Host command approvals are independent of these levels (see Host commands). `reasoning()` is not synthetic: a standalone `reasoning("...")` on a plain string has its own approval exemption at every level. It cannot exempt unrelated code.
 
@@ -211,8 +212,9 @@ When you scroll up, the view stays put while the model writes; scroll back to th
 
 | Command | Action |
 |---|---|
-| `/rename <name>` | Rename this session (its directory in `~/.harness/sessions/`); refused if the name is taken or a subagent is running |
+| `/rename <name>` | Rename this session (its directory in `~/.harness/sessions/`); refused if the name is taken, empty, contains `/`, or starts with `.`, or while a subagent is running |
 | `/tools` | Show every tool's name and full description for the agent on screen in the conversation display; output is not saved or sent to the model |
+| `/new`, `/clear` | Start a new, empty session; the current one stays saved for `--resume`. Refused while a turn is running |
 | `/exit`, `/quit` | Exit |
 
 Typing `/` opens a list of matching commands below the input: Up/Down to choose, Tab to complete, Enter to run (for `/rename`, to complete it so you can type the name), Esc to close.
@@ -225,15 +227,15 @@ Each subagent has its own REPL, which starts fresh and lasts until the subagent'
 
 Printed output is followed by the trailing expression's value, when not `None`, and any runtime error. Empty output becomes `(no output)`. Results are capped at `output_limit` bytes on a Unicode character boundary, with a notice stating how many bytes were omitted. The sandbox sees an empty environment.
 
-`help()` lists the output limit, optional guidance from `~/.harness/repl-notes.md`, the agent's files (the repository with its current permission level, plus `/store` and `/library` where mounted), host functions, loaded public helper functions, and allow-listed command names.
+`help()` prints the output limit, the contents of `~/.harness/repl-notes.md` when present, and five sections: Files (the repository with its current permission level, plus `/store` and `/library` where mounted, and how REPL code and the direct tools reach each), Python (the supported subset and what to use instead), REPL functions (`FYI`, `help`, `run`, `lib_source`, and `store_summary` and `library_summary` where their mounts exist), Commands (how to call `run()`, with the allow-listed and denied names), and Helper functions (loaded public helpers). The Python section's `Use instead` lines come from one table of unsupported names that agents commonly try, each with its supported alternative, and a REPL call whose result ends with an exception listed in that table gets one more line: `<name> is not available in this REPL; use <alternative>.` A tool call naming one of those REPL functions or loaded helper functions gets `Unknown tool: <name>` followed by a pointer to call it inside REPL code, with its signature.
 
 ### Host commands
 
-`run(argv, cwd=None)` executes a bare command name with literal arguments, without a shell. It returns `{"exit_code": int, "stdout": str, "stderr": str}` and prints nothing. Output is captured until the command finishes; a signal exit uses the negative signal number. Commands have no terminal or interactive stdin. Esc kills the command's process group.
+`run(argv, cwd=None)` runs `argv[0]` with the remaining items as literal arguments, without a shell. It returns `{"exit_code": int, "stdout": str, "stderr": str}` and prints nothing. Output is captured until the command finishes; a signal exit uses the negative signal number. Commands have no terminal, stdin, or timeout. Esc kills the command's process group.
 
-Names in `[commands] deny` are blocked. Names in `[commands.allow]` run the configured absolute executable without asking. Other names are resolved through the app's `PATH` and require approval each time; missing commands produce an error. This is independent of the filesystem permission level.
+`argv[0]` is a command name or a relative path containing `/`. Names in `[commands] deny` are blocked. Names in `[commands.allow]` run the configured absolute executable without asking. Other names resolve to an executable file on the app's `PATH` and require approval each time; a name not found raises `FileNotFoundError`. A path names an executable inside the repository, resolved against `cwd`; it requires approval each time, and the deny and allow lists do not apply to it. Absolute paths, `..` components, and paths resolving outside the repository are denied, and a path that is not an executable file raises `PermissionError`. Denials and refused approvals raise `PermissionError`. None of this depends on the filesystem permission level.
 
-Commands start in the repository root, independently of sandbox `os.chdir()`. An explicit `cwd` must be relative and contain no `..` components. If its symlinks resolve outside the repository, using that directory requires approval. Commands inherit the app's environment minus the exact names in `env_filter`.
+Commands start in the repository root, independently of sandbox `os.chdir()`. An explicit `cwd` must be an existing directory, relative, with no `..` components. If its symlinks resolve outside the repository, using that directory requires approval. Commands inherit the app's environment minus the exact names in `env_filter`. They run on the host, where `/repository`, `/store`, and `/library` do not exist.
 
 ### Helper functions
 
@@ -257,12 +259,11 @@ def word_count(path: str) -> int:
 
 This repo ships `replib/reasoning.py`, `replib/glob.py`, and `replib/search.py`. `install.sh` copies them into `~/.harness/replib/` and overwrites them on every install; your own files there are unaffected.
 
-- `reasoning(text)` does nothing and returns `None`. It gives the model a way to record its reasoning as part of the conversation, and the model is encouraged to call it: a call that is only `reasoning("...")` on a plain string never needs approval, and the app answers it with `(no output)` without running it.
-- That answer depends on it staying a no-op that prints nothing.
-- `glob(pattern, path=None, exclude=(".git", "target", "node_modules"))` returns sorted relative paths.
-- `search(pattern, path=None, glob=None, exclude=(".git", "target", "node_modules"))` finds regex matches and returns `path`, 1-based `line`, and `text` records.
+- `reasoning(text)` does nothing and returns `None`. It gives the model a way to record its reasoning as part of the conversation, and the model is encouraged to call it: a call that is only `reasoning("...")` on a plain string never needs approval, and the app answers it with `(no output)` without running it. That answer depends on it staying a no-op that prints nothing.
+- `glob(pattern, path=None, exclude=())` returns sorted relative paths.
+- `search(pattern, path=None, glob=None, exclude=())` finds regex matches in the files that the `glob()` pattern `glob` (default `**/*`) selects and returns `path`, 1-based `line`, and `text` records. Files containing a NUL byte are skipped as binary, as the `grep` tool skips them.
 
-Both file helpers default to `.`, preserve the supplied relative root in results, skip directory symlinks, and reject absolute paths and `..` components in path inputs. Errors propagate rather than silently skipping unreadable files.
+Both file helpers default to `.`, preserve the supplied relative root in results, skip only the entry names you pass in `exclude`, and reject absolute paths and `..` components in path inputs, so they cannot reach `/store` or `/library`; `**` does not enter directory symlinks. Errors propagate rather than silently skipping unreadable files; a missing root raises `FileNotFoundError`.
 
 ### Failure notes
 
@@ -270,9 +271,9 @@ App denials and unsupported Monty operations are appended to `~/.harness/failure
 
 ## Conversation files
 
-Each session is a directory, `~/.harness/sessions/<name>/`. `library/root.json` is your conversation with the root. Each subagent's conversation is a file named by the ID of the `rlm` call that started it: `library/<id>.json` at depth 1, `deep/<id>.json` deeper. Every file uses the format below.
+Each session is a directory, `~/.harness/sessions/<name>/`. `library/root.json` is your conversation with the root. Each subagent's conversation is a file named by the ID of the `rlm` call that started it: `library/<id>.json` at depth 1, `deep/<id>.json` deeper. `--resume` lists and loads only directories containing `library/root.json`. Every file uses the format below.
 
-The saved `messages` array is authoritative session state. It interleaves provider messages with a local marker after each hidden turn; unmarked turns are model-visible. Requests omit markers and hidden turns. The required top-level `_harness_local` object is never sent to providers. It records, at creation, `repository` (the canonical launch directory), `depth` (0 for the root), and, for a subagent, `parent` (`root` at depth 1, otherwise the parent's call ID); it also holds the derived `turn_token_cache`. The system message is added separately and isn't saved; each request uses this invocation's `--system-prompt` override or the prompt loaded from `config.toml`, including for resumed conversations:
+The saved `messages` array is authoritative session state. It interleaves provider messages with a local marker after each hidden turn; unmarked turns are model-visible. Requests omit markers and hidden turns. The required top-level `_harness_local` object is never sent to providers. It records, at creation, `repository` (the canonical launch directory), `depth` (0 for the root), and, for a subagent, `parent` (`root` at depth 1, otherwise the parent's call ID); the root's file also holds the derived `turn_token_cache`. The system message is added separately and isn't saved; each request uses the agent's system message as this invocation resolves it (see Agents), including for resumed conversations:
 
 ```json
 { "messages": [

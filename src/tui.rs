@@ -35,8 +35,8 @@ use crate::transcript::{Block, View};
 /// Prompt marker at the start of the input box.
 const PROMPT: &str = "> ";
 
-/// The context overlay's title. The header is this followed by the on-screen agent's
-/// name in brackets, and the title itself is never shortened.
+/// The context overlay's title. The header is this followed by the name of each agent
+/// on the stack in brackets (`context_header`), and the title itself is never shortened.
 const CONTEXT_TITLE: &str = "[Context]";
 
 /// Top-border cells beside the header: the two corners and the `[-]`/`[+]` toggle.
@@ -64,7 +64,10 @@ pub struct MessageOverlay<'a> {
     pub entries: &'a [MessageEntry],
     pub scroll: usize,
     pub collapsed: bool,
-    /// The agent on screen, named in the header as `[Context][<name>]`.
+    /// The names of the agents on the stack below the one on screen, root first. The
+    /// header names them before it: `[Context][<root>]…[<name>]`.
+    pub ancestors: &'a [&'a str],
+    /// The agent on screen, last in the header.
     pub name: &'a str,
 }
 
@@ -290,13 +293,17 @@ fn render_messages(
     let max_width = (u32::from(transcript.width) * 9 / 16) as u16;
     let max_height = (u32::from(transcript.height) * 9 / 16) as u16;
     let min_height = if overlay.collapsed { 1 } else { 3 };
-    // Controls in the name are replaced up front, as `clip_line` replaces them when
-    // drawing, so the width measured for it is the width drawn.
+    // Controls in the names are replaced up front (`clip_line` at unlimited width), so
+    // none reach the terminal and the widths measured for them are the widths drawn.
+    let ancestors: Vec<String> = overlay
+        .ancestors
+        .iter()
+        .map(|name| clip_line(name, usize::MAX))
+        .collect();
     let name = clip_line(overlay.name, usize::MAX);
-    let title_width = Line::raw(CONTEXT_TITLE).width();
-    // Hidden unless the cap fits the shortest header, the title and the name clipped
-    // to its ellipsis (`[Context][…]`), with the corners and toggle.
-    let min_width = title_width + Line::raw("[…]").width() + HEADER_CHROME;
+    // Hidden unless the cap fits the shortest header, `[Context][…]`, with the corners
+    // and toggle, whatever the stack's depth.
+    let min_width = Line::raw(CONTEXT_TITLE).width() + Line::raw("[…]").width() + HEADER_CHROME;
     if usize::from(max_width) < min_width || max_height < min_height {
         return MessageGeometry::default();
     }
@@ -314,12 +321,10 @@ fn render_messages(
         })
         .max()
         .unwrap_or("(empty)".len());
-    // At least wide enough for the full header, `[Context][<name>]`, with the corners
-    // and toggle, in both forms. Only when the cap binds does the header shorten the
-    // name (`render_context_header`).
-    let header_width = Line::raw(name.as_str())
-        .width()
-        .saturating_add(title_width + 2);
+    // At least wide enough for the full header, naming every agent on the stack, with
+    // the corners and toggle, in both forms. Only when the cap binds does the header
+    // collapse ancestors or shorten the name (`context_header`).
+    let header_width = Line::raw(context_header(&ancestors, &name, usize::MAX).as_str()).width();
     let width = content_width
         .saturating_add(2)
         .max(header_width.saturating_add(HEADER_CHROME))
@@ -331,7 +336,7 @@ fn render_messages(
             .borders(Borders::TOP)
             .border_style(theme.status)
             .render(area, buf);
-        let toggle = render_context_header(buf, area, true, &name, theme);
+        let toggle = render_context_header(buf, area, true, &ancestors, &name, theme);
         return MessageGeometry {
             area,
             toggle,
@@ -356,7 +361,7 @@ fn render_messages(
         .borders(Borders::ALL)
         .border_style(theme.status)
         .render(area, buf);
-    let toggle = render_context_header(buf, area, false, &name, theme);
+    let toggle = render_context_header(buf, area, false, &ancestors, &name, theme);
     let entries = &overlay.entries[scroll..overlay.entries.len().min(scroll + rows)];
     let mut turn_rows = Vec::with_capacity(entries.len());
     for row in 0..rows {
@@ -426,14 +431,14 @@ fn half_brightness(mut style: Style) -> Style {
     style
 }
 
-/// Draw the centered persistent header, `[Context][<name>]` for the agent on screen,
-/// and the visibility control over the top border. When the width cap leaves too
-/// little room for the full header, only the name shortens, with `clip_line`'s
-/// ellipsis; `render_messages` never draws an overlay too narrow for `[Context][…]`.
+/// Draw the centered persistent header naming the agents on the stack, fitted to the
+/// cells between the left corner and the toggle (`context_header`), and the visibility
+/// control over the top border.
 fn render_context_header(
     buf: &mut Buffer,
     area: Rect,
     collapsed: bool,
+    ancestors: &[String],
     name: &str,
     theme: &Theme,
 ) -> Rect {
@@ -441,13 +446,46 @@ fn render_context_header(
     let control = if collapsed { "[+]" } else { "[-]" };
     buf.set_string(toggle.x, toggle.y, control, theme.status);
     let title_space = toggle.x.saturating_sub(area.x + 1);
-    // The cells left for the name once the title and the name's brackets are placed.
-    let name_space = usize::from(title_space).saturating_sub(Line::raw(CONTEXT_TITLE).width() + 2);
-    let header = format!("{CONTEXT_TITLE}[{}]", clip_line(name, name_space));
+    let header = context_header(ancestors, name, usize::from(title_space));
     let header_width = Line::raw(header.as_str()).width() as u16;
     let title_x = area.x + 1 + title_space.saturating_sub(header_width) / 2;
     buf.set_string(title_x, area.y, &header, theme.assistant);
     toggle
+}
+
+/// The header naming the agents on the stack, `[Context][<root>]…[<name>]`, fitted to
+/// `space` cells; `ancestors` (root first) and `name` (the agent on screen) arrive with
+/// their controls replaced. When the full header does not fit, the fewest oldest
+/// ancestors that make it fit collapse into one `[…]` after the title, so the name stays
+/// visible; with every ancestor collapsed, a name still too long shortens with
+/// `clip_line`'s ellipsis. Too narrow even for `[Context][…][…]`, the one `[…]` stands
+/// for the name as well, so the shortest header is `[Context][…]` at any depth, the
+/// narrowest `render_messages` draws.
+fn context_header(ancestors: &[String], name: &str, space: usize) -> String {
+    // Collapse the oldest `collapsed` ancestors, none at first, into one `[…]`.
+    for collapsed in 0..=ancestors.len() {
+        let marker = if collapsed == 0 { "" } else { "[…]" };
+        let kept: String = ancestors[collapsed..]
+            .iter()
+            .map(|ancestor| format!("[{ancestor}]"))
+            .collect();
+        let header = format!("{CONTEXT_TITLE}{marker}{kept}[{name}]");
+        if Line::raw(header.as_str()).width() <= space {
+            return header;
+        }
+    }
+    // Every ancestor is collapsed and the name still does not fit: it shortens to the
+    // cells left after the title, the marker, and its own brackets, while at least its
+    // ellipsis fits; below that the header is `[Context][…]`.
+    let marker = if ancestors.is_empty() { "" } else { "[…]" };
+    let fixed = Line::raw(CONTEXT_TITLE).width() + Line::raw(marker).width() + 2;
+    if space > fixed {
+        return format!(
+            "{CONTEXT_TITLE}{marker}[{}]",
+            clip_line(name, space - fixed)
+        );
+    }
+    format!("{CONTEXT_TITLE}[…]")
 }
 
 /// Preserve grapheme boundaries and reserve one terminal cell for the ellipsis.
@@ -548,6 +586,7 @@ mod tests {
             entries: &entries,
             scroll: usize::MAX,
             collapsed: false,
+            ancestors: &[],
             name: "test",
         };
         let geometry = render_messages(&mut buffer, area, &overlay, &theme);
@@ -594,6 +633,7 @@ mod tests {
                 entries: &entries,
                 scroll: 0,
                 collapsed: false,
+                ancestors: &[],
                 name: "test",
             },
             &theme,
@@ -640,6 +680,7 @@ mod tests {
                 entries: &entries,
                 scroll: 0,
                 collapsed: false,
+                ancestors: &[],
                 name: "test",
             },
             &theme,
@@ -674,6 +715,7 @@ mod tests {
             entries: &[],
             scroll: 0,
             collapsed: false,
+            ancestors: &[],
             name: "test",
         };
         let area = Rect::new(0, 0, 80, 24);
@@ -711,6 +753,7 @@ mod tests {
             entries: &entries,
             scroll: 2,
             collapsed: true,
+            ancestors: &[],
             name: "test",
         };
         let area = Rect::new(0, 0, 80, 24);

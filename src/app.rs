@@ -84,9 +84,7 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
     let textarea = input::new_textarea(&settings.theme);
     let http = reqwest::Client::new();
     let token_counts = token_count::Counter::new(http.clone(), settings.endpoint.clone());
-    // The root is a pure delegator (`rlm`, `FYI`) with no mounts; only branches at
-    // depth 2 and deeper get the library.
-    let root = Agent::new(session, &settings, None);
+    let root = Frame::root(session, &settings);
     let mut app = App {
         resources: Resources {
             settings,
@@ -98,11 +96,7 @@ pub async fn run(settings: Settings, session: Session) -> anyhow::Result<()> {
             list_runtime,
         },
         failures,
-        frames: vec![Frame {
-            agent: root,
-            notes: Vec::new(),
-            branch_name: None,
-        }],
+        frames: vec![root],
         library: None,
         token_counts,
         textarea,
@@ -135,8 +129,8 @@ struct App {
     /// below the top wait in `Phase::Delegating`.
     frames: Vec<Frame>,
     /// This tree's library for agents at depth 2 and deeper: opened on first use
-    /// (`library`) and dropped by `/rename`, so the next use opens the renamed
-    /// directory.
+    /// (`library`) and dropped by `/rename` and `/new`, so the next use opens the
+    /// renamed directory or the new tree's.
     library: Option<Library>,
     /// Counts the active agent's session; replaced whenever the top of the stack
     /// changes (`show_top`).
@@ -158,7 +152,8 @@ struct App {
     message_scroll: usize,
     /// Follow appended positions only until the user scrolls during this turn.
     follow_messages: bool,
-    /// Visibility belongs to this app run; turns do not reopen a collapsed overlay.
+    /// Visibility lasts across turns and agent switches; only `/new` reopens a collapsed
+    /// overlay, as a launch shows it.
     messages_collapsed: bool,
     /// A gesture touching the overlay must not select or copy the transcript underneath it.
     overlay_gesture: bool,
@@ -179,10 +174,21 @@ struct Frame {
 }
 
 impl Frame {
-    /// The name the status line and the context overlay's header show while this
-    /// agent is on screen: a branch's `branch_name`; for the root, its session name
-    /// (the tree directory name), read from the session each time so it follows
-    /// `/rename`.
+    /// The bottom of the stack for root session `session`, at launch and after `/new`.
+    /// The root is a pure delegator (`rlm`, `FYI`) with no mounts; only branches at
+    /// depth 2 and deeper get the library.
+    fn root(session: Session, settings: &Settings) -> Self {
+        Frame {
+            agent: Agent::new(session, settings, None),
+            notes: Vec::new(),
+            branch_name: None,
+        }
+    }
+
+    /// The name the status line shows while this agent is on screen, and the context
+    /// overlay's header shows for it while it is on the stack: a branch's
+    /// `branch_name`; for the root, its session name (the tree directory name), read
+    /// from the session each time so it follows `/rename`.
     fn name(&self) -> &str {
         match &self.branch_name {
             Some(name) => name,
@@ -590,8 +596,11 @@ impl App {
             self.count_tokens()?;
             // Field borrows below, not `top()`, so drawing can borrow other fields
             // mutably alongside the active agent.
-            let frame = self.frames.last().expect(ROOT_HELD);
+            let (frame, below) = self.frames.split_last().expect(ROOT_HELD);
             let agent = &frame.agent;
+            // The agents below the one on screen, root first: the overlay's header names
+            // them before it.
+            let ancestors: Vec<&str> = below.iter().map(Frame::name).collect();
             let messages =
                 message_overlay_entries(&agent.session().turns, self.token_counts.turns())?;
             let transcript_messages: Vec<_> = agent.session().messages().collect();
@@ -621,6 +630,7 @@ impl App {
                         self.message_scroll
                     },
                     collapsed: self.messages_collapsed,
+                    ancestors: &ancestors,
                     name: frame.name(),
                 },
             )?;
@@ -909,8 +919,8 @@ impl App {
     }
 
     /// Run a command (typed in full, or picked from the completion list). The input
-    /// is cleared, except after a failed `/rename`, which keeps it for correction like
-    /// an unknown command.
+    /// is cleared, except after a failed `/rename` or a refused or failed `/new`, which
+    /// keeps it like an unknown command.
     fn run_command(&mut self, action: Action, argument: &str) -> anyhow::Result<Flow> {
         match action {
             Action::Exit => return Ok(Flow::Exit),
@@ -943,6 +953,33 @@ impl App {
                 }
                 // The tree directory moved; the next agent needing the library reopens it.
                 self.library = None;
+            }
+            Action::New => {
+                // Refused as Enter on a message is during a turn, keeping the input. A
+                // running branch's ancestors wait in `Phase::Delegating`, so checking
+                // every frame covers every turn on the stack.
+                if self.frames.iter().any(|frame| frame.agent.turn().is_some()) {
+                    self.notice = Some("turn in progress (esc to stop)".to_string());
+                    return Ok(Flow::Continue);
+                }
+                // As at launch: named by its start time, created on disk at its first save.
+                let session = match Session::new(&self.resources.settings.dir) {
+                    Ok(session) => session,
+                    Err(error) => {
+                        self.notice = Some(format!("couldn't start a new session: {error:#}"));
+                        return Ok(Flow::Continue);
+                    }
+                };
+                // Every change to the idle root was saved as it happened, so dropping it
+                // leaves its session on disk unchanged for `--resume`. Its notes end with
+                // its frame, and its tree's library is not the new tree's.
+                self.frames = vec![Frame::root(session, &self.resources.settings)];
+                self.library = None;
+                // The display starts over as at launch: `show_top` replaces the token
+                // counter and returns the transcript and the overlay to their newest
+                // positions; a collapsed overlay reopens.
+                self.messages_collapsed = false;
+                self.show_top()?;
             }
         }
         self.textarea.clear();

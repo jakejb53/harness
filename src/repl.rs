@@ -16,9 +16,10 @@ use tokio::task::JoinHandle;
 
 use crate::config::{Permission, Settings};
 use crate::host::{self, HostConfig, HostContext, Mounts};
-use crate::hostfs::{self, FsAction, LIBRARY, STORE};
+use crate::hostfs::{self, FsAction, LIBRARY, REPOSITORY, STORE};
 use crate::root::Library;
 use crate::token_count::TokenTotal;
+use crate::unsupported;
 
 pub enum ReplEvent {
     /// Code output in execution order. The app applies its existing result truncation.
@@ -48,8 +49,10 @@ pub struct Runtime {
     pool: Arc<Pool>,
     config: Arc<HostConfig>,
     repl_config: Arc<ReplConfig>,
+    /// The repository's canonical host path, given to each host context for `run()`.
     repo: PathBuf,
-    /// Clone the opened directory capability across feeds; never reopen its path.
+    /// The repository at its virtual path `REPOSITORY`, never at `repo`. Clone the
+    /// opened directory capability across feeds; never reopen its path.
     mount: MountSpec,
     /// `/store`, opened once at startup and cloned into the feeds of agents at depth 1
     /// and deeper, like `mount`.
@@ -68,13 +71,8 @@ impl Runtime {
             .context("finding repository directory")?
             .canonicalize()
             .context("resolving repository directory")?;
-        let mount = MountSpec::new(
-            repo.to_str()
-                .context("repository directory is not valid UTF-8")?,
-            &repo,
-            MountSpecMode::ReadWrite,
-        )
-        .context("opening repository mount")?;
+        let mount = MountSpec::new(REPOSITORY, &repo, MountSpecMode::ReadWrite)
+            .context("opening repository mount")?;
         let store = MountSpec::new(STORE, &settings.store_path, MountSpecMode::ReadWrite)
             .with_context(|| format!("opening store mount {}", settings.store_path.display()))?;
         let store_dir =
@@ -150,12 +148,14 @@ impl Runtime {
         });
         let (commands, incoming) = mpsc::unbounded_channel();
         let (events, output) = mpsc::unbounded_channel();
+        let (helpers, helper_signatures) = watch::channel(BTreeMap::new());
         let driver = Driver {
             pool: self.pool.clone(),
             config: self.repl_config.clone(),
             checkout: None,
             mounts,
             memory_mb: self.memory_mb,
+            helpers,
             host: HostContext {
                 repo: self.repo.clone(),
                 mounts: host_mounts,
@@ -172,6 +172,7 @@ impl Runtime {
         Repl {
             commands,
             events: output,
+            helpers: helper_signatures,
             task: Some(tokio::spawn(driver.run(incoming))),
         }
     }
@@ -201,6 +202,10 @@ enum DriverCommand {
 pub struct Repl {
     commands: mpsc::UnboundedSender<DriverCommand>,
     events: mpsc::UnboundedReceiver<ReplEvent>,
+    /// The helper functions loaded in this REPL's session, by name, each with its
+    /// help() signature line, as the driver published them when its latest call ended
+    /// (`Driver::helpers`); empty before the first call ends.
+    helpers: watch::Receiver<BTreeMap<String, String>>,
     task: Option<JoinHandle<anyhow::Result<()>>>,
 }
 
@@ -241,6 +246,13 @@ impl Repl {
             task.abort();
         }
     }
+
+    /// Helper function `name`'s help() signature line (`host::helper_signature`) when it
+    /// is loaded in this REPL's session, for the agent's unknown-tool pointer. Read
+    /// between calls, when the published set matches the session.
+    pub fn helper_signature(&self, name: &str) -> Option<String> {
+        self.helpers.borrow().get(name).cloned()
+    }
 }
 
 impl Drop for Repl {
@@ -258,6 +270,10 @@ struct Driver {
     /// Passed to every feed, the repository first; `host.mounts` describes the rest.
     mounts: Vec<MountSpec>,
     memory_mb: usize,
+    /// Publishes `host.library` as help() signature lines to the `Repl` handle. Sent
+    /// once per call, just before its `Done`, so it is current whenever the agent reads
+    /// it between calls, including after a session loss cleared the library.
+    helpers: watch::Sender<BTreeMap<String, String>>,
 }
 
 impl Driver {
@@ -288,8 +304,31 @@ impl Driver {
                             },
                             None,
                         ),
-                        Err(error) => (None, Some(self.report_error(error))),
+                        Err(error) => {
+                            // Matched before `report_error` consumes the error. Only the
+                            // call's own final exception gets a pointer; library load
+                            // failures in `initialize` are reported without one.
+                            let pointer = match &error {
+                                PoolError::Runtime(exception) => unsupported::pointer(exception),
+                                _ => None,
+                            };
+                            let mut report = self.report_error(error);
+                            if let Some(pointer) = pointer {
+                                report.push('\n');
+                                report.push_str(&pointer);
+                            }
+                            (None, Some(report))
+                        }
                     };
+                    self.helpers.send_replace(
+                        self.host
+                            .library
+                            .iter()
+                            .map(|(name, function)| {
+                                (name.clone(), host::helper_signature(name, function))
+                            })
+                            .collect(),
+                    );
                     if self
                         .host
                         .events
@@ -565,10 +604,9 @@ mod tests {
             pool: pool.clone(),
             config: Arc::new(ReplConfig::default()),
             checkout: None,
-            mounts: vec![
-                MountSpec::new(repo.to_str().unwrap(), &repo, MountSpecMode::ReadWrite).unwrap(),
-            ],
+            mounts: vec![MountSpec::new(REPOSITORY, &repo, MountSpecMode::ReadWrite).unwrap()],
             memory_mb: 64,
+            helpers: watch::channel(BTreeMap::new()).0,
             host: HostContext {
                 repo: repo.clone(),
                 mounts: Mounts {

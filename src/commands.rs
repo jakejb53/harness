@@ -6,6 +6,7 @@ pub enum Action {
     Exit,
     ShowTools,
     Rename,
+    New,
 }
 
 pub struct Command {
@@ -19,7 +20,8 @@ pub struct Command {
     pub takes_argument: bool,
 }
 
-/// In completion-list order. `/exit` is last, so `/` then Enter can't quit by accident.
+/// In completion-list order. `/exit` is last, so `/` then Enter can't quit by accident;
+/// for the same reason `/new` isn't first.
 const COMMANDS: &[Command] = &[
     Command {
         name: "/rename",
@@ -33,6 +35,13 @@ const COMMANDS: &[Command] = &[
         aliases: &[],
         description: "Show tool descriptions",
         action: Action::ShowTools,
+        takes_argument: false,
+    },
+    Command {
+        name: "/new",
+        aliases: &["/clear"],
+        description: "Start a new session",
+        action: Action::New,
         takes_argument: false,
     },
     Command {

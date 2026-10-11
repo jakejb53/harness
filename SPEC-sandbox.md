@@ -32,7 +32,7 @@ Optional `[approval_description]`: required `enabled` boolean; when true, requir
 - A turn checks out a worker (fresh session), feeds `replib/*.py`, then runs the turn's calls; state persists across the turn's calls. The turn's end finishes the session and returns the worker. Esc or exit drops the checkout, discarding the worker. A crashed worker ends the call with `[REPL worker crashed: <reason>. The REPL was restarted: every variable, import, and function defined earlier in this turn is gone; library functions are reloaded.]`; the next call gets that new session.
 - Static type checking is disabled. Type annotations are not enforced; runtime errors stop execution where they occur. Completed effects and surviving REPL state remain available to later calls after ordinary exceptions. Host functions validate arguments and enforce permissions at each operation.
 - Limits: `max_suspensions = usize::MAX`; `max_memory` from `[repl] max_memory_mb`; no time limits (Esc stops). Hitting the memory limit discards the worker and ends the call with `[REPL memory limit of <N> MiB exceeded. The REPL was restarted: every variable, import, and function defined earlier in this turn is gone; library functions are reloaded.]`.
-- The repo (working directory) is mounted read-write at its real absolute path, which is also the sandbox working directory. The directory handle is opened once and reused across feeds and turns. `os.getenv`/`os.environ` see an empty environment.
+- The repo is mounted read-write at the virtual path `/repository`, which is also the sandbox working directory; its host path is never visible to sandbox code. The directory handle is opened once and reused across feeds and turns. `os.getenv`/`os.environ` see an empty environment.
 - Result: `print` output in order, then the repr of a trailing expression if not `None`, then the exception type and descriptive message without traceback frames if the code raised; `(no output)` if empty; truncated at `output_limit` as before. Library-load exceptions and unsupported-operation records use the same exception summary.
 - Except for file injection below, all synthetic tool calls, present and future, including the per-turn `FYI()`, never require approval at any permission level, whether app-generated or explicitly called by the model. `help()` runs only on demand and also requires no approval. Unrelated code bundled with them, including code evaluated in arguments, remains subject to normal permission and approval rules. App-generated file injections follow the separate user-authorized read contract below.
 - `reasoning()` is not synthetic and remains separately approval-exempt at every permission level. Exact `reasoning(<string literal>)` calls are answered `(no output)` without running; unrelated code cannot inherit the exemption.
@@ -55,7 +55,7 @@ User file injection (`@path`, specified in `SPEC.md`) is an app-side read outsid
 
 `run(argv, cwd=None)` → `{"exit_code": int, "stdout": str, "stderr": str}`; prints nothing. A command killed by a signal has `exit_code` = minus the signal number.
 
-- `argv[0]` is a bare command name; one containing `/` raises `ValueError: run takes a command name, not a path: './build.sh'`.
+- `argv[0]` is a command name, or a relative path containing `/` (no `..`) to an executable inside the repo, resolved against `cwd` through symlinks. Outside the repo: denied. Missing: `FileNotFoundError`. Not a regular file with an execute bit: `PermissionError: run 'scripts/build.sh': not an executable file`, not logged as a denial. A path skips `deny` and `allow` and always asks `allow <path> <args>?` with the resolved path; errors name the path as spelled.
 - In `deny`: denied. In `allow`: runs the configured path without asking. Otherwise the app resolves the name through its own `PATH` and asks `allow <path> <args>?`; not found raises `FileNotFoundError: run: no command named 'npm' is configured or found on the host`. Independent of the permission level.
 - `cwd` defaults to the repo root. An explicit `cwd` must be relative with no `..` components and resolves against the repo root, independently of sandbox `os.chdir()`; if symlink resolution places the directory outside the repo, it asks.
 - The program runs directly (no shell), stdin `/dev/null`, in its own session with no controlling terminal, with the app's environment minus `env_filter`. Commands are host processes, not confined by the REPL mount. Esc kills the process group. No timeout. Output is decoded as UTF-8 with replacement and never shown live.
@@ -65,13 +65,13 @@ User file injection (`@path`, specified in `SPEC.md`) is an app-side read outsid
 - `~/.harness/replib/*.py` is Monty code, fed in name order at session start. Load errors are printed in the first call's output. The repo ships `reasoning.py`, `glob.py`, and `search.py`.
 - Public library functions are the top-level functions whose names don't start with `_`. Monty functions expose no name, signature, or docstring, so the app reads these from the source with `ruff_python_parser`.
 - `lib_source(name)`: returns the contents of `replib/<name>.py`.
-- `glob` and `search` return relative string paths preserving the supplied root (default `.`), skip directory symlinks, and reject absolute paths and `..` components in their path inputs. `search` returns `{"path", "line", "text"}` records with 1-based line numbers; its regex is not a path input.
+- `glob` and `search` return relative string paths preserving the supplied root (default `.`), skip only the entry names in `exclude` (default `()`), and reject absolute paths and `..` components in their path inputs; `**` does not enter directory symlinks, and a missing root raises `FileNotFoundError`. `search` returns `{"path", "line", "text"}` records with 1-based line numbers and skips files containing a NUL byte; its regex is not a path input.
 - Model-authored library changes are deferred: `lib_define`, `lib_remove`, scratch validation, `lib_auto_allow`, and `/lib-auto` are outside this implementation.
 
 ## Host functions
 
 - `FYI()`: unchanged output.
-- `help()`: the output limit, then `~/.harness/repl-notes.md` if present, then host functions, public library functions (signature and docstring; files that failed to load this session are omitted), and the `allow` command names.
+- `help()`: the output limit, then `~/.harness/repl-notes.md` if present, then the agent's files, the supported Python subset and its alternatives, host functions, `run`'s contract with the `allow` names not in `deny` and the `deny` names, and public library functions (signature and docstring; files that failed to load this session are omitted).
 - `run`, `lib_source`: above.
 
 ## Failures

@@ -47,7 +47,7 @@ Contract for the root agent, branch agents, the library, and the store. Base con
 - Esc stops the whole tree; the deepest agent's partial response followed by `[stopped by user]` reaches the root as the `rlm` result at each level.
 - The filesystem permission level applies to every branch.
 - Every branch file is inspectable as a session.
-- The transcript, context overlay, and status line follow the deepest active agent and return to its parent when it ends. The status line and the context overlay's header name the agent on screen: the session name for the root, its `name` for a branch.
+- The transcript, context overlay, and status line follow the deepest active agent and return to its parent when it ends. The status line names the agent on screen: the session name for the root, its `name` for a branch. The context overlay's header names every agent on the stack the same way, root first, as `[Context][<root>]…[<on-screen agent>]`, and when the width cap binds, the oldest ancestors collapse into one `[…]` segment, the on-screen agent's name shortening with an ellipsis only if it alone still does not fit.
 
 ## Removed
 

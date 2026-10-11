@@ -21,6 +21,7 @@ use crate::list;
 use crate::repl::ReplEvent;
 use crate::root::Root;
 use crate::token_count::TokenTotal;
+use crate::unsupported;
 
 /// Signatures shown by help(); dispatch validates host arguments at runtime. The mount
 /// summary signatures below follow these only where their mount is present.
@@ -37,6 +38,43 @@ const STORE_SUMMARY_STUB: &str = "def store_summary() -> None: ...";
 
 /// `library_summary()`'s signature, listed by help() where `/library` is mounted.
 const LIBRARY_SUMMARY_STUB: &str = "def library_summary() -> None: ...";
+
+/// help()'s `Python:` section up to its `Use instead` lines, which help() generates from
+/// the unsupported-name table (`unsupported::help_lines`) and follows with
+/// `PYTHON_HELP_TAIL`. The modules and language gaps are fixed by the pinned Monty crates,
+/// so this text must change with them. It names no replib helper; the table names only
+/// the shipped `glob()`.
+const PYTHON_HELP_HEAD: &str = r#"
+Python:
+The REPL runs a subset of Python. Importable modules: asyncio, base64, binascii, collections, copy, dataclasses, datetime, functools, itertools, json, math, os, pathlib, random, re, sys, time, typing, unicodedata. Any other import, including subprocess, glob, shutil, fnmatch, io, tempfile, and csv, raises ModuleNotFoundError.
+Not available: generator functions (yield), del, match, class inheritance, method decorators.
+Use instead:
+"#;
+
+/// The rest of help()'s `Python:` section, after its generated `Use instead` lines. The
+/// callback rule is fixed by the pinned Monty crates and the environment line by
+/// `hostfs`, so this text must change with them.
+const PYTHON_HELP_TAIL: &str = r#"Calls that touch files or run commands fail inside sorted/min/max key= and map()/filter(); build a list with a comprehension first.
+os.environ is empty and os.getenv() returns its default.
+Write repository paths relative to the repository root. read_file, grep, list, and apply_patch are tools, not Python functions.
+"#;
+
+/// The fixed part of help()'s `Commands:` section, which states `run`'s contract; help()
+/// follows it with the configured allow and deny names. Each line must stay true to
+/// `run` and `arguments`: a command name or a relative path to a repository executable,
+/// `argv` and `cwd` only.
+const COMMANDS_HELP: &str = r#"
+Commands:
+Call run() inside REPL code; a tool call named run fails.
+    r = run(["cargo", "test"], cwd="tools")
+    print(r["exit_code"], r["stdout"], r["stderr"])
+- argv: a list of strings, passed to the program as-is with no shell: no pipes, redirection, wildcards, ~, or $VARS. For shell syntax, pass ["sh", "-c", "<script>"].
+- argv[0]: a command name, resolved through the lists below and then PATH; or a relative path containing / to an executable inside the repository, resolved against cwd ("target/debug/app", or "./app" with cwd="target/debug").
+- cwd: a directory relative to the repository root (the default). Absolute paths and .. are rejected. os.chdir() does not affect it.
+- No other arguments: no capture_output, text, timeout, env, check, or input. Output is always captured and returned; run() prints nothing.
+- Returns {"exit_code": int, "stdout": str, "stderr": str}; a signal exit is negative. There is no stdin and no timeout.
+- Commands are host processes: the file permission level does not apply to them, and the virtual /repository, /store, and /library paths do not exist for them.
+"#;
 
 /// The strftime format of every local date host functions print: `FYI()`'s `Date` and
 /// a mount summary's last update.
@@ -125,7 +163,9 @@ impl Mounts {
 }
 
 pub struct HostContext {
-    /// Canonical repository path, which is also its mount's virtual path.
+    /// Canonical host path of the repository, for `run()`, which resolves command
+    /// directories and repository executables on the host. Sandbox paths never name it:
+    /// the repository is mounted at `hostfs::REPOSITORY`, which `hostfs` authorizes.
     pub repo: PathBuf,
     pub mounts: Mounts,
     /// The directory behind `/store`, held exactly where `mounts` has the store, for
@@ -199,6 +239,28 @@ pub fn is_host_function(name: &str, mounts: Mounts) -> bool {
         "library_summary" => mounts.library,
         _ => false,
     }
+}
+
+/// Host function `name`'s stub line as help() lists it, without its `: ...` body, e.g.
+/// `def help() -> None`; `None` where `name` is not a host function with `mounts`
+/// (`is_host_function`). The stubs above stay the one source of these signatures.
+pub fn signature(name: &str, mounts: Mounts) -> Option<&'static str> {
+    if !is_host_function(name, mounts) {
+        return None;
+    }
+    let start = format!("def {name}(");
+    STUBS
+        .lines()
+        .chain([STORE_SUMMARY_STUB, LIBRARY_SUMMARY_STUB])
+        .find(|line| line.starts_with(&start))
+        .map(|line| line.strip_suffix(": ...").unwrap_or(line))
+}
+
+/// Helper function `name`'s signature line as help() lists it: the name followed by its
+/// source parameter list, verbatim, e.g. `reasoning(text: str)`. help() and the REPL's
+/// published helper signatures (`Repl::helper_signature`) both use this one format.
+pub fn helper_signature(name: &str, function: &LibraryFunction) -> String {
+    format!("{name}{}", function.signature)
 }
 
 /// Answer one host suspension; argument evaluation has already followed normal permissions.
@@ -286,7 +348,9 @@ fn prompt_tokens_line(tokens: TokenTotal) -> String {
     format!("Prompt tokens: {estimate}{}\n", tokens.count)
 }
 
-/// Describe loaded capabilities from their authoritative stubs and source metadata.
+/// Describe the REPL to the model: its files, the Python subset it runs, host functions
+/// from their authoritative stubs, `run`'s contract with the configured allow and deny
+/// names, and helper functions from their source metadata.
 fn help(args: &CallArgs, host: &HostContext) -> Result<MontyObject, MontyException> {
     arguments(args, &[])?;
     let mut text = format!(
@@ -314,7 +378,10 @@ fn help(args: &CallArgs, host: &HostContext) -> Result<MontyObject, MontyExcepti
     if host.mounts.library {
         text.push_str("/library (read-only): session transcripts available to inspect, one JSON file per session. REPL: pathlib.Path paths under /library; read_file, grep, and list: root = \"library\".\n");
     }
-    text.push_str("\nHost functions:\n");
+    text.push_str(PYTHON_HELP_HEAD);
+    text.push_str(&unsupported::help_lines());
+    text.push_str(PYTHON_HELP_TAIL);
+    text.push_str("\nREPL functions (call these inside REPL code; they are not tools):\n");
     text.push_str(STUBS.trim());
     // Like the mounts above, each mount's summary function is listed only where the
     // feeds carry the mount (`is_host_function`).
@@ -327,7 +394,28 @@ fn help(args: &CallArgs, host: &HostContext) -> Result<MontyObject, MontyExcepti
             text.push_str(stub);
         }
     }
-    text.push_str("\nrun: executes a command name directly; returns exit_code, stdout, stderr.\nlib_source: reads replib/<name>.py.\n");
+    text.push_str("\nlib_source: reads replib/<name>.py.\n");
+    text.push_str(COMMANDS_HELP);
+    // Comma-joined names, with an explicit empty state like the helper listing below.
+    let listing = |names: Vec<&str>| {
+        if names.is_empty() {
+            "(none)".to_owned()
+        } else {
+            names.join(", ")
+        }
+    };
+    // `run` checks deny before allow, so a name in both lists is listed only as denied.
+    let allowed = host
+        .config
+        .allow
+        .keys()
+        .filter(|name| !host.config.deny.contains(name))
+        .map(String::as_str)
+        .collect();
+    let denied = host.config.deny.iter().map(String::as_str).collect();
+    text.push_str(&format!("Run without approval: {}\n", listing(allowed)));
+    text.push_str(&format!("Always denied: {}\n", listing(denied)));
+    text.push_str("Any other command on PATH, and any repository executable, asks the user for approval on every call; a refusal raises PermissionError.\n");
     text.push_str("\nHelper functions:\n");
     // Explicit empty states distinguish complete listings from truncated output.
     if host.library.is_empty() {
@@ -335,19 +423,11 @@ fn help(args: &CallArgs, host: &HostContext) -> Result<MontyObject, MontyExcepti
     }
     for (name, function) in &host.library {
         text.push_str(&format!(
-            "{name}{}\n{}\n",
-            function.signature, function.docstring
+            "{}\n{}\n",
+            helper_signature(name, function),
+            function.docstring
         ));
     }
-    text.push_str("\nCommands configured to run without approval (deny takes precedence):\n");
-    if host.config.allow.is_empty() {
-        text.push_str("(none)\n");
-    }
-    for name in host.config.allow.keys() {
-        text.push_str(name);
-        text.push('\n');
-    }
-    text.push_str("\nOther commands found on PATH require approval unless denied.\n");
     host.output(text);
     Ok(MontyObject::none())
 }
@@ -531,22 +611,8 @@ async fn run(args: &CallArgs, host: &HostContext) -> Result<MontyObject, MontyEx
         .first()
         .filter(|name| !name.is_empty())
         .ok_or_else(|| exception(ExcType::ValueError, "run requires a nonempty command name"))?;
-    if name.contains('/') {
-        return Err(exception(
-            ExcType::ValueError,
-            format!("run takes a command name, not a path: {name:?}"),
-        ));
-    }
-    if host.config.deny.contains(name) {
-        return Err(host.denied(format!(
-            "run '{name}': denied: '{name}' is on the command deny list"
-        )));
-    }
-    let configured = host.config.allow.get(name);
-    let executable = match configured {
-        Some(path) => path.clone(),
-        None => resolve_command(name, &host.config.search_path)?,
-    };
+    // The working directory is resolved before the command, because a path-form command
+    // resolves against it.
     let cwd = match argument(args, 1, "cwd") {
         None => host.repo.clone(),
         Some(value) if value.type_name() == "NoneType" => host.repo.clone(),
@@ -554,17 +620,7 @@ async fn run(args: &CallArgs, host: &HostContext) -> Result<MontyObject, MontyEx
             let value = value
                 .as_str()
                 .ok_or_else(|| exception(ExcType::TypeError, "run cwd must be a string or None"))?;
-            // Inspect the agent's spelling before joining it to the repository:
-            // containment alone would allow forbidden absolute and parent paths.
-            if Path::new(value).is_absolute()
-                || Path::new(value)
-                    .components()
-                    .any(|part| part == std::path::Component::ParentDir)
-            {
-                return Err(host.denied(format!(
-                    "run cwd {value:?}: denied: absolute paths and '..' components are not allowed"
-                )));
-            }
+            require_relative(host, &format!("run cwd {value:?}"), value)?;
             host.repo.join(value)
         }
     };
@@ -573,6 +629,26 @@ async fn run(args: &CallArgs, host: &HostContext) -> Result<MontyObject, MontyEx
     let cwd = cwd
         .canonicalize()
         .map_err(|error| io_error("resolve command directory", &cwd, error))?;
+    // `label` is what errors after resolution name: a path-form command by its spelling,
+    // never the host path behind it; a bare name by its resolved executable.
+    let (executable, label, configured) = if name.contains('/') {
+        // `deny` holds bare names matched exactly and `allow` is never consulted for a
+        // path, so a repository executable always reaches the command prompt below.
+        let executable = repository_executable(name, &cwd, host)?;
+        (executable, PathBuf::from(name), None)
+    } else {
+        if host.config.deny.contains(name) {
+            return Err(host.denied(format!(
+                "run '{name}': denied: '{name}' is on the command deny list"
+            )));
+        }
+        let configured = host.config.allow.get(name);
+        let executable = match configured {
+            Some(path) => path.clone(),
+            None => resolve_command(name, &host.config.search_path)?,
+        };
+        (executable.clone(), executable, configured)
+    };
     if !cwd.starts_with(&host.repo)
         && !host
             .ask(
@@ -596,10 +672,7 @@ async fn run(args: &CallArgs, host: &HostContext) -> Result<MontyObject, MontyEx
             )
             .await?
     {
-        return Err(host.denied(format!(
-            "run '{}': denied by the user",
-            executable.display()
-        )));
+        return Err(host.denied(format!("run '{}': denied by the user", label.display())));
     }
     let mut command = tokio::process::Command::new(&executable);
     command
@@ -623,12 +696,12 @@ async fn run(args: &CallArgs, host: &HostContext) -> Result<MontyObject, MontyEx
     }
     let child = command
         .spawn()
-        .map_err(|error| io_error("run", &executable, error))?;
+        .map_err(|error| io_error("run", &label, error))?;
     let mut group = CommandGroup(child.id().map(|id| id as libc::pid_t));
     let output = child
         .wait_with_output()
         .await
-        .map_err(|error| io_error("wait for", &executable, error))?;
+        .map_err(|error| io_error("wait for", &label, error))?;
     group.0 = None;
     let exit_code = output
         .status
@@ -676,7 +749,7 @@ fn resolve_command(name: &str, paths: &[PathBuf]) -> Result<PathBuf, MontyExcept
     for dir in paths {
         let candidate = dir.join(name);
         match candidate.metadata() {
-            Ok(metadata) if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 => {
+            Ok(metadata) if is_executable(&metadata) => {
                 return std::path::absolute(&candidate)
                     .map_err(|error| io_error("resolve command", &candidate, error));
             }
@@ -693,6 +766,69 @@ fn resolve_command(name: &str, paths: &[PathBuf]) -> Result<PathBuf, MontyExcept
         ExcType::FileNotFoundError,
         format!("run: no command named '{name}' is configured or found on the host"),
     ))
+}
+
+/// Resolve `spelled`, a path-form `argv[0]`, to the canonical path of an executable
+/// inside the repository, joined to the canonical command directory `cwd`. The spelling
+/// is checked before the join and the canonical result must lie under the repository,
+/// so neither `..` nor a symlink reaches outside it. Errors name the spelling, never the
+/// host path behind it.
+fn repository_executable(
+    spelled: &str,
+    cwd: &Path,
+    host: &HostContext,
+) -> Result<PathBuf, MontyException> {
+    require_relative(host, &format!("run '{spelled}'"), spelled)?;
+    let executable = cwd
+        .join(spelled)
+        .canonicalize()
+        .map_err(|error| io_error("resolve command", Path::new(spelled), error))?;
+    if !executable.starts_with(&host.repo) {
+        return Err(host.denied(format!(
+            "run '{spelled}': denied: resolves outside the repository"
+        )));
+    }
+    let metadata = executable
+        .metadata()
+        .map_err(|error| io_error("resolve command", Path::new(spelled), error))?;
+    // Not an app denial, so it is not logged as one: the OS refuses to execute such a
+    // file (EACCES), and this is the PermissionError CPython's subprocess raises for it.
+    if !is_executable(&metadata) {
+        return Err(exception(
+            ExcType::PermissionError,
+            format!("run '{spelled}': not an executable file"),
+        ));
+    }
+    Ok(executable)
+}
+
+/// Whether `metadata` is a regular file with an execute bit: the test `run` applies to
+/// an executable it finds, on PATH (`resolve_command`) or in the repository
+/// (`repository_executable`); configured `allow` paths are spawned as given.
+fn is_executable(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+}
+
+/// Deny `spelled`, an agent-written `run` path (`cwd` or a path-form `argv[0]`), when
+/// it is absolute or has a `..` component. The spelling is inspected before it is
+/// joined to anything: containment alone would allow those forbidden spellings.
+/// `subject` opens the denial, e.g. `run cwd "src"`.
+fn require_relative(
+    host: &HostContext,
+    subject: &str,
+    spelled: &str,
+) -> Result<(), MontyException> {
+    let path = Path::new(spelled);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+    {
+        return Err(host.denied(format!(
+            "{subject}: denied: absolute paths and '..' components are not allowed"
+        )));
+    }
+    Ok(())
 }
 
 /// Extract public signatures and docstrings without executing the source in the host.

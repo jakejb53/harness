@@ -75,31 +75,38 @@ def _glob_match(pattern: str, name: str) -> bool:
 def glob(
     pattern: str,
     path: str | None = None,
-    exclude: tuple[str, ...] = (".git", "target", "node_modules"),
+    exclude: tuple[str, ...] = (),
 ) -> list[str]:
-    """Return sorted matching path strings beneath path (default '.').
+    """Return sorted paths matching pattern beneath path (default '.').
 
-    Paths preserve the supplied relative root, so results can be opened directly.
-    Absolute paths and '..' components are rejected in both path and pattern.
-    '*', '?', and bracket ranges match within a component; '**' spans directories.
-    Hidden names are included. Excluded entry names and directory symlinks are
-    skipped. A trailing '/' selects directories. Filesystem errors propagate.
+    Results keep the supplied relative root, so they can be opened directly.
+    Absolute paths and '..' are rejected, so /store and /library are out of reach;
+    use pathlib or the direct tools there. '*', '?', and [...] match within one
+    name; '**' matches any number of directories and does not enter directory
+    symlinks. Hidden names are included. A trailing '/' selects directories.
+    exclude is a tuple of entry names skipped at every level. Nothing is skipped by
+    default, so '**' from the root also walks .git and target unless you pass
+    exclude=('.git', 'target'). A missing path raises FileNotFoundError; other
+    filesystem errors propagate.
     """
+    # A str would silently turn the entry-name test below into a substring test.
+    if isinstance(exclude, str):
+        raise TypeError("exclude must be a tuple of entry names, not a str: " + repr(exclude))
     root = "." if path is None else path
     _glob_check_path(root)
     _glob_check_path(pattern)
     # Match the separator normalization used by Monty's Path for the root.
     pattern = pattern.replace("\\", "/")
-    # Inspect every prefix before traversing an explicitly supplied nested root.
-    prefix = _GlobPath(".")
-    for component in root.replace("\\", "/").split("/"):
-        if component not in ("", "."):
-            prefix = prefix / component
-            if prefix.is_symlink() and prefix.is_dir():
-                return []
+    # An unusable root raises instead of returning [], which would read as "nothing
+    # matched" and hide a mistyped path. A root through a directory symlink is walked.
+    start = _GlobPath(root)
+    if not start.is_dir():
+        if start.exists():
+            raise NotADirectoryError("path is not a directory: " + repr(root))
+        raise FileNotFoundError("path does not exist: " + repr(root))
     parts = [part for part in pattern.split("/") if part not in ("", ".")]
     directories_only = pattern.endswith("/")
-    pending: list[tuple[str, int]] = [(str(_GlobPath(root)), 0)]
+    pending: list[tuple[str, int]] = [(str(start), 0)]
     matches: set[str] = set()
     visited: set[tuple[str, int]] = set()
     while pending:
@@ -109,10 +116,7 @@ def glob(
             continue
         visited.add(state)
         entry = _GlobPath(current)
-        # Skipping directory symlinks also prevents recursive cycles.
         directory = entry.is_dir()
-        if directory and entry.is_symlink():
-            continue
         if index == len(parts):
             if (directory or entry.exists()) and (not directories_only or directory):
                 matches.add(current)
@@ -126,8 +130,16 @@ def glob(
             if child.name in exclude:
                 continue
             if component == "**":
-                if child.is_dir() and not child.is_symlink():
+                # '**' is the only component that can revisit a directory without
+                # consuming a pattern part, so keeping it out of directory symlinks is
+                # what prevents cycles; other components may pass through a symlink.
+                child_directory = child.is_dir()
+                if child_directory and not child.is_symlink():
                     pending.append((str(child), index))
+                elif not child_directory and index + 1 == len(parts):
+                    # A trailing '**' also matches files. Before a later part, a file
+                    # could never match, so it is not queued.
+                    pending.append((str(child), index + 1))
             elif _glob_match(component, child.name):
                 pending.append((str(child), index + 1))
     return sorted(matches)

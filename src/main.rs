@@ -19,6 +19,7 @@ mod tool_call_id;
 mod tool_reasoning;
 mod transcript;
 mod tui;
+mod unsupported;
 mod worker;
 
 use clap::{Parser, Subcommand};

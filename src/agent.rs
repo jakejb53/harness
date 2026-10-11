@@ -97,7 +97,8 @@ pub struct Agent {
     turn: Option<Turn>,
     /// Tool definitions sent with every request and listed by `/tools`; built at
     /// creation from this agent's depth and mounts (`mounts`) and fixed thereafter.
-    /// A call naming any other tool gets `Unknown tool: <name>` (`offers`).
+    /// A call naming any other tool gets `Unknown tool: <name>` (`offers`), with a
+    /// pointer when the name is a REPL host or helper function (`unknown_tool`).
     tools: Vec<Value>,
     /// Content of the final response (one without tool calls) of the latest turn, set
     /// when that response ends and cleared when a turn starts or is stopped. A
@@ -645,7 +646,7 @@ impl Agent {
         // Only this agent's own tools run; any other name, including a tool another
         // depth has, is unknown here.
         if !self.offers(&call.function.name) {
-            let error = format!("Unknown tool: {}", call.function.name);
+            let error = self.unknown_tool(&call.function.name);
             self.record_result(res, &call, error)?;
             return Ok(Outcome::None);
         }
@@ -704,6 +705,29 @@ impl Agent {
         self.tools
             .iter()
             .any(|tool| tool["function"]["name"].as_str() == Some(name))
+    }
+
+    /// The error result for a call to `name`, which this agent does not offer: `Unknown
+    /// tool: <name>`, followed, when this agent has a REPL and `name` is one of its host
+    /// functions with this agent's mounts (`host::signature`) or a helper function
+    /// loaded in its turn's REPL (`Repl::helper_signature`), by a pointer to call it
+    /// inside REPL code with its help() signature. A host function's name is checked
+    /// first. The root has no REPL, so it never gets the pointer. Nothing is executed
+    /// either way.
+    fn unknown_tool(&self, name: &str) -> String {
+        let signature = if self.offers("REPL") {
+            host::signature(name, self.mounts())
+                .map(str::to_owned)
+                .or_else(|| self.turn.as_ref()?.repl.as_ref()?.helper_signature(name))
+        } else {
+            None
+        };
+        match signature {
+            Some(signature) => format!(
+                "Unknown tool: {name}. {name} is a REPL function, not a tool; call it inside REPL code: {signature}"
+            ),
+            None => format!("Unknown tool: {name}"),
+        }
     }
 
     /// Validate and queue a REPL or direct-tool call, under `begin_call`'s rules.
